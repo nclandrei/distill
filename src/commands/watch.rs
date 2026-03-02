@@ -1,12 +1,20 @@
 use anyhow::Result;
 
+use crate::config::Config;
+use crate::schedule;
+
 pub fn run(install: bool, uninstall: bool) -> Result<()> {
+    let scheduler = schedule::create_scheduler_default();
     if install {
-        println!("distill watch --install: scheduler installation not yet implemented.");
+        let config = Config::load()?;
+        scheduler.install(&config.scan_interval)?;
+        println!("Scheduler installed.");
     } else if uninstall {
-        println!("distill watch --uninstall: scheduler removal not yet implemented.");
+        scheduler.uninstall()?;
+        println!("Scheduler removed.");
     } else {
-        println!("Usage: distill watch --install | --uninstall");
+        let status = scheduler.status()?;
+        println!("Scheduler status: {:?}", status);
     }
     Ok(())
 }

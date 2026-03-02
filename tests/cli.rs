@@ -69,22 +69,33 @@ fn test_scan_without_now_flag() {
 }
 
 #[test]
-fn test_review_stub() {
+fn test_review_no_proposals() {
+    // With an empty proposals directory the command exits cleanly with a
+    // human-friendly message and a zero exit code.
     let dir = tempfile::tempdir().unwrap();
     distill_cmd(dir.path())
         .arg("review")
         .assert()
         .success()
-        .stdout(predicate::str::contains("not yet implemented"));
+        .stdout(predicate::str::contains("No pending proposals to review."));
 }
 
 #[test]
 fn test_watch_install_stub() {
     let dir = tempfile::tempdir().unwrap();
+    // Seed a minimal config so that `watch --install` can load it.
+    let distill_dir = dir.path().join(".distill");
+    std::fs::create_dir_all(&distill_dir).unwrap();
+    std::fs::write(
+        distill_dir.join("config.yaml"),
+        "agents:\n  - name: claude\n    enabled: true\nscan_interval: weekly\nproposal_agent: claude\nshell: zsh\nnotifications: both\n",
+    ).unwrap();
+
     distill_cmd(dir.path())
         .args(["watch", "--install"])
         .assert()
-        .success();
+        .success()
+        .stdout(predicate::str::contains("Scheduler installed."));
 }
 
 #[test]
@@ -93,7 +104,8 @@ fn test_watch_uninstall_stub() {
     distill_cmd(dir.path())
         .args(["watch", "--uninstall"])
         .assert()
-        .success();
+        .success()
+        .stdout(predicate::str::contains("Scheduler removed."));
 }
 
 #[test]
