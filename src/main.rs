@@ -59,8 +59,7 @@ fn main() -> anyhow::Result<()> {
                 println!("Run 'distill scan --now' to scan for new proposals.");
                 println!("Run 'distill review' to review pending proposals.");
             } else {
-                println!("Welcome to distill! Onboarding not yet implemented.");
-                println!("Run 'distill status' to see current state.");
+                onboard::run_interactive()?;
             }
         }
         Some(Commands::Scan { now }) => {

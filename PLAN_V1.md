@@ -201,10 +201,10 @@ Below, tasks are grouped into **waves**. All tasks within a wave can be executed
 
 | # | Task | Description | Done |
 |---|------|-------------|------|
-| 4 | **Onboarding flow** | `src/onboard/` — interactive first-run flow using `dialoguer` (Select, MultiSelect, Confirm prompts) or ratatui. Scan home dir for agent configs, present multi-select for agents, interval picker, agent-for-generation picker. Calls config system to persist. Wire to root command (run onboarding if no config exists). | |
-| 5 | **Session reader** | `src/scanner/reader.rs` — given a `Vec<Box<dyn Agent>>` and a `since: DateTime<Utc>`, collect all sessions. Deduplicate by session ID. Return `Vec<Session>`. Read/update `last-scan.json` via serde. Unit tests. | |
-| 7 | **Skill sync** | `src/sync/` — read all `.md` files from `~/.distill/skills/` via `std::fs::read_dir`, call each agent adapter's `write_skill()` to sync. Idempotent (compare content hashes, skip unchanged). Wire to an internal sync step called after review. Unit tests. | |
-| 10 | **Proposal writer** | `src/proposals/` — define `Proposal` struct with serde derive. Enum `ProposalType { New, Improve, Edit, Remove }`, enum `Confidence { High, Medium, Low }`. Serialize to markdown with YAML frontmatter (serde_yaml for frontmatter block, raw string for body). Write to / read from `~/.distill/proposals/`. List pending proposals. Unit tests. | |
+| 4 | **Onboarding flow** | `src/onboard/` — interactive first-run flow using `dialoguer` (Select, MultiSelect, Confirm prompts) or ratatui. Scan home dir for agent configs, present multi-select for agents, interval picker, agent-for-generation picker. Calls config system to persist. Wire to root command (run onboarding if no config exists). | yes |
+| 5 | **Session reader** | `src/scanner/reader.rs` — given a `Vec<Box<dyn Agent>>` and a `since: DateTime<Utc>`, collect all sessions. Deduplicate by session ID. Return `Vec<Session>`. Read/update `last-scan.json` via serde. Unit tests. | yes |
+| 7 | **Skill sync** | `src/sync/` — read all `.md` files from `~/.distill/skills/` via `std::fs::read_dir`, call each agent adapter's `write_skill()` to sync. Idempotent (compare content hashes, skip unchanged). Wire to an internal sync step called after review. Unit tests. | yes |
+| 10 | **Proposal writer** | `src/proposals/` — define `Proposal` struct with serde derive. Enum `ProposalType { New, Improve, Edit, Remove }`, enum `Confidence { High, Medium, Low }`. Serialize to markdown with YAML frontmatter (serde_yaml for frontmatter block, raw string for body). Write to / read from `~/.distill/proposals/`. List pending proposals. Unit tests. | yes |
 
 ---
 
@@ -214,7 +214,7 @@ Below, tasks are grouped into **waves**. All tasks within a wave can be executed
 
 | # | Task | Description | Done |
 |---|------|-------------|------|
-| 6 | **Scan engine** | `src/scanner/engine.rs` — orchestrate a full scan: call session reader, load existing skills, build prompt for the configured generation agent, invoke the agent (via `std::process::Command`, e.g. `claude --print` or `codex --quiet`), parse the agent's structured response into `Vec<Proposal>`, pass to proposal writer. Wire to `distill scan` subcommand with `--now` flag. Integration test with mock agent (inject a fake command that returns fixture output). | |
+| 6 | **Scan engine** | `src/scanner/engine.rs` — orchestrate a full scan: call session reader, load existing skills, build prompt for the configured generation agent, invoke the agent (via `std::process::Command`, e.g. `claude --print` or `codex --quiet`), parse the agent's structured response into `Vec<Proposal>`, pass to proposal writer. Wire to `distill scan` subcommand with `--now` flag. Integration test with mock agent (inject a fake command that returns fixture output). | yes |
 
 ---
 

@@ -1,18 +1,27 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 
+/// Build a distill command with HOME set to a temp dir so tests
+/// don't interact with the real ~/.distill config.
+fn distill_cmd(home: &std::path::Path) -> Command {
+    let mut cmd = Command::cargo_bin("distill").unwrap();
+    cmd.env("HOME", home);
+    cmd
+}
+
 #[test]
-fn test_no_args_runs_without_error() {
-    Command::cargo_bin("distill")
-        .unwrap()
+fn test_no_args_without_config() {
+    let dir = tempfile::tempdir().unwrap();
+    distill_cmd(dir.path())
         .assert()
-        .success();
+        .success()
+        .stdout(predicate::str::contains("Welcome to distill"));
 }
 
 #[test]
 fn test_help_flag() {
-    Command::cargo_bin("distill")
-        .unwrap()
+    let dir = tempfile::tempdir().unwrap();
+    distill_cmd(dir.path())
         .arg("--help")
         .assert()
         .success()
@@ -21,8 +30,8 @@ fn test_help_flag() {
 
 #[test]
 fn test_version_flag() {
-    Command::cargo_bin("distill")
-        .unwrap()
+    let dir = tempfile::tempdir().unwrap();
+    distill_cmd(dir.path())
         .arg("--version")
         .assert()
         .success()
@@ -31,8 +40,8 @@ fn test_version_flag() {
 
 #[test]
 fn test_status_without_config() {
-    Command::cargo_bin("distill")
-        .unwrap()
+    let dir = tempfile::tempdir().unwrap();
+    distill_cmd(dir.path())
         .arg("status")
         .assert()
         .success()
@@ -41,9 +50,8 @@ fn test_status_without_config() {
 
 #[test]
 fn test_scan_now_without_config() {
-    // Without a config file, scan --now should fail with a helpful error
-    Command::cargo_bin("distill")
-        .unwrap()
+    let dir = tempfile::tempdir().unwrap();
+    distill_cmd(dir.path())
         .args(["scan", "--now"])
         .assert()
         .failure()
@@ -52,9 +60,8 @@ fn test_scan_now_without_config() {
 
 #[test]
 fn test_scan_without_now_flag() {
-    // Without --now, scan prints a message about scheduled scan
-    Command::cargo_bin("distill")
-        .unwrap()
+    let dir = tempfile::tempdir().unwrap();
+    distill_cmd(dir.path())
         .arg("scan")
         .assert()
         .success()
@@ -63,8 +70,8 @@ fn test_scan_without_now_flag() {
 
 #[test]
 fn test_review_stub() {
-    Command::cargo_bin("distill")
-        .unwrap()
+    let dir = tempfile::tempdir().unwrap();
+    distill_cmd(dir.path())
         .arg("review")
         .assert()
         .success()
@@ -73,8 +80,8 @@ fn test_review_stub() {
 
 #[test]
 fn test_watch_install_stub() {
-    Command::cargo_bin("distill")
-        .unwrap()
+    let dir = tempfile::tempdir().unwrap();
+    distill_cmd(dir.path())
         .args(["watch", "--install"])
         .assert()
         .success();
@@ -82,8 +89,8 @@ fn test_watch_install_stub() {
 
 #[test]
 fn test_watch_uninstall_stub() {
-    Command::cargo_bin("distill")
-        .unwrap()
+    let dir = tempfile::tempdir().unwrap();
+    distill_cmd(dir.path())
         .args(["watch", "--uninstall"])
         .assert()
         .success();
@@ -91,8 +98,8 @@ fn test_watch_uninstall_stub() {
 
 #[test]
 fn test_notify_check() {
-    Command::cargo_bin("distill")
-        .unwrap()
+    let dir = tempfile::tempdir().unwrap();
+    distill_cmd(dir.path())
         .args(["notify", "--check"])
         .assert()
         .success();
@@ -100,8 +107,8 @@ fn test_notify_check() {
 
 #[test]
 fn test_invalid_subcommand() {
-    Command::cargo_bin("distill")
-        .unwrap()
+    let dir = tempfile::tempdir().unwrap();
+    distill_cmd(dir.path())
         .arg("nonexistent")
         .assert()
         .failure();
@@ -109,9 +116,27 @@ fn test_invalid_subcommand() {
 
 #[test]
 fn test_watch_mutual_exclusion() {
-    Command::cargo_bin("distill")
-        .unwrap()
+    let dir = tempfile::tempdir().unwrap();
+    distill_cmd(dir.path())
         .args(["watch", "--install", "--uninstall"])
         .assert()
         .failure();
+}
+
+#[test]
+fn test_status_with_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let distill_dir = dir.path().join(".distill");
+    std::fs::create_dir_all(&distill_dir).unwrap();
+    std::fs::write(
+        distill_dir.join("config.yaml"),
+        "agents:\n  - name: claude\n    enabled: true\nscan_interval: weekly\nproposal_agent: claude\nshell: zsh\nnotifications: both\n",
+    ).unwrap();
+
+    distill_cmd(dir.path())
+        .arg("status")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("distill status"))
+        .stdout(predicate::str::contains("claude"));
 }
