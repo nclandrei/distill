@@ -243,8 +243,8 @@ Below, tasks are grouped into **waves**. All tasks within a wave can be executed
 
 | # | Task | Description | Done |
 |---|------|-------------|------|
-| 15 | **End-to-end integration test** | Full flow: onboard → scan → proposals created → review → skills synced. Can use mock agent responses. | |
-| 16 | **README** | Installation instructions, demo GIF placeholder, usage examples. | |
+| 15 | **End-to-end integration test** | Full flow: onboard → scan → proposals created → review → skills synced. Can use mock agent responses. | yes |
+| 16 | **README** | Installation instructions, demo GIF placeholder, usage examples. | yes |
 
 ---
 
