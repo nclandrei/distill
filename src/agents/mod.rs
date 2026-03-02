@@ -111,12 +111,12 @@ fn system_time_to_utc(st: std::time::SystemTime) -> DateTime<Utc> {
         .unwrap_or_else(Utc::now)
 }
 
-/// Read a single `.jsonl` file into a `Session`.
+/// Read metadata for a single `.jsonl` session file (without reading its content).
 ///
 /// The session `timestamp` is set to the file's modification time.
 /// The session `id` is the file stem (filename without extension).
+/// The agent is given the file *path* so it can read the content itself.
 fn read_jsonl_session(path: &std::path::Path, kind: AgentKind) -> Result<Session> {
-    let content = std::fs::read_to_string(path)?;
     let id = path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -131,7 +131,7 @@ fn read_jsonl_session(path: &std::path::Path, kind: AgentKind) -> Result<Session
         agent: kind,
         path: path.to_path_buf(),
         timestamp: mtime,
-        content,
+        content: String::new(),
     })
 }
 
@@ -463,7 +463,6 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "sess-1");
         assert_eq!(sessions[0].agent, AgentKind::Codex);
-        assert_eq!(sessions[0].content, r#"{"msg":"hello"}"#);
     }
 
     // --- read_sessions: non-.jsonl files are ignored ---
@@ -645,10 +644,10 @@ mod tests {
         assert!(written.contains("Beta content"));
     }
 
-    // --- session content is preserved exactly ---
+    // --- session content is not read (agent reads files itself) ---
 
     #[test]
-    fn test_session_content_matches_file_contents() {
+    fn test_session_content_is_empty() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().to_path_buf();
         let projects = home.join(".claude").join("projects");
@@ -659,7 +658,7 @@ mod tests {
         let sessions = adapter.read_sessions(DateTime::UNIX_EPOCH).unwrap();
 
         assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].content, raw);
+        assert!(sessions[0].content.is_empty());
     }
 
     // --- session path matches the actual file path ---

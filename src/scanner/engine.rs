@@ -1,12 +1,50 @@
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::agents::{Agent, Session, Skill};
 use crate::config::Config;
 use crate::proposals::{Confidence, Evidence, Proposal, ProposalFrontmatter, ProposalType};
 use crate::scanner::reader::{self, LastScan};
+
+/// JSON Schema for the proposal response.  Passed to agents via
+/// `--json-schema` (claude) or `--output-schema` (codex) so the response
+/// is validated and deterministic.
+///
+/// The top-level type must be `object` (API requirement), so we wrap the
+/// proposal array in `{"proposals": [...]}`.
+const PROPOSAL_SCHEMA: &str = r#"{
+  "type": "object",
+  "properties": {
+    "proposals": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "type":         { "type": "string", "enum": ["new", "improve", "edit", "remove"] },
+          "confidence":   { "type": "string", "enum": ["high", "medium", "low"] },
+          "target_skill": { "type": ["string", "null"] },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "session": { "type": "string" },
+                "pattern": { "type": "string" }
+              },
+              "required": ["session", "pattern"]
+            }
+          },
+          "body": { "type": "string" }
+        },
+        "required": ["type", "confidence", "target_skill", "evidence", "body"]
+      }
+    }
+  },
+  "required": ["proposals"]
+}"#;
 
 /// Configuration for the scan engine, allowing dependency injection for testing.
 pub struct ScanConfig {
@@ -37,10 +75,22 @@ impl ScanConfig {
 }
 
 /// Return (command, args) for invoking a generation agent non-interactively.
+///
+/// The prompt is always delivered via stdin (see [`invoke_agent`]), so these
+/// args only configure non-interactive / print-only output and structured JSON.
 fn agent_command_for(agent_name: &str) -> (String, Vec<String>) {
     match agent_name {
-        "claude" => ("claude".into(), vec!["--print".into()]),
-        "codex" => ("codex".into(), vec!["--quiet".into()]),
+        // `claude -p` reads the prompt from stdin.
+        // `--output-format json` wraps the response in a JSON envelope.
+        // `--json-schema` enforces structured output matching our proposal schema.
+        "claude" => ("claude".into(), vec![
+            "--print".into(),
+            "--output-format".into(), "json".into(),
+            "--json-schema".into(), PROPOSAL_SCHEMA.into(),
+        ]),
+        // `codex exec` is the headless CLI; reads prompt from stdin.
+        // `--output-schema` requires a file path — written at invocation time.
+        "codex" => ("codex".into(), vec!["exec".into()]),
         other => (other.into(), vec![]),
     }
 }
@@ -86,11 +136,19 @@ pub fn run_scan(agents: &[Box<dyn Agent>], scan_config: &ScanConfig) -> Result<V
 
     // Step 4: Build prompt and invoke agent
     let prompt = build_prompt(&sessions, &skills);
+    println!(
+        "Sending {} session path(s) to `{}` for analysis (prompt: {} bytes)...",
+        sessions.len(),
+        scan_config.agent_command,
+        prompt.len()
+    );
+    println!("Waiting for agent response (this may take several minutes)...");
     let raw_response = invoke_agent(
         &scan_config.agent_command,
         &scan_config.agent_args,
         &prompt,
     )?;
+    println!("Agent responded ({} bytes).", raw_response.len());
 
     // Step 5: Parse response into proposals
     let proposals = parse_response(&raw_response)?;
@@ -155,13 +213,16 @@ fn load_skills(skills_dir: &Path) -> Result<Vec<Skill>> {
 }
 
 /// Build the prompt sent to the generation agent.
+///
+/// Instead of inlining session content (which can be enormous), the prompt
+/// points the agent at the session file paths and lets it read them directly.
 fn build_prompt(sessions: &[Session], existing_skills: &[Skill]) -> String {
     let mut prompt = String::new();
 
     prompt.push_str(
-        "You are a skill extraction engine for the `distill` tool. \
-         Analyze the following AI agent sessions and existing skills, then propose new or \
-         improved skills.\n\n\
+        "You are a skill extraction engine for the `distill` tool.\n\n\
+         Your job: read the AI agent session files listed below, look for repeated \
+         patterns, workflows, or techniques, and propose reusable skills.\n\n\
          IMPORTANT: Respond ONLY with valid JSON — an array of proposal objects. \
          No markdown fences, no commentary.\n\n\
          Each proposal object must have these fields:\n\
@@ -172,7 +233,7 @@ fn build_prompt(sessions: &[Session], existing_skills: &[Skill]) -> String {
          - \"body\": string containing the full proposed skill content in markdown\n\n",
     );
 
-    // Include existing skills context
+    // Existing skills so the agent knows what's already been extracted.
     if existing_skills.is_empty() {
         prompt.push_str("## Existing Skills\n\nNone yet.\n\n");
     } else {
@@ -182,40 +243,78 @@ fn build_prompt(sessions: &[Session], existing_skills: &[Skill]) -> String {
         }
     }
 
-    // Include sessions
-    prompt.push_str("## Recent Sessions\n\n");
+    // List session file paths — the agent reads the actual content itself.
+    prompt.push_str(&format!(
+        "## Session Files ({} total)\n\n\
+         Read these JSONL session files and analyze them for patterns:\n\n",
+        sessions.len()
+    ));
     for session in sessions {
         prompt.push_str(&format!(
-            "### Session {} ({}, {})\n\n{}\n\n---\n\n",
-            session.id,
+            "- {} ({}, {})\n",
+            session.path.display(),
             session.agent,
             session.timestamp.format("%Y-%m-%d %H:%M"),
-            session.content
         ));
     }
 
     prompt.push_str(
-        "Now analyze the sessions above and produce a JSON array of proposals. \
-         Focus on repeated patterns that would benefit from being codified as skills.\n",
+        "\nAnalyze these session files and produce a JSON array of skill proposals. \
+         Focus on repeated patterns that would benefit from being codified as reusable skills.\n",
     );
 
     prompt
 }
 
 /// Invoke the generation agent command and return its stdout.
+///
+/// The prompt is piped via stdin rather than passed as a command-line argument
+/// to avoid hitting the OS `ARG_MAX` limit (`E2BIG` / "Argument list too long").
 fn invoke_agent(command: &str, args: &[String], prompt: &str) -> Result<String> {
-    let output = Command::new(command)
+    let mut child = Command::new(command)
         .args(args)
-        .arg(prompt)
-        .output()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit()) // let agent progress output show in real time
+        .spawn()
         .with_context(|| format!("Failed to execute agent command: {command}"))?;
 
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(prompt.as_bytes())
+            .with_context(|| format!("Failed to write prompt to {command} stdin"))?;
+        // stdin is dropped here, closing the pipe so the child sees EOF
+    }
+
+    // Print a heartbeat every 30 s so the user knows we're not stuck.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_clone = stop.clone();
+    let heartbeat = std::thread::spawn(move || {
+        let mut elapsed = 0u64;
+        while !stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            if stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            elapsed += 10;
+            eprint!("\r  ...agent working ({elapsed}s)   ");
+        }
+        eprint!("\r                            \r"); // clear the line
+    });
+
+    let output = child
+        .wait_with_output()
+        .with_context(|| format!("Failed to wait for agent command: {command}"))?;
+
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = heartbeat.join();
+
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
         bail!(
             "Agent command `{command}` failed with status {}:\n{}",
             output.status,
-            stderr
+            stdout.trim()
         );
     }
 
@@ -240,27 +339,54 @@ struct RawEvidence {
     pattern: String,
 }
 
+/// Claude's `--output-format json` envelope.
+#[derive(serde::Deserialize)]
+struct ClaudeEnvelope {
+    structured_output: Option<serde_json::Value>,
+    result: Option<String>,
+}
+
+/// Wrapper object returned when using `--json-schema` with our schema.
+/// The schema requires `{"proposals": [...]}` because the API mandates a
+/// top-level object.
+#[derive(serde::Deserialize)]
+struct ProposalWrapper {
+    proposals: Vec<RawProposal>,
+}
+
 /// Parse the agent's JSON response into typed Proposal structs.
+///
+/// Handles multiple formats:
+/// 1. Claude JSON envelope with `structured_output.proposals` (preferred)
+/// 2. Claude JSON envelope with `result` text
+/// 3. Raw JSON `{"proposals": [...]}` wrapper
+/// 4. Raw JSON array `[...]`
 pub fn parse_response(raw: &str) -> Result<Vec<Proposal>> {
     let trimmed = raw.trim();
 
-    // Strip markdown code fences if the agent included them
-    let json_str = if trimmed.starts_with("```") {
-        let inner = trimmed
-            .strip_prefix("```json")
-            .or_else(|| trimmed.strip_prefix("```"))
-            .unwrap_or(trimmed);
-        inner
-            .rfind("```")
-            .map(|pos| &inner[..pos])
-            .unwrap_or(inner)
-            .trim()
+    // Try to extract structured_output from a Claude JSON envelope first.
+    let proposals_value: serde_json::Value = if let Ok(envelope) =
+        serde_json::from_str::<ClaudeEnvelope>(trimmed)
+    {
+        if let Some(structured) = envelope.structured_output {
+            structured
+        } else if let Some(ref text) = envelope.result {
+            extract_json_value(text)?
+        } else {
+            extract_json_value(trimmed)?
+        }
     } else {
-        trimmed
+        extract_json_value(trimmed)?
     };
 
+    // The value is either {"proposals": [...]} (from --json-schema) or [...] (raw).
     let raw_proposals: Vec<RawProposal> =
-        serde_json::from_str(json_str).context("Failed to parse agent response as JSON array")?;
+        if let Ok(wrapper) = serde_json::from_value::<ProposalWrapper>(proposals_value.clone()) {
+            wrapper.proposals
+        } else {
+            serde_json::from_value(proposals_value)
+                .context("Failed to parse agent response as proposals")?
+        };
 
     let mut proposals = Vec::new();
     for rp in raw_proposals {
@@ -300,6 +426,27 @@ pub fn parse_response(raw: &str) -> Result<Vec<Proposal>> {
     }
 
     Ok(proposals)
+}
+
+/// Extract a JSON value from raw text that may contain markdown code fences.
+fn extract_json_value(text: &str) -> Result<serde_json::Value> {
+    let trimmed = text.trim();
+
+    let json_str = if trimmed.starts_with("```") {
+        let inner = trimmed
+            .strip_prefix("```json")
+            .or_else(|| trimmed.strip_prefix("```"))
+            .unwrap_or(trimmed);
+        inner
+            .rfind("```")
+            .map(|pos| &inner[..pos])
+            .unwrap_or(inner)
+            .trim()
+    } else {
+        trimmed
+    };
+
+    serde_json::from_str(json_str).context("Failed to parse agent response as JSON")
 }
 
 #[cfg(test)]
@@ -393,7 +540,7 @@ mod tests {
             agent: AgentKind::Claude,
             path: PathBuf::from("/fake/s1.jsonl"),
             timestamp: Utc::now(),
-            content: "User ran deploy script".into(),
+            content: String::new(),
         }];
 
         let skills = vec![Skill {
@@ -402,8 +549,8 @@ mod tests {
         }];
 
         let prompt = build_prompt(&sessions, &skills);
-        assert!(prompt.contains("Recent Sessions"));
-        assert!(prompt.contains("User ran deploy script"));
+        assert!(prompt.contains("Session Files"));
+        assert!(prompt.contains("/fake/s1.jsonl"));
         assert!(prompt.contains("Existing Skills"));
         assert!(prompt.contains("deploy"));
         assert!(prompt.contains("JSON"));
@@ -416,7 +563,7 @@ mod tests {
             agent: AgentKind::Claude,
             path: PathBuf::from("/fake/s1.jsonl"),
             timestamp: Utc::now(),
-            content: "session".into(),
+            content: String::new(),
         }];
 
         let prompt = build_prompt(&sessions, &[]);
@@ -457,9 +604,10 @@ mod tests {
 
         std::fs::create_dir_all(&skills_dir).unwrap();
 
-        // Create a mock agent script that returns valid JSON
+        // Create a mock agent script that reads stdin and returns valid JSON.
+        // The prompt is piped via stdin (not as a positional arg).
         let mock_script = dir.path().join("mock-agent.sh");
-        let script_content = "#!/bin/sh\nprintf '%s' '[{\"type\":\"new\",\"confidence\":\"high\",\"target_skill\":null,\"evidence\":[{\"session\":\"test\",\"pattern\":\"test pattern\"}],\"body\":\"# Test Skill\"}]'\n";
+        let script_content = "#!/bin/sh\ncat > /dev/null\nprintf '%s' '[{\"type\":\"new\",\"confidence\":\"high\",\"target_skill\":null,\"evidence\":[{\"session\":\"test\",\"pattern\":\"test pattern\"}],\"body\":\"# Test Skill\"}]'\n";
         std::fs::write(&mock_script, script_content).unwrap();
         #[cfg(unix)]
         {
@@ -584,14 +732,16 @@ mod tests {
     fn test_agent_command_for_claude() {
         let (cmd, args) = agent_command_for("claude");
         assert_eq!(cmd, "claude");
-        assert_eq!(args, vec!["--print"]);
+        assert!(args.contains(&"--print".to_string()));
+        assert!(args.contains(&"--output-format".to_string()));
+        assert!(args.contains(&"--json-schema".to_string()));
     }
 
     #[test]
     fn test_agent_command_for_codex() {
         let (cmd, args) = agent_command_for("codex");
         assert_eq!(cmd, "codex");
-        assert_eq!(args, vec!["--quiet"]);
+        assert!(args.contains(&"exec".to_string()));
     }
 
     #[test]
@@ -599,5 +749,28 @@ mod tests {
         let (cmd, args) = agent_command_for("custom-agent");
         assert_eq!(cmd, "custom-agent");
         assert!(args.is_empty());
+    }
+
+    #[test]
+    fn test_parse_response_claude_envelope_with_wrapper() {
+        let envelope = r##"{"type":"result","subtype":"success","result":"","structured_output":{"proposals":[{"type":"new","confidence":"high","target_skill":null,"evidence":[{"session":"s1","pattern":"test"}],"body":"# Skill"}]}}"##;
+        let proposals = parse_response(envelope).unwrap();
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].frontmatter.proposal_type, ProposalType::New);
+    }
+
+    #[test]
+    fn test_parse_response_claude_envelope_empty() {
+        let envelope = r#"{"type":"result","subtype":"success","result":"","structured_output":{"proposals":[]}}"#;
+        let proposals = parse_response(envelope).unwrap();
+        assert!(proposals.is_empty());
+    }
+
+    #[test]
+    fn test_parse_response_raw_array_still_works() {
+        // Agents without structured output may return a raw JSON array
+        let json = r#"[{"type":"new","confidence":"medium","target_skill":null,"evidence":[],"body":"test"}]"#;
+        let proposals = parse_response(json).unwrap();
+        assert_eq!(proposals.len(), 1);
     }
 }
