@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 
 use crate::agents::{ClaudeAdapter, CodexAdapter, Agent};
 use crate::config::Config;
+use crate::notify::notify_scan_complete;
 use crate::scanner::engine::{self, ScanConfig};
 
 pub fn run(now: bool) -> Result<()> {
@@ -43,6 +44,10 @@ pub fn run(now: bool) -> Result<()> {
         );
         println!("Run 'distill review' to review them.");
     }
+
+    // Send notification according to the user's preference.
+    // notify_scan_complete is a no-op when proposal_count == 0.
+    notify_scan_complete(proposals.len(), &config.notifications)?;
 
     Ok(())
 }

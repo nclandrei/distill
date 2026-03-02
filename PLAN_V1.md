@@ -234,8 +234,8 @@ Below, tasks are grouped into **waves**. All tasks within a wave can be executed
 
 | # | Task | Description | Done |
 |---|------|-------------|------|
-| 12 | **Notification system** | `src/notify/` — trait `Notifier` with `send(title, body) -> Result<()>`. macOS impl: `osascript` via `std::process::Command` (with `terminal-notifier` as optional enhancement). Linux impl: `notify-send` via `std::process::Command`. Called at end of `distill scan`. Respect user's notification preference from config. Conditional compilation via `#[cfg(target_os)]`. | |
-| 14 | **`distill status` command** | `src/commands/status.rs` — show current config, last scan time, next scheduled scan, number of pending proposals, number of accepted skills. Simple table output via `comfy-table` or similar. | |
+| 12 | **Notification system** | `src/notify/` — trait `Notifier` with `send(title, body) -> Result<()>`. macOS impl: `osascript` via `std::process::Command` (with `terminal-notifier` as optional enhancement). Linux impl: `notify-send` via `std::process::Command`. Called at end of `distill scan`. Respect user's notification preference from config. Conditional compilation via `#[cfg(target_os)]`. | yes |
+| 14 | **`distill status` command** | `src/commands/status.rs` — show current config, last scan time, next scheduled scan, number of pending proposals, number of accepted skills. Simple table output via `comfy-table` or similar. | yes |
 
 ---
 
