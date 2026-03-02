@@ -40,13 +40,25 @@ fn test_status_without_config() {
 }
 
 #[test]
-fn test_scan_now() {
+fn test_scan_now_without_config() {
+    // Without a config file, scan --now should fail with a helpful error
     Command::cargo_bin("distill")
         .unwrap()
         .args(["scan", "--now"])
         .assert()
+        .failure()
+        .stderr(predicate::str::contains("No config found"));
+}
+
+#[test]
+fn test_scan_without_now_flag() {
+    // Without --now, scan prints a message about scheduled scan
+    Command::cargo_bin("distill")
+        .unwrap()
+        .arg("scan")
+        .assert()
         .success()
-        .stdout(predicate::str::contains("scan"));
+        .stdout(predicate::str::contains("scheduled scan not yet implemented"));
 }
 
 #[test]
