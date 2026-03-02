@@ -191,9 +191,9 @@ Below, tasks are grouped into **waves**. All tasks within a wave can be executed
 
 | # | Task | Description | Done |
 |---|------|-------------|------|
-| 2 | **Config system** | `src/config/` — define `Config` struct with serde derive (monitored agents, interval, shell, notification prefs, agent for generation). Load/save `~/.distill/config.yaml` via `serde_yaml`. Ensure `~/.distill/` directory creation with `std::fs`. Enums for `Interval` (`Daily`, `Weekly`, `Monthly`), `NotificationPref`, `ShellType`. Unit tests. | |
-| 3 | **Agent adapters** | `src/agents/` — define `Agent` trait with `fn read_sessions(&self, since: DateTime<Utc>) -> Result<Vec<Session>>` and `fn write_skill(&self, skill: &Skill) -> Result<()>`. Implement `ClaudeAdapter` (reads `~/.claude/` sessions, writes to `CLAUDE.md`) and `CodexAdapter` (reads `~/.codex/` sessions, writes to `instructions.md`). Define `Session` and `Skill` structs. Enum `AgentKind { Claude, Codex }`. Unit tests with fixture data. | |
-| 13 | **Homebrew + cargo-dist** | `cargo-dist` config in `Cargo.toml` (`[dist]` metadata or `dist-workspace.toml`), GitHub Actions release workflow, Homebrew formula in `nclandrei/homebrew-tap`. Can be done now since it just needs `main.rs` to exist. | |
+| 2 | **Config system** | `src/config/` — define `Config` struct with serde derive (monitored agents, interval, shell, notification prefs, agent for generation). Load/save `~/.distill/config.yaml` via `serde_yaml`. Ensure `~/.distill/` directory creation with `std::fs`. Enums for `Interval` (`Daily`, `Weekly`, `Monthly`), `NotificationPref`, `ShellType`. Unit tests. | yes |
+| 3 | **Agent adapters** | `src/agents/` — define `Agent` trait with `fn read_sessions(&self, since: DateTime<Utc>) -> Result<Vec<Session>>` and `fn write_skill(&self, skill: &Skill) -> Result<()>`. Implement `ClaudeAdapter` (reads `~/.claude/` sessions, writes to `CLAUDE.md`) and `CodexAdapter` (reads `~/.codex/` sessions, writes to `instructions.md`). Define `Session` and `Skill` structs. Enum `AgentKind { Claude, Codex }`. Unit tests with fixture data. | yes |
+| 13 | **Homebrew + cargo-dist** | `cargo-dist` config in `Cargo.toml` (`[dist]` metadata or `dist-workspace.toml`), GitHub Actions release workflow, Homebrew formula in `nclandrei/homebrew-tap`. Can be done now since it just needs `main.rs` to exist. | yes |
 
 ---
 

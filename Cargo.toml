@@ -18,3 +18,9 @@ thiserror = "2"
 tempfile = "3"
 assert_cmd = "2"
 predicates = "3"
+
+[package.metadata.dist]
+dist = true
+installers = ["shell", "homebrew"]
+targets = ["x86_64-apple-darwin", "aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]
+tap = "nclandrei/homebrew-tap"
