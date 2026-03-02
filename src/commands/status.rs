@@ -180,8 +180,14 @@ mod tests {
     fn test_format_status_disabled_agent() {
         let mut info = default_info();
         info.config.agents = vec![
-            AgentEntry { name: "claude".into(), enabled: true },
-            AgentEntry { name: "codex".into(), enabled: false },
+            AgentEntry {
+                name: "claude".into(),
+                enabled: true,
+            },
+            AgentEntry {
+                name: "codex".into(),
+                enabled: false,
+            },
         ];
 
         let output = format_status(&info);
@@ -288,7 +294,10 @@ mod tests {
             proposal_agent: "codex".into(),
             shell: ShellType::Bash,
             notifications: NotificationPref::Terminal,
-            agents: vec![AgentEntry { name: "codex".into(), enabled: true }],
+            agents: vec![AgentEntry {
+                name: "codex".into(),
+                enabled: true,
+            }],
         };
 
         let info = collect_status_info(&config, base).unwrap();

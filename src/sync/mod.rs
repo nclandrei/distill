@@ -108,7 +108,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let skills_dir = dir.path().to_path_buf();
 
-        std::fs::write(skills_dir.join("git-workflow.md"), "# Git Workflow\nAlways rebase.").unwrap();
+        std::fs::write(
+            skills_dir.join("git-workflow.md"),
+            "# Git Workflow\nAlways rebase.",
+        )
+        .unwrap();
         std::fs::write(skills_dir.join("code-review.md"), "# Code Review\nBe kind.").unwrap();
 
         let skills = load_skills(&skills_dir).unwrap();

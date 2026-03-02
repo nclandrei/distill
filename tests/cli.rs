@@ -65,7 +65,9 @@ fn test_scan_without_now_flag() {
         .arg("scan")
         .assert()
         .success()
-        .stdout(predicate::str::contains("scheduled scan not yet implemented"));
+        .stdout(predicate::str::contains(
+            "scheduled scan not yet implemented",
+        ));
 }
 
 #[test]

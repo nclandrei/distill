@@ -14,11 +14,7 @@ pub fn run(check: bool) -> Result<()> {
 
     let entries: Vec<_> = std::fs::read_dir(&proposals_dir)?
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .is_some_and(|ext| ext == "md")
-        })
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
         .collect();
 
     if entries.is_empty() {

@@ -159,7 +159,9 @@ fn test_e2e_scan_creates_proposals_dir() {
         .args(["scan", "--now"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("No new sessions found since last scan."));
+        .stdout(predicate::str::contains(
+            "No new sessions found since last scan.",
+        ));
 
     // The .distill directory must have been created by Config::ensure_dirs().
     assert!(

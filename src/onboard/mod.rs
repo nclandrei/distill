@@ -75,7 +75,6 @@ pub fn build_config(answers: &OnboardingAnswers) -> Config {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -93,7 +92,11 @@ mod tests {
         let home = dir.path().to_path_buf();
         // Neither .claude nor .codex exists.
         let detected = detect_agents(&home);
-        assert_eq!(detected.len(), 2, "should report an entry for every known agent");
+        assert_eq!(
+            detected.len(),
+            2,
+            "should report an entry for every known agent"
+        );
         for (_, installed) in &detected {
             assert!(!installed, "no agent should be detected");
         }
@@ -106,8 +109,14 @@ mod tests {
         std::fs::create_dir_all(home.join(".claude")).unwrap();
 
         let detected = detect_agents(&home);
-        let claude = detected.iter().find(|(k, _)| *k == AgentKind::Claude).unwrap();
-        let codex = detected.iter().find(|(k, _)| *k == AgentKind::Codex).unwrap();
+        let claude = detected
+            .iter()
+            .find(|(k, _)| *k == AgentKind::Claude)
+            .unwrap();
+        let codex = detected
+            .iter()
+            .find(|(k, _)| *k == AgentKind::Codex)
+            .unwrap();
         assert!(claude.1, "Claude should be detected");
         assert!(!codex.1, "Codex should not be detected");
     }
@@ -119,8 +128,14 @@ mod tests {
         std::fs::create_dir_all(home.join(".codex")).unwrap();
 
         let detected = detect_agents(&home);
-        let claude = detected.iter().find(|(k, _)| *k == AgentKind::Claude).unwrap();
-        let codex = detected.iter().find(|(k, _)| *k == AgentKind::Codex).unwrap();
+        let claude = detected
+            .iter()
+            .find(|(k, _)| *k == AgentKind::Claude)
+            .unwrap();
+        let codex = detected
+            .iter()
+            .find(|(k, _)| *k == AgentKind::Codex)
+            .unwrap();
         assert!(!claude.1, "Claude should not be detected");
         assert!(codex.1, "Codex should be detected");
     }

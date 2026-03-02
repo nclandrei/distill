@@ -23,10 +23,7 @@ pub struct MacOsNotifier;
 
 impl Notifier for MacOsNotifier {
     fn send(&self, title: &str, body: &str) -> Result<()> {
-        let script = format!(
-            "display notification \"{}\" with title \"{}\"",
-            body, title
-        );
+        let script = format!("display notification \"{}\" with title \"{}\"", body, title);
         let status = Command::new("osascript")
             .arg("-e")
             .arg(&script)
@@ -152,7 +149,10 @@ mod tests {
     #[test]
     fn test_terminal_notifier_is_available() {
         let notifier = TerminalNotifier;
-        assert!(notifier.is_available(), "TerminalNotifier must always be available");
+        assert!(
+            notifier.is_available(),
+            "TerminalNotifier must always be available"
+        );
     }
 
     #[test]
@@ -171,7 +171,10 @@ mod tests {
         if cfg!(target_os = "macos") {
             assert!(available, "MacOsNotifier should be available on macOS");
         } else {
-            assert!(!available, "MacOsNotifier should not be available off macOS");
+            assert!(
+                !available,
+                "MacOsNotifier should not be available off macOS"
+            );
         }
     }
 
@@ -210,10 +213,7 @@ mod tests {
     #[test]
     fn test_notify_scan_complete_zero_proposals() {
         // Zero proposals must be a silent no-op regardless of pref.
-        for pref in [
-            NotificationPref::None,
-            NotificationPref::Terminal,
-        ] {
+        for pref in [NotificationPref::None, NotificationPref::Terminal] {
             let result = notify_scan_complete(0, &pref);
             assert!(
                 result.is_ok(),

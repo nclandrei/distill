@@ -4,7 +4,7 @@ use anyhow::Result;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
     prelude::*,
@@ -12,9 +12,9 @@ use ratatui::{
 };
 use std::io::{self, IsTerminal};
 
+use super::{OnboardingAnswers, build_config, detect_agents};
 use crate::agents::AgentKind;
 use crate::config::{Config, Interval, NotificationPref, ShellType};
-use super::{build_config, detect_agents, OnboardingAnswers};
 
 // ---------------------------------------------------------------------------
 // State machine
@@ -106,8 +106,20 @@ impl WizardState {
             Step::SelectAgents => 2,
             Step::SelectInterval => 3,
             Step::SelectProposal => 4,
-            Step::SelectShell => if self.should_skip_proposal() { 4 } else { 5 },
-            Step::SelectNotifications => if self.should_skip_proposal() { 5 } else { 6 },
+            Step::SelectShell => {
+                if self.should_skip_proposal() {
+                    4
+                } else {
+                    5
+                }
+            }
+            Step::SelectNotifications => {
+                if self.should_skip_proposal() {
+                    5
+                } else {
+                    6
+                }
+            }
             Step::Summary => self.total_steps(),
             Step::Done | Step::Cancelled => self.total_steps(),
         }
@@ -291,11 +303,7 @@ fn render(frame: &mut Frame, state: &WizardState) {
         .split(inner);
 
     // -- Header: progress --
-    let header_text = format!(
-        "Step {} of {}",
-        state.step_number(),
-        state.total_steps()
-    );
+    let header_text = format!("Step {} of {}", state.step_number(), state.total_steps());
     let header = Paragraph::new(header_text).style(Style::default().fg(Color::Cyan));
     frame.render_widget(header, chunks[0]);
 
@@ -304,24 +312,40 @@ fn render(frame: &mut Frame, state: &WizardState) {
         Step::Welcome => render_welcome(frame, chunks[1], state),
         Step::SelectAgents => render_select_agents(frame, chunks[1], state),
         Step::SelectInterval => render_single_select(
-            frame, chunks[1], "How often should distill scan for new skills?",
-            INTERVALS, state.cursor,
+            frame,
+            chunks[1],
+            "How often should distill scan for new skills?",
+            INTERVALS,
+            state.cursor,
         ),
         Step::SelectProposal => {
-            let labels: Vec<String> = state.enabled_agents().iter().map(|k| k.to_string()).collect();
+            let labels: Vec<String> = state
+                .enabled_agents()
+                .iter()
+                .map(|k| k.to_string())
+                .collect();
             let label_refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
             render_single_select(
-                frame, chunks[1], "Which agent should generate skill proposals?",
-                &label_refs, state.cursor,
+                frame,
+                chunks[1],
+                "Which agent should generate skill proposals?",
+                &label_refs,
+                state.cursor,
             );
         }
         Step::SelectShell => render_single_select(
-            frame, chunks[1], "Confirm your shell:",
-            SHELLS, state.cursor,
+            frame,
+            chunks[1],
+            "Confirm your shell:",
+            SHELLS,
+            state.cursor,
         ),
         Step::SelectNotifications => render_single_select(
-            frame, chunks[1], "How would you like to receive notifications?",
-            NOTIFICATIONS, state.cursor,
+            frame,
+            chunks[1],
+            "How would you like to receive notifications?",
+            NOTIFICATIONS,
+            state.cursor,
         ),
         Step::Summary => render_summary(frame, chunks[1], state),
         _ => {}
@@ -347,18 +371,23 @@ fn render_welcome(frame: &mut Frame, area: Rect, state: &WizardState) {
     let welcome = Paragraph::new("Welcome to distill! Let's set things up.\n\nDetected agents:");
     frame.render_widget(welcome, chunks[0]);
 
-    let rows: Vec<Row> = state.detected_agents.iter().map(|(kind, found)| {
-        let status = if *found { "found" } else { "not found" };
-        let style = if *found {
-            Style::default().fg(Color::Green)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        Row::new(vec![kind.to_string(), status.to_string()]).style(style)
-    }).collect();
+    let rows: Vec<Row> = state
+        .detected_agents
+        .iter()
+        .map(|(kind, found)| {
+            let status = if *found { "found" } else { "not found" };
+            let style = if *found {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            Row::new(vec![kind.to_string(), status.to_string()]).style(style)
+        })
+        .collect();
 
-    let table = Table::new(rows, [Constraint::Length(12), Constraint::Length(12)])
-        .header(Row::new(vec!["Agent", "Status"]).style(Style::default().add_modifier(Modifier::BOLD)));
+    let table = Table::new(rows, [Constraint::Length(12), Constraint::Length(12)]).header(
+        Row::new(vec!["Agent", "Status"]).style(Style::default().add_modifier(Modifier::BOLD)),
+    );
     frame.render_widget(table, chunks[1]);
 }
 
@@ -375,8 +404,17 @@ fn render_select_agents(frame: &mut Frame, area: Rect, state: &WizardState) {
         .iter()
         .enumerate()
         .map(|(i, kind)| {
-            let checked = if state.agents_enabled[i] { "[x]" } else { "[ ]" };
-            let detected = state.detected_agents.iter().find(|(k, _)| k == kind).map(|(_, v)| *v).unwrap_or(false);
+            let checked = if state.agents_enabled[i] {
+                "[x]"
+            } else {
+                "[ ]"
+            };
+            let detected = state
+                .detected_agents
+                .iter()
+                .find(|(k, _)| k == kind)
+                .map(|(_, v)| *v)
+                .unwrap_or(false);
             let suffix = if detected { "" } else { " (not detected)" };
             let label = format!("{checked} {kind}{suffix}");
             let style = if i == state.cursor {
@@ -432,11 +470,18 @@ fn render_summary(frame: &mut Frame, area: Rect, state: &WizardState) {
     let enabled_display = if enabled.is_empty() {
         "(none)".to_string()
     } else {
-        enabled.iter().map(|k| k.to_string()).collect::<Vec<_>>().join(", ")
+        enabled
+            .iter()
+            .map(|k| k.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
     };
 
     let interval = INTERVALS[state.scan_interval_idx];
-    let proposal = enabled.get(state.proposal_agent_idx).map(|k| k.to_string()).unwrap_or_else(|| "claude".to_string());
+    let proposal = enabled
+        .get(state.proposal_agent_idx)
+        .map(|k| k.to_string())
+        .unwrap_or_else(|| "claude".to_string());
     let shell = SHELLS[state.shell_idx];
     let notif = NOTIFICATIONS[state.notification_idx];
 
@@ -456,8 +501,9 @@ fn render_summary(frame: &mut Frame, area: Rect, state: &WizardState) {
     let title = Paragraph::new("Review your choices:");
     frame.render_widget(title, chunks[0]);
 
-    let table = Table::new(rows, [Constraint::Length(20), Constraint::Min(20)])
-        .header(Row::new(vec!["Setting", "Value"]).style(Style::default().add_modifier(Modifier::BOLD)));
+    let table = Table::new(rows, [Constraint::Length(20), Constraint::Min(20)]).header(
+        Row::new(vec!["Setting", "Value"]).style(Style::default().add_modifier(Modifier::BOLD)),
+    );
     frame.render_widget(table, chunks[1]);
 }
 
@@ -465,7 +511,10 @@ fn render_summary(frame: &mut Frame, area: Rect, state: &WizardState) {
 // Event loop
 // ---------------------------------------------------------------------------
 
-fn run_wizard(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, state: &mut WizardState) -> Result<()> {
+fn run_wizard(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    state: &mut WizardState,
+) -> Result<()> {
     loop {
         terminal.draw(|f| render(f, state))?;
 
@@ -539,10 +588,7 @@ pub fn run_interactive() -> Result<()> {
     let config = build_config(&answers);
     config.save()?;
 
-    println!(
-        "Configuration saved to {}",
-        Config::config_path().display()
-    );
+    println!("Configuration saved to {}", Config::config_path().display());
 
     Ok(())
 }

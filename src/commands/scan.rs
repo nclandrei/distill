@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 
-use crate::agents::{ClaudeAdapter, CodexAdapter, Agent};
+use crate::agents::{Agent, ClaudeAdapter, CodexAdapter};
 use crate::config::Config;
 use crate::notify::notify_scan_complete;
 use crate::scanner::engine::{self, ScanConfig};

@@ -7,7 +7,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 
-use crate::agents::{from_kind, AgentKind};
+use crate::agents::{AgentKind, from_kind};
 use crate::config::Config;
 use crate::proposals::Proposal;
 
@@ -120,10 +120,7 @@ pub fn log_decision(history_dir: &Path, entry: &HistoryEntry) -> Result<()> {
 /// 3. A timestamp-based fallback.
 fn skill_filename_for(proposal: &Proposal) -> String {
     if let Some(target) = &proposal.frontmatter.target_skill {
-        let slug = target
-            .to_lowercase()
-            .replace(' ', "-")
-            .replace('_', "-");
+        let slug = target.to_lowercase().replace(' ', "-").replace('_', "-");
         if slug.ends_with(".md") {
             slug
         } else {
@@ -171,9 +168,8 @@ pub fn accept_proposal(
     // Delete the proposal file.
     let proposal_path = proposals_dir.join(&proposal_filename);
     if proposal_path.exists() {
-        fs::remove_file(&proposal_path).with_context(|| {
-            format!("Failed to delete proposal: {}", proposal_path.display())
-        })?;
+        fs::remove_file(&proposal_path)
+            .with_context(|| format!("Failed to delete proposal: {}", proposal_path.display()))?;
     }
 
     Ok(())
@@ -201,9 +197,8 @@ pub fn reject_proposal(
     // Delete the proposal file.
     let proposal_path = proposals_dir.join(&proposal_filename);
     if proposal_path.exists() {
-        fs::remove_file(&proposal_path).with_context(|| {
-            format!("Failed to delete proposal: {}", proposal_path.display())
-        })?;
+        fs::remove_file(&proposal_path)
+            .with_context(|| format!("Failed to delete proposal: {}", proposal_path.display()))?;
     }
 
     Ok(())
@@ -402,10 +397,7 @@ pub fn run_review_interactive(
         println!("Syncing skills to agents...");
         match sync_after_review(skills_dir) {
             Ok(report) => {
-                println!(
-                    "  Synced {} operation(s) across agents.",
-                    report.synced,
-                );
+                println!("  Synced {} operation(s) across agents.", report.synced,);
                 if !report.errors.is_empty() {
                     for err in &report.errors {
                         eprintln!("  Sync warning: {err}");
@@ -566,7 +558,10 @@ mod tests {
         let proposal_path = proposals_dir.join("delete-me.md");
         write_proposal_file(&proposals_dir, &proposal);
 
-        assert!(proposal_path.exists(), "proposal file should exist before accept");
+        assert!(
+            proposal_path.exists(),
+            "proposal file should exist before accept"
+        );
         accept_proposal(&proposal, &skills_dir, &history_dir, &proposals_dir).unwrap();
         assert!(
             !proposal_path.exists(),
@@ -590,8 +585,14 @@ mod tests {
         let decisions_path = history_dir.join("decisions.jsonl");
         assert!(decisions_path.exists(), "decisions.jsonl should be created");
         let content = fs::read_to_string(&decisions_path).unwrap();
-        assert!(content.contains("\"accepted\""), "should log accepted decision");
-        assert!(content.contains("logged.md"), "should include proposal filename");
+        assert!(
+            content.contains("\"accepted\""),
+            "should log accepted decision"
+        );
+        assert!(
+            content.contains("logged.md"),
+            "should include proposal filename"
+        );
     }
 
     #[test]
@@ -639,7 +640,10 @@ mod tests {
         let proposal_path = proposals_dir.join("reject-me.md");
         write_proposal_file(&proposals_dir, &proposal);
 
-        assert!(proposal_path.exists(), "proposal file should exist before reject");
+        assert!(
+            proposal_path.exists(),
+            "proposal file should exist before reject"
+        );
         reject_proposal(&proposal, &history_dir, &proposals_dir).unwrap();
         assert!(
             !proposal_path.exists(),
@@ -662,7 +666,10 @@ mod tests {
         let decisions_path = history_dir.join("decisions.jsonl");
         assert!(decisions_path.exists(), "decisions.jsonl should be created");
         let content = fs::read_to_string(&decisions_path).unwrap();
-        assert!(content.contains("\"rejected\""), "should log rejected decision");
+        assert!(
+            content.contains("\"rejected\""),
+            "should log rejected decision"
+        );
         assert!(
             content.contains("reject-log.md"),
             "should include proposal filename"
@@ -738,8 +745,8 @@ mod tests {
         let path = history_dir.join("decisions.jsonl");
         let content = fs::read_to_string(&path).unwrap();
         for line in content.lines() {
-            let parsed: serde_json::Value = serde_json::from_str(line)
-                .expect("each line should be valid JSON");
+            let parsed: serde_json::Value =
+                serde_json::from_str(line).expect("each line should be valid JSON");
             assert_eq!(
                 parsed["proposal_filename"].as_str().unwrap(),
                 "valid-json.md"
@@ -775,9 +782,14 @@ mod tests {
             ReviewDecision::Skip,
         ];
 
-        let summary =
-            run_review(&proposals, &decisions, &skills_dir, &history_dir, &proposals_dir)
-                .unwrap();
+        let summary = run_review(
+            &proposals,
+            &decisions,
+            &skills_dir,
+            &history_dir,
+            &proposals_dir,
+        )
+        .unwrap();
 
         assert_eq!(summary.accepted, 1);
         assert_eq!(summary.rejected, 1);
@@ -800,9 +812,14 @@ mod tests {
         let proposals = vec![p1, p2];
         let decisions = vec![ReviewDecision::Accept, ReviewDecision::Accept];
 
-        let summary =
-            run_review(&proposals, &decisions, &skills_dir, &history_dir, &proposals_dir)
-                .unwrap();
+        let summary = run_review(
+            &proposals,
+            &decisions,
+            &skills_dir,
+            &history_dir,
+            &proposals_dir,
+        )
+        .unwrap();
 
         assert_eq!(summary.accepted, 2);
         assert_eq!(summary.rejected, 0);
@@ -829,9 +846,14 @@ mod tests {
         let proposals = vec![p1, p2];
         let decisions = vec![ReviewDecision::Reject, ReviewDecision::Reject];
 
-        let summary =
-            run_review(&proposals, &decisions, &skills_dir, &history_dir, &proposals_dir)
-                .unwrap();
+        let summary = run_review(
+            &proposals,
+            &decisions,
+            &skills_dir,
+            &history_dir,
+            &proposals_dir,
+        )
+        .unwrap();
 
         assert_eq!(summary.accepted, 0);
         assert_eq!(summary.rejected, 2);
@@ -855,9 +877,14 @@ mod tests {
         let proposals = vec![p1];
         let decisions = vec![ReviewDecision::Skip];
 
-        let summary =
-            run_review(&proposals, &decisions, &skills_dir, &history_dir, &proposals_dir)
-                .unwrap();
+        let summary = run_review(
+            &proposals,
+            &decisions,
+            &skills_dir,
+            &history_dir,
+            &proposals_dir,
+        )
+        .unwrap();
 
         assert_eq!(summary.accepted, 0);
         assert_eq!(summary.rejected, 0);

@@ -67,7 +67,9 @@ impl Proposal {
 
         let yaml_str = &after_first[..end];
         let body_start = end + 4; // skip \n---
-        let body = after_first[body_start..].trim_start_matches('\n').to_string();
+        let body = after_first[body_start..]
+            .trim_start_matches('\n')
+            .to_string();
 
         let frontmatter: ProposalFrontmatter = serde_yaml::from_str(yaml_str)?;
 

@@ -213,8 +213,9 @@ impl Scheduler for SystemdScheduler {
         let service_path = self.service_path();
 
         if timer_path.exists() {
-            fs::remove_file(&timer_path)
-                .with_context(|| format!("Failed to remove timer unit: {}", timer_path.display()))?;
+            fs::remove_file(&timer_path).with_context(|| {
+                format!("Failed to remove timer unit: {}", timer_path.display())
+            })?;
         }
         if service_path.exists() {
             fs::remove_file(&service_path).with_context(|| {
@@ -400,8 +401,14 @@ mod tests {
         assert!(scheduler.service_path().exists());
         assert!(scheduler.timer_path().exists());
         scheduler.uninstall().unwrap();
-        assert!(!scheduler.service_path().exists(), "service file still exists after uninstall");
-        assert!(!scheduler.timer_path().exists(), "timer file still exists after uninstall");
+        assert!(
+            !scheduler.service_path().exists(),
+            "service file still exists after uninstall"
+        );
+        assert!(
+            !scheduler.timer_path().exists(),
+            "timer file still exists after uninstall"
+        );
     }
 
     #[test]
@@ -425,8 +432,14 @@ mod tests {
         let scheduler = LaunchdScheduler::new(dir.path().to_path_buf());
         scheduler.install(&Interval::Daily).unwrap();
         let content = fs::read_to_string(scheduler.plist_or_unit_path()).unwrap();
-        assert!(content.starts_with("<?xml"), "plist does not start with XML declaration");
-        assert!(content.contains("<plist version=\"1.0\">"), "missing plist root element");
+        assert!(
+            content.starts_with("<?xml"),
+            "plist does not start with XML declaration"
+        );
+        assert!(
+            content.contains("<plist version=\"1.0\">"),
+            "missing plist root element"
+        );
         assert!(content.contains("</plist>"), "plist missing closing tag");
         assert!(
             content.contains("com.distill.agent"),
@@ -440,9 +453,18 @@ mod tests {
         let scheduler = SystemdScheduler::new(dir.path().to_path_buf());
         scheduler.install(&Interval::Daily).unwrap();
         let content = fs::read_to_string(scheduler.service_path()).unwrap();
-        assert!(content.contains("ExecStart="), "service missing ExecStart directive");
-        assert!(content.contains("scan"), "service ExecStart missing 'scan' subcommand");
-        assert!(content.contains("[Service]"), "service missing [Service] section");
+        assert!(
+            content.contains("ExecStart="),
+            "service missing ExecStart directive"
+        );
+        assert!(
+            content.contains("scan"),
+            "service ExecStart missing 'scan' subcommand"
+        );
+        assert!(
+            content.contains("[Service]"),
+            "service missing [Service] section"
+        );
         assert!(content.contains("[Unit]"), "service missing [Unit] section");
     }
 

@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -79,18 +79,11 @@ pub fn run_scan(agents: &[Box<dyn Agent>], scan_config: &ScanConfig) -> Result<V
 
     // Step 3: Load existing skills
     let skills = load_skills(&scan_config.skills_dir)?;
-    println!(
-        "Loaded {} existing skill(s).",
-        skills.len()
-    );
+    println!("Loaded {} existing skill(s).", skills.len());
 
     // Step 4: Build prompt and invoke agent
     let prompt = build_prompt(&sessions, &skills);
-    let raw_response = invoke_agent(
-        &scan_config.agent_command,
-        &scan_config.agent_args,
-        &prompt,
-    )?;
+    let raw_response = invoke_agent(&scan_config.agent_command, &scan_config.agent_args, &prompt)?;
 
     // Step 5: Parse response into proposals
     let proposals = parse_response(&raw_response)?;
@@ -178,7 +171,10 @@ fn build_prompt(sessions: &[Session], existing_skills: &[Skill]) -> String {
     } else {
         prompt.push_str("## Existing Skills\n\n");
         for skill in existing_skills {
-            prompt.push_str(&format!("### {}\n\n{}\n\n---\n\n", skill.name, skill.content));
+            prompt.push_str(&format!(
+                "### {}\n\n{}\n\n---\n\n",
+                skill.name, skill.content
+            ));
         }
     }
 
@@ -358,7 +354,10 @@ mod tests {
         let proposals = parse_response(json).unwrap();
         assert_eq!(proposals.len(), 3);
         assert_eq!(proposals[0].frontmatter.proposal_type, ProposalType::New);
-        assert_eq!(proposals[1].frontmatter.proposal_type, ProposalType::Improve);
+        assert_eq!(
+            proposals[1].frontmatter.proposal_type,
+            ProposalType::Improve
+        );
         assert_eq!(
             proposals[1].frontmatter.target_skill.as_deref(),
             Some("existing-skill.md")
@@ -383,7 +382,12 @@ mod tests {
         let json = r#"[{"type":"unknown","confidence":"high","target_skill":null,"evidence":[],"body":"x"}]"#;
         let result = parse_response(json);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Unknown proposal type"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Unknown proposal type")
+        );
     }
 
     #[test]
@@ -433,7 +437,11 @@ mod tests {
     #[test]
     fn test_load_skills_reads_md_files() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("git-workflow.md"), "# Git Workflow\nDo stuff").unwrap();
+        std::fs::write(
+            dir.path().join("git-workflow.md"),
+            "# Git Workflow\nDo stuff",
+        )
+        .unwrap();
         std::fs::write(dir.path().join("not-a-skill.txt"), "ignore me").unwrap();
 
         let skills = load_skills(dir.path()).unwrap();

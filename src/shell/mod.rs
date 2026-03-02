@@ -42,9 +42,7 @@ pub fn hook_snippet(shell: &ShellType) -> &'static str {
         ShellType::Zsh | ShellType::Bash => {
             "# distill hook\ncommand -v distill &>/dev/null && distill notify --check"
         }
-        ShellType::Fish => {
-            "# distill hook\nif command -q distill; distill notify --check; end"
-        }
+        ShellType::Fish => "# distill hook\nif command -q distill; distill notify --check; end",
         ShellType::Other => "",
     }
 }
@@ -247,7 +245,10 @@ mod tests {
         let path = shell_config_path(&ShellType::Fish, home).unwrap();
         assert_eq!(
             path,
-            home.join(".config").join("fish").join("conf.d").join("distill.fish")
+            home.join(".config")
+                .join("fish")
+                .join("conf.d")
+                .join("distill.fish")
         );
     }
 

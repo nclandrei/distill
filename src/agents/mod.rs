@@ -104,9 +104,7 @@ fn collect_jsonl_recursive(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
 
 /// Convert a `std::time::SystemTime` to `DateTime<Utc>`.
 fn system_time_to_utc(st: std::time::SystemTime) -> DateTime<Utc> {
-    let duration = st
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
+    let duration = st.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
     DateTime::from_timestamp(duration.as_secs() as i64, duration.subsec_nanos())
         .unwrap_or_else(Utc::now)
 }
@@ -170,7 +168,7 @@ impl Agent for ClaudeAdapter {
         for path in files {
             match read_jsonl_session(&path, AgentKind::Claude) {
                 Ok(session) if session.timestamp >= since => sessions.push(session),
-                Ok(_) => {} // filtered out by `since`
+                Ok(_) => {}  // filtered out by `since`
                 Err(_) => {} // skip unreadable files silently
             }
         }
@@ -435,7 +433,10 @@ mod tests {
         let projects = home.join(".claude").join("projects").join("my-project");
 
         write_jsonl(&projects.join("session-alpha.jsonl"), r#"{"role":"user"}"#);
-        write_jsonl(&projects.join("session-beta.jsonl"), r#"{"role":"assistant"}"#);
+        write_jsonl(
+            &projects.join("session-beta.jsonl"),
+            r#"{"role":"assistant"}"#,
+        );
 
         let adapter = ClaudeAdapter::with_home(home);
         let sessions = adapter.read_sessions(DateTime::UNIX_EPOCH).unwrap();
@@ -493,10 +494,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().to_path_buf();
 
-        write_jsonl(
-            &home.join(".claude/projects/proj-a/s1.jsonl"),
-            r#"{"a":1}"#,
-        );
+        write_jsonl(&home.join(".claude/projects/proj-a/s1.jsonl"), r#"{"a":1}"#);
         write_jsonl(
             &home.join(".claude/projects/proj-b/sub/s2.jsonl"),
             r#"{"b":2}"#,
@@ -587,8 +585,7 @@ mod tests {
             content: "created automatically".into(),
         };
         adapter.write_skill(&skill).unwrap();
-        let written =
-            std::fs::read_to_string(home.join(".codex/instructions.md")).unwrap();
+        let written = std::fs::read_to_string(home.join(".codex/instructions.md")).unwrap();
         assert!(written.contains("<!-- distill:skill:auto-dir -->"));
     }
 
@@ -637,8 +634,7 @@ mod tests {
         adapter.write_skill(&skill_a).unwrap();
         adapter.write_skill(&skill_b).unwrap();
 
-        let written =
-            std::fs::read_to_string(home.join(".codex/instructions.md")).unwrap();
+        let written = std::fs::read_to_string(home.join(".codex/instructions.md")).unwrap();
         assert!(written.contains("<!-- distill:skill:alpha -->"));
         assert!(written.contains("Alpha content"));
         assert!(written.contains("<!-- distill:skill:beta -->"));
