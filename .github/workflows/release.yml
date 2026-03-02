@@ -2,15 +2,40 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*"
+    branches: [main]
 
 permissions:
   contents: write
 
 jobs:
-  dist:
-    name: Build and publish release
+  check-version:
+    name: Check if release needed
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      should_release: ${{ steps.meta.outputs.should_release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract version and check tag
+        id: meta
+        run: |
+          version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if git rev-parse "v$version" >/dev/null 2>&1; then
+            echo "Tag v$version already exists — skipping release"
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Tag v$version does not exist — will release"
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: check-version
+    if: needs.check-version.outputs.should_release == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
@@ -37,16 +62,108 @@ jobs:
           key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-${{ matrix.target }}-cargo-
 
-      - name: Install cargo-dist
-        run: cargo install cargo-dist --locked
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Build dist artifacts
-        run: cargo dist build --target ${{ matrix.target }} --output-format=json
+      - name: Package tarball
+        run: |
+          staging="distill-${{ needs.check-version.outputs.version }}-${{ matrix.target }}"
+          mkdir "$staging"
+          cp "target/${{ matrix.target }}/release/distill" "$staging/"
+          tar czf "$staging.tar.gz" "$staging"
 
-      - name: Upload artifacts to GitHub release
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: distill-${{ matrix.target }}
+          path: "*.tar.gz"
+
+  release:
+    name: Create GitHub release
+    needs: [check-version, build]
+    if: needs.check-version.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.check-version.outputs.version }}
         run: |
-          tag="${GITHUB_REF#refs/tags/}"
-          gh release create "$tag" --generate-notes --draft || true
-          gh release upload "$tag" dist/artifacts/* --clobber
+          gh release create "v$VERSION" \
+            --title "v$VERSION" \
+            --generate-notes \
+            artifacts/*.tar.gz
+
+  update-tap:
+    name: Update Homebrew tap
+    needs: [check-version, release]
+    if: needs.check-version.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Compute checksums and push formula
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ needs.check-version.outputs.version }}
+        run: |
+          sha_x86_mac=$(sha256sum artifacts/distill-${VERSION}-x86_64-apple-darwin.tar.gz | cut -d' ' -f1)
+          sha_arm_mac=$(sha256sum artifacts/distill-${VERSION}-aarch64-apple-darwin.tar.gz | cut -d' ' -f1)
+          sha_x86_linux=$(sha256sum artifacts/distill-${VERSION}-x86_64-unknown-linux-gnu.tar.gz | cut -d' ' -f1)
+
+          base_url="https://github.com/nclandrei/distill/releases/download/v${VERSION}"
+
+          formula="class Distill < Formula
+            desc \"CLI tool that monitors AI agent sessions, identifies patterns, and proposes skills\"
+            homepage \"https://github.com/nclandrei/distill\"
+            version \"${VERSION}\"
+            license \"MIT\"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url \"${base_url}/distill-${VERSION}-aarch64-apple-darwin.tar.gz\"
+                sha256 \"${sha_arm_mac}\"
+              else
+                url \"${base_url}/distill-${VERSION}-x86_64-apple-darwin.tar.gz\"
+                sha256 \"${sha_x86_mac}\"
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.intel?
+                url \"${base_url}/distill-${VERSION}-x86_64-unknown-linux-gnu.tar.gz\"
+                sha256 \"${sha_x86_linux}\"
+              end
+            end
+
+            def install
+              bin.install \"distill\"
+            end
+
+            test do
+              assert_match version.to_s, shell_output(\"#{bin}/distill --version\")
+            end
+          end"
+
+          # Get existing file SHA (needed for updates, absent on first create)
+          existing_sha=$(gh api "repos/nclandrei/homebrew-tap/contents/Formula/distill.rb" --jq '.sha' 2>/dev/null || echo "")
+
+          payload=$(jq -n \
+            --arg message "Update distill to ${VERSION}" \
+            --arg content "$(echo "$formula" | base64 -w0)" \
+            --arg sha "$existing_sha" \
+            '{message: $message, content: $content} + (if $sha != "" then {sha: $sha} else {} end)')
+
+          gh api --method PUT \
+            "repos/nclandrei/homebrew-tap/contents/Formula/distill.rb" \
+            --input - <<< "$payload"
