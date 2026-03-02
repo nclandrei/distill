@@ -179,9 +179,9 @@ Below, tasks are grouped into **waves**. All tasks within a wave can be executed
 
 > Must be done first by a single agent. Everything else depends on this.
 
-| # | Task | Description |
-|---|------|-------------|
-| 1 | **Project scaffold** | `cargo init`, workspace structure (`src/`, `src/commands/`, `src/agents/`, `src/config/`, `src/scanner/`, `src/proposals/`, `src/review/`, `src/sync/`, `src/notify/`, `src/schedule/`, `src/shell/`), `main.rs` entry point with clap derive root command, `Cargo.toml` with all dependencies, `Makefile` with `build`/`test`/`lint`/`fmt` targets. |
+| # | Task | Description | Done |
+|---|------|-------------|------|
+| 1 | **Project scaffold** | `cargo init`, workspace structure (`src/`, `src/commands/`, `src/agents/`, `src/config/`, `src/scanner/`, `src/proposals/`, `src/review/`, `src/sync/`, `src/notify/`, `src/schedule/`, `src/shell/`), `main.rs` entry point with clap derive root command, `Cargo.toml` with all dependencies, `Makefile` with `build`/`test`/`lint`/`fmt` targets. | yes |
 
 ---
 
@@ -189,22 +189,22 @@ Below, tasks are grouped into **waves**. All tasks within a wave can be executed
 
 > These have no dependencies on each other, only on the scaffold.
 
-| # | Task | Description |
-|---|------|-------------|
-| 2 | **Config system** | `src/config/` — define `Config` struct with serde derive (monitored agents, interval, shell, notification prefs, agent for generation). Load/save `~/.distill/config.yaml` via `serde_yaml`. Ensure `~/.distill/` directory creation with `std::fs`. Enums for `Interval` (`Daily`, `Weekly`, `Monthly`), `NotificationPref`, `ShellType`. Unit tests. |
-| 3 | **Agent adapters** | `src/agents/` — define `Agent` trait with `fn read_sessions(&self, since: DateTime<Utc>) -> Result<Vec<Session>>` and `fn write_skill(&self, skill: &Skill) -> Result<()>`. Implement `ClaudeAdapter` (reads `~/.claude/` sessions, writes to `CLAUDE.md`) and `CodexAdapter` (reads `~/.codex/` sessions, writes to `instructions.md`). Define `Session` and `Skill` structs. Enum `AgentKind { Claude, Codex }`. Unit tests with fixture data. |
-| 13 | **Homebrew + cargo-dist** | `cargo-dist` config in `Cargo.toml` (`[dist]` metadata or `dist-workspace.toml`), GitHub Actions release workflow, Homebrew formula in `nclandrei/homebrew-tap`. Can be done now since it just needs `main.rs` to exist. |
+| # | Task | Description | Done |
+|---|------|-------------|------|
+| 2 | **Config system** | `src/config/` — define `Config` struct with serde derive (monitored agents, interval, shell, notification prefs, agent for generation). Load/save `~/.distill/config.yaml` via `serde_yaml`. Ensure `~/.distill/` directory creation with `std::fs`. Enums for `Interval` (`Daily`, `Weekly`, `Monthly`), `NotificationPref`, `ShellType`. Unit tests. | |
+| 3 | **Agent adapters** | `src/agents/` — define `Agent` trait with `fn read_sessions(&self, since: DateTime<Utc>) -> Result<Vec<Session>>` and `fn write_skill(&self, skill: &Skill) -> Result<()>`. Implement `ClaudeAdapter` (reads `~/.claude/` sessions, writes to `CLAUDE.md`) and `CodexAdapter` (reads `~/.codex/` sessions, writes to `instructions.md`). Define `Session` and `Skill` structs. Enum `AgentKind { Claude, Codex }`. Unit tests with fixture data. | |
+| 13 | **Homebrew + cargo-dist** | `cargo-dist` config in `Cargo.toml` (`[dist]` metadata or `dist-workspace.toml`), GitHub Actions release workflow, Homebrew formula in `nclandrei/homebrew-tap`. Can be done now since it just needs `main.rs` to exist. | |
 
 ---
 
 #### Wave 2 — Features that depend on config + adapters (fully parallel, 4 agents)
 
-| # | Task | Description |
-|---|------|-------------|
-| 4 | **Onboarding flow** | `src/onboard/` — interactive first-run flow using `dialoguer` (Select, MultiSelect, Confirm prompts) or ratatui. Scan home dir for agent configs, present multi-select for agents, interval picker, agent-for-generation picker. Calls config system to persist. Wire to root command (run onboarding if no config exists). |
-| 5 | **Session reader** | `src/scanner/reader.rs` — given a `Vec<Box<dyn Agent>>` and a `since: DateTime<Utc>`, collect all sessions. Deduplicate by session ID. Return `Vec<Session>`. Read/update `last-scan.json` via serde. Unit tests. |
-| 7 | **Skill sync** | `src/sync/` — read all `.md` files from `~/.distill/skills/` via `std::fs::read_dir`, call each agent adapter's `write_skill()` to sync. Idempotent (compare content hashes, skip unchanged). Wire to an internal sync step called after review. Unit tests. |
-| 10 | **Proposal writer** | `src/proposals/` — define `Proposal` struct with serde derive. Enum `ProposalType { New, Improve, Edit, Remove }`, enum `Confidence { High, Medium, Low }`. Serialize to markdown with YAML frontmatter (serde_yaml for frontmatter block, raw string for body). Write to / read from `~/.distill/proposals/`. List pending proposals. Unit tests. |
+| # | Task | Description | Done |
+|---|------|-------------|------|
+| 4 | **Onboarding flow** | `src/onboard/` — interactive first-run flow using `dialoguer` (Select, MultiSelect, Confirm prompts) or ratatui. Scan home dir for agent configs, present multi-select for agents, interval picker, agent-for-generation picker. Calls config system to persist. Wire to root command (run onboarding if no config exists). | |
+| 5 | **Session reader** | `src/scanner/reader.rs` — given a `Vec<Box<dyn Agent>>` and a `since: DateTime<Utc>`, collect all sessions. Deduplicate by session ID. Return `Vec<Session>`. Read/update `last-scan.json` via serde. Unit tests. | |
+| 7 | **Skill sync** | `src/sync/` — read all `.md` files from `~/.distill/skills/` via `std::fs::read_dir`, call each agent adapter's `write_skill()` to sync. Idempotent (compare content hashes, skip unchanged). Wire to an internal sync step called after review. Unit tests. | |
+| 10 | **Proposal writer** | `src/proposals/` — define `Proposal` struct with serde derive. Enum `ProposalType { New, Improve, Edit, Remove }`, enum `Confidence { High, Medium, Low }`. Serialize to markdown with YAML frontmatter (serde_yaml for frontmatter block, raw string for body). Write to / read from `~/.distill/proposals/`. List pending proposals. Unit tests. | |
 
 ---
 
@@ -212,9 +212,9 @@ Below, tasks are grouped into **waves**. All tasks within a wave can be executed
 
 > This is the brain of the tool. Depends on session reader, proposal writer, and agent adapters.
 
-| # | Task | Description |
-|---|------|-------------|
-| 6 | **Scan engine** | `src/scanner/engine.rs` — orchestrate a full scan: call session reader, load existing skills, build prompt for the configured generation agent, invoke the agent (via `std::process::Command`, e.g. `claude --print` or `codex --quiet`), parse the agent's structured response into `Vec<Proposal>`, pass to proposal writer. Wire to `distill scan` subcommand with `--now` flag. Integration test with mock agent (inject a fake command that returns fixture output). |
+| # | Task | Description | Done |
+|---|------|-------------|------|
+| 6 | **Scan engine** | `src/scanner/engine.rs` — orchestrate a full scan: call session reader, load existing skills, build prompt for the configured generation agent, invoke the agent (via `std::process::Command`, e.g. `claude --print` or `codex --quiet`), parse the agent's structured response into `Vec<Proposal>`, pass to proposal writer. Wire to `distill scan` subcommand with `--now` flag. Integration test with mock agent (inject a fake command that returns fixture output). | |
 
 ---
 
@@ -222,29 +222,29 @@ Below, tasks are grouped into **waves**. All tasks within a wave can be executed
 
 > Depend on proposals existing (Wave 3), but can be built in parallel with each other.
 
-| # | Task | Description |
-|---|------|-------------|
-| 8 | **Shell hook installer** | `src/shell/` — detect shell from `$SHELL` env var, generate correct hook snippet, write to correct config file (`~/.zshrc`, `~/.bashrc`, `~/.config/fish/conf.d/distill.fish`). Idempotent (check if marker comment already exists before writing). Called during onboarding. `distill notify --check` subcommand: count files in `~/.distill/proposals/` via `read_dir`, print summary or exit silently. |
-| 9 | **Scheduler installer** | `src/schedule/` — trait `Scheduler` with `install()`, `uninstall()`, `status()`. macOS impl: generate `~/Library/LaunchAgents/com.distill.agent.plist`, load/unload via `launchctl`. Linux impl: generate `~/.config/systemd/user/distill.service`, enable/disable via `systemctl --user`. `distill watch --install` and `--uninstall` subcommands. Conditional compilation via `#[cfg(target_os)]`. |
-| 11 | **Review TUI** | `src/review/` — ratatui TUI for `distill review`. List proposals in a selectable list widget, show diff/content in a scrollable pane for each, keybindings for accept (`a`), reject (`r`), edit (`e`), snooze (`s`), batch accept all (`A`). On accept: move proposal content to `~/.distill/skills/`, log decision to `~/.distill/history/`, trigger skill sync. On reject: log and delete proposal. |
+| # | Task | Description | Done |
+|---|------|-------------|------|
+| 8 | **Shell hook installer** | `src/shell/` — detect shell from `$SHELL` env var, generate correct hook snippet, write to correct config file (`~/.zshrc`, `~/.bashrc`, `~/.config/fish/conf.d/distill.fish`). Idempotent (check if marker comment already exists before writing). Called during onboarding. `distill notify --check` subcommand: count files in `~/.distill/proposals/` via `read_dir`, print summary or exit silently. | |
+| 9 | **Scheduler installer** | `src/schedule/` — trait `Scheduler` with `install()`, `uninstall()`, `status()`. macOS impl: generate `~/Library/LaunchAgents/com.distill.agent.plist`, load/unload via `launchctl`. Linux impl: generate `~/.config/systemd/user/distill.service`, enable/disable via `systemctl --user`. `distill watch --install` and `--uninstall` subcommands. Conditional compilation via `#[cfg(target_os)]`. | |
+| 11 | **Review TUI** | `src/review/` — ratatui TUI for `distill review`. List proposals in a selectable list widget, show diff/content in a scrollable pane for each, keybindings for accept (`a`), reject (`r`), edit (`e`), snooze (`s`), batch accept all (`A`). On accept: move proposal content to `~/.distill/skills/`, log decision to `~/.distill/history/`, trigger skill sync. On reject: log and delete proposal. | |
 
 ---
 
 #### Wave 5 — Notifications + status (parallel, 2 agents)
 
-| # | Task | Description |
-|---|------|-------------|
-| 12 | **Notification system** | `src/notify/` — trait `Notifier` with `send(title, body) -> Result<()>`. macOS impl: `osascript` via `std::process::Command` (with `terminal-notifier` as optional enhancement). Linux impl: `notify-send` via `std::process::Command`. Called at end of `distill scan`. Respect user's notification preference from config. Conditional compilation via `#[cfg(target_os)]`. |
-| 14 | **`distill status` command** | `src/commands/status.rs` — show current config, last scan time, next scheduled scan, number of pending proposals, number of accepted skills. Simple table output via `comfy-table` or similar. |
+| # | Task | Description | Done |
+|---|------|-------------|------|
+| 12 | **Notification system** | `src/notify/` — trait `Notifier` with `send(title, body) -> Result<()>`. macOS impl: `osascript` via `std::process::Command` (with `terminal-notifier` as optional enhancement). Linux impl: `notify-send` via `std::process::Command`. Called at end of `distill scan`. Respect user's notification preference from config. Conditional compilation via `#[cfg(target_os)]`. | |
+| 14 | **`distill status` command** | `src/commands/status.rs` — show current config, last scan time, next scheduled scan, number of pending proposals, number of accepted skills. Simple table output via `comfy-table` or similar. | |
 
 ---
 
 #### Wave 6 — Integration + polish (sequential)
 
-| # | Task | Description |
-|---|------|-------------|
-| 15 | **End-to-end integration test** | Full flow: onboard → scan → proposals created → review → skills synced. Can use mock agent responses. |
-| 16 | **README** | Installation instructions, demo GIF placeholder, usage examples. |
+| # | Task | Description | Done |
+|---|------|-------------|------|
+| 15 | **End-to-end integration test** | Full flow: onboard → scan → proposals created → review → skills synced. Can use mock agent responses. | |
+| 16 | **README** | Installation instructions, demo GIF placeholder, usage examples. | |
 
 ---
 

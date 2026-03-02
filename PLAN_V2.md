@@ -196,9 +196,11 @@ This doesn't require ML — it's prompt engineering with historical context.
 
 Roughly ordered by value and implementation complexity:
 
-1. **`distill convert` (MCP to skills)** — high value, addresses a real pain point now
-2. **Project-level skills** — natural extension, needed once people use it on multiple projects
-3. **Skill deduplication** — maintenance feature, prevents skill sprawl
-4. **Team sync** — multiplier feature, makes distill valuable for teams
-5. **`distill publish`** — community feature, needs critical mass first
-6. **Preference learning** — refinement, improves quality over time
+| # | Feature | Notes | Done |
+|---|---------|-------|------|
+| 1 | **`distill convert` (MCP to skills)** | high value, addresses a real pain point now | |
+| 2 | **Project-level skills** | natural extension, needed once people use it on multiple projects | |
+| 3 | **Skill deduplication** | maintenance feature, prevents skill sprawl | |
+| 4 | **Team sync** | multiplier feature, makes distill valuable for teams | |
+| 5 | **`distill publish`** | community feature, needs critical mass first | |
+| 6 | **Preference learning** | refinement, improves quality over time | |
