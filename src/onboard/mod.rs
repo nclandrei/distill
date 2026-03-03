@@ -622,109 +622,123 @@ fn draw_onboarding_ui(frame: &mut Frame<'_>, state: &OnboardingUiState) {
         .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
         .split(chunks[2]);
 
-    let (options_title, options, selected_idx): (&str, Vec<String>, Option<usize>) =
-        match state.step {
-            OnboardingStep::Agents => (
-                "Agents",
-                state
-                    .all_agents
-                    .iter()
-                    .map(|kind| {
-                        let checked = if state.selected_agents.contains(kind) {
-                            "[x]"
-                        } else {
-                            "[ ]"
-                        };
-                        let installed = state
-                            .detected_agents
-                            .iter()
-                            .find(|(detected_kind, _)| detected_kind == kind)
-                            .map(|(_, installed)| *installed)
-                            .unwrap_or(false);
-                        let suffix = if installed { "" } else { " (not detected)" };
-                        format!("{checked} {kind}{suffix}")
-                    })
-                    .collect(),
-                Some(state.agent_cursor),
-            ),
-            OnboardingStep::Interval => (
-                "Scan Interval",
-                vec![
-                    "daily".to_string(),
-                    "weekly (recommended)".to_string(),
-                    "monthly".to_string(),
-                ],
-                Some(state.interval_cursor),
-            ),
-            OnboardingStep::ProposalAgent => {
-                let options = state
-                    .proposal_options()
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>();
-                let selected = state
-                    .proposal_options()
-                    .iter()
-                    .position(|kind| *kind == state.proposal_agent)
-                    .unwrap_or(0);
-                ("Proposal Agent", options, Some(selected))
-            }
-            OnboardingStep::Shell => (
-                "Shell",
-                vec![
-                    "zsh".to_string(),
-                    "bash".to_string(),
-                    "fish".to_string(),
-                    "other".to_string(),
-                ],
-                Some(state.shell_cursor),
-            ),
-            OnboardingStep::Hook => (
-                "Terminal Hook",
-                vec![
-                    "yes - install notification hook".to_string(),
-                    "no - skip hook install".to_string(),
-                ],
-                Some(usize::from(!state.install_shell_hook)),
-            ),
-            OnboardingStep::Notifications => (
-                "Notifications",
-                vec![
-                    "terminal".to_string(),
-                    "native".to_string(),
-                    "both (recommended)".to_string(),
-                    "none".to_string(),
-                ],
-                Some(state.notif_cursor),
-            ),
-            OnboardingStep::Confirm => (
-                "Confirm",
-                vec![
-                    "Press Enter to save settings".to_string(),
-                    "Press Backspace to edit previous step".to_string(),
-                ],
-                None,
-            ),
-        };
+    if state.step == OnboardingStep::Confirm {
+        let confirm = Paragraph::new(vec![
+            Line::from("Ready to apply this onboarding setup."),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("[Enter] ", Style::default().fg(Color::Green)),
+                Span::raw("Save and finish setup"),
+            ]),
+            Line::from(vec![
+                Span::styled("[Backspace] ", Style::default().fg(Color::Yellow)),
+                Span::raw("Go back and edit choices"),
+            ]),
+            Line::from(vec![
+                Span::styled("[q] ", Style::default().fg(Color::Red)),
+                Span::raw("Cancel without writing config"),
+            ]),
+        ])
+        .block(Block::default().borders(Borders::ALL).title("Save / Cancel"));
+        frame.render_widget(confirm, body_chunks[0]);
+    } else {
+        let (options_title, options, selected_idx): (&str, Vec<String>, Option<usize>) =
+            match state.step {
+                OnboardingStep::Agents => (
+                    "Agents",
+                    state
+                        .all_agents
+                        .iter()
+                        .map(|kind| {
+                            let checked = if state.selected_agents.contains(kind) {
+                                "[x]"
+                            } else {
+                                "[ ]"
+                            };
+                            let installed = state
+                                .detected_agents
+                                .iter()
+                                .find(|(detected_kind, _)| detected_kind == kind)
+                                .map(|(_, installed)| *installed)
+                                .unwrap_or(false);
+                            let suffix = if installed { "" } else { " (not detected)" };
+                            format!("{checked} {kind}{suffix}")
+                        })
+                        .collect(),
+                    Some(state.agent_cursor),
+                ),
+                OnboardingStep::Interval => (
+                    "Scan Interval",
+                    vec![
+                        "daily".to_string(),
+                        "weekly (recommended)".to_string(),
+                        "monthly".to_string(),
+                    ],
+                    Some(state.interval_cursor),
+                ),
+                OnboardingStep::ProposalAgent => {
+                    let options = state
+                        .proposal_options()
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>();
+                    let selected = state
+                        .proposal_options()
+                        .iter()
+                        .position(|kind| *kind == state.proposal_agent)
+                        .unwrap_or(0);
+                    ("Proposal Agent", options, Some(selected))
+                }
+                OnboardingStep::Shell => (
+                    "Shell",
+                    vec![
+                        "zsh".to_string(),
+                        "bash".to_string(),
+                        "fish".to_string(),
+                        "other".to_string(),
+                    ],
+                    Some(state.shell_cursor),
+                ),
+                OnboardingStep::Hook => (
+                    "Terminal Hook",
+                    vec![
+                        "yes - install notification hook".to_string(),
+                        "no - skip hook install".to_string(),
+                    ],
+                    Some(usize::from(!state.install_shell_hook)),
+                ),
+                OnboardingStep::Notifications => (
+                    "Notifications",
+                    vec![
+                        "terminal".to_string(),
+                        "native".to_string(),
+                        "both (recommended)".to_string(),
+                        "none".to_string(),
+                    ],
+                    Some(state.notif_cursor),
+                ),
+                OnboardingStep::Confirm => unreachable!(),
+            };
 
-    let option_items = options
-        .iter()
-        .map(|line| ListItem::new(line.clone()))
-        .collect::<Vec<_>>();
-    let option_list = List::new(option_items)
-        .block(Block::default().borders(Borders::ALL).title(options_title))
-        .highlight_symbol("> ")
-        .highlight_style(
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        );
+        let option_items = options
+            .iter()
+            .map(|line| ListItem::new(line.clone()))
+            .collect::<Vec<_>>();
+        let option_list = List::new(option_items)
+            .block(Block::default().borders(Borders::ALL).title(options_title))
+            .highlight_symbol("> ")
+            .highlight_style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            );
 
-    let mut list_state = ListState::default();
-    if let Some(idx) = selected_idx {
-        list_state.select(Some(idx));
+        let mut list_state = ListState::default();
+        if let Some(idx) = selected_idx {
+            list_state.select(Some(idx));
+        }
+        frame.render_stateful_widget(option_list, body_chunks[0], &mut list_state);
     }
-    frame.render_stateful_widget(option_list, body_chunks[0], &mut list_state);
 
     let fallback_note = if state.selected_agents.is_empty() {
         "none selected (proposal agent fallback active)"
