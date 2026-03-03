@@ -82,6 +82,60 @@ V1 writes all skills globally to `~/.distill/skills/`. But developers work on mu
 
 ---
 
+## `distill sync-agents` — AGENTS.md Drift Detection
+
+### Problem
+
+`AGENTS.md` files drift over time. Teams discover better test commands, config flags, CI checks, and workflow tweaks during real sessions, but those improvements often stay buried in chat history and never make it back into project instructions.
+
+### Solution
+
+Add a periodic, user-configurable sync pass that reviews recent sessions and proposes `AGENTS.md` updates per project:
+
+```
+distill sync-agents --projects <allowlist>
+```
+
+### Behavior
+
+1. Scan latest sessions per configured project and extract candidate instruction tweaks (config, test commands, CI/debug workflows, gotchas)
+2. Compare candidates against current `AGENTS.md` to avoid duplicate or conflicting guidance
+3. Generate a patch proposal instead of editing blindly
+4. Preserve user-authored rules and style; only update/add where confidence is high
+5. Route changes through review (`distill review`) with rationale and source session references
+
+### Guardrails
+
+- Project scope is explicit and user-controlled (allowlist or config file)
+- Never overwrite explicit user constraints; prefer additive updates
+- Require repeated evidence (or explicit user approval) before adding new defaults
+- Support `--dry-run` so teams can inspect changes before applying
+
+### Possible commands
+
+| Command | Purpose |
+|---|---|
+| `distill sync-agents --projects <list>` | Propose `AGENTS.md` updates for selected projects |
+| `distill sync-agents --all-configured` | Run across every configured project |
+| `distill sync-agents --dry-run` | Preview proposals without writing files |
+| `distill sync-agents --since <date>` | Limit evidence window to recent sessions |
+
+### Reference automation profile (from user concept)
+
+- Name: `Sync AGENTS.md`
+- Project scope: selected repositories (allowlist-based)
+- Execution environment: worktree
+- Example cadence: daily at `18:00`, weekdays (Mon-Fri)
+- Expected report: inbox summary with `Updated` or `No changes`, evidence used (`files/commits`), and exact sections changed or skipped
+
+### Reference prompt template
+
+```text
+Review each selected repository and keep AGENTS.md aligned with current engineering workflow. Read AGENTS.md first, then inspect recent commits and changed files. Detect concrete updates to commands, test workflows, CI behavior, tool/config paths, environment setup, and branch/review conventions. Update AGENTS.md only when evidence exists in repository files or git history, keep edits minimal, preserve style, and do not invent rules. If no update is needed, leave files unchanged. Post an inbox summary with: Updated or No changes, evidence used (files/commits), and exact sections changed or skipped.
+```
+
+---
+
 ## Skill Deduplication
 
 ### Problem
@@ -200,7 +254,8 @@ Roughly ordered by value and implementation complexity:
 |---|---------|-------|------|
 | 1 | **`distill convert` (MCP to skills)** | high value, addresses a real pain point now | |
 | 2 | **Project-level skills** | natural extension, needed once people use it on multiple projects | |
-| 3 | **Skill deduplication** | maintenance feature, prevents skill sprawl | |
-| 4 | **Team sync** | multiplier feature, makes distill valuable for teams | |
-| 5 | **`distill publish`** | community feature, needs critical mass first | |
-| 6 | **Preference learning** | refinement, improves quality over time | |
+| 3 | **`distill sync-agents` (AGENTS.md drift detection)** | keeps project instructions current with real workflows | |
+| 4 | **Skill deduplication** | maintenance feature, prevents skill sprawl | |
+| 5 | **Team sync** | multiplier feature, makes distill valuable for teams | |
+| 6 | **`distill publish`** | community feature, needs critical mass first | |
+| 7 | **Preference learning** | refinement, improves quality over time | |
