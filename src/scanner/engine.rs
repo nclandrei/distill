@@ -1,8 +1,9 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::agents::{Agent, Session, Skill};
 use crate::config::Config;
@@ -17,11 +18,13 @@ use crate::scanner::reader::{self, LastScan};
 /// proposal array in `{"proposals": [...]}`.
 const PROPOSAL_SCHEMA: &str = r#"{
   "type": "object",
+  "additionalProperties": false,
   "properties": {
     "proposals": {
       "type": "array",
       "items": {
         "type": "object",
+        "additionalProperties": false,
         "properties": {
           "type":         { "type": "string", "enum": ["new", "improve", "edit", "remove"] },
           "confidence":   { "type": "string", "enum": ["high", "medium", "low"] },
@@ -30,6 +33,7 @@ const PROPOSAL_SCHEMA: &str = r#"{
             "type": "array",
             "items": {
               "type": "object",
+              "additionalProperties": false,
               "properties": {
                 "session": { "type": "string" },
                 "pattern": { "type": "string" }
@@ -83,15 +87,102 @@ fn agent_command_for(agent_name: &str) -> (String, Vec<String>) {
         // `claude -p` reads the prompt from stdin.
         // `--output-format json` wraps the response in a JSON envelope.
         // `--json-schema` enforces structured output matching our proposal schema.
-        "claude" => ("claude".into(), vec![
-            "--print".into(),
-            "--output-format".into(), "json".into(),
-            "--json-schema".into(), PROPOSAL_SCHEMA.into(),
-        ]),
+        "claude" => (
+            "claude".into(),
+            vec![
+                "--print".into(),
+                "--output-format".into(),
+                "json".into(),
+                "--json-schema".into(),
+                PROPOSAL_SCHEMA.into(),
+            ],
+        ),
         // `codex exec` is the headless CLI; reads prompt from stdin.
-        // `--output-schema` requires a file path — written at invocation time.
+        // `--output-schema` requires a file path, so args are injected at
+        // invocation time (see `prepare_codex_invocation`).
         "codex" => ("codex".into(), vec!["exec".into()]),
         other => (other.into(), vec![]),
+    }
+}
+
+fn is_codex_exec(command: &str, args: &[String]) -> bool {
+    let command_name = Path::new(command)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(command);
+    command_name == "codex" && args.first().is_some_and(|arg| arg == "exec")
+}
+
+fn create_temp_file_path(prefix: &str, extension: &str) -> Result<PathBuf> {
+    let tmp_dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let mut attempt = 0u32;
+    loop {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = tmp_dir.join(format!("{prefix}-{pid}-{nanos}-{attempt}.{extension}"));
+        match std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+        {
+            Ok(_) => return Ok(path),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                attempt += 1;
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("Failed to create temporary file {}", path.display())
+                });
+            }
+        }
+    }
+}
+
+fn prepare_codex_invocation(
+    command: &str,
+    args: &[String],
+) -> Result<(Vec<String>, Option<PathBuf>, Vec<PathBuf>)> {
+    let mut effective_args = args.to_vec();
+    let mut output_path = None;
+    let mut temp_files = vec![];
+
+    if !is_codex_exec(command, args) {
+        return Ok((effective_args, output_path, temp_files));
+    }
+
+    if !effective_args.iter().any(|arg| arg == "--output-schema") {
+        let schema_path = create_temp_file_path("distill-codex-schema", "json")?;
+        std::fs::write(&schema_path, PROPOSAL_SCHEMA).with_context(|| {
+            format!(
+                "Failed to write Codex schema file {}",
+                schema_path.display()
+            )
+        })?;
+        effective_args.push("--output-schema".into());
+        effective_args.push(schema_path.to_string_lossy().to_string());
+        temp_files.push(schema_path);
+    }
+
+    if !effective_args
+        .iter()
+        .any(|arg| arg == "--output-last-message" || arg == "-o")
+    {
+        let last_message_path = create_temp_file_path("distill-codex-last-message", "txt")?;
+        effective_args.push("--output-last-message".into());
+        effective_args.push(last_message_path.to_string_lossy().to_string());
+        output_path = Some(last_message_path.clone());
+        temp_files.push(last_message_path);
+    }
+
+    Ok((effective_args, output_path, temp_files))
+}
+
+fn cleanup_temp_files(paths: &[PathBuf]) {
+    for path in paths {
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -129,10 +220,7 @@ pub fn run_scan(agents: &[Box<dyn Agent>], scan_config: &ScanConfig) -> Result<V
 
     // Step 3: Load existing skills
     let skills = load_skills(&scan_config.skills_dir)?;
-    println!(
-        "Loaded {} existing skill(s).",
-        skills.len()
-    );
+    println!("Loaded {} existing skill(s).", skills.len());
 
     // Step 4: Build prompt and invoke agent
     let prompt = build_prompt(&sessions, &skills);
@@ -143,11 +231,7 @@ pub fn run_scan(agents: &[Box<dyn Agent>], scan_config: &ScanConfig) -> Result<V
         prompt.len()
     );
     println!("Waiting for agent response (this may take several minutes)...");
-    let raw_response = invoke_agent(
-        &scan_config.agent_command,
-        &scan_config.agent_args,
-        &prompt,
-    )?;
+    let raw_response = invoke_agent(&scan_config.agent_command, &scan_config.agent_args, &prompt)?;
     println!("Agent responded ({} bytes).", raw_response.len());
 
     // Step 5: Parse response into proposals
@@ -223,9 +307,11 @@ fn build_prompt(sessions: &[Session], existing_skills: &[Skill]) -> String {
         "You are a skill extraction engine for the `distill` tool.\n\n\
          Your job: read the AI agent session files listed below, look for repeated \
          patterns, workflows, or techniques, and propose reusable skills.\n\n\
-         IMPORTANT: Respond ONLY with valid JSON — an array of proposal objects. \
+         IMPORTANT: Respond ONLY with valid JSON in this exact wrapper shape: \
+         {\"proposals\": [...]}.\n\
+         The top-level JSON value must be an object with a `proposals` array. \
          No markdown fences, no commentary.\n\n\
-         Each proposal object must have these fields:\n\
+         Each object in `proposals` must have these fields:\n\
          - \"type\": one of \"new\", \"improve\", \"edit\", \"remove\"\n\
          - \"confidence\": one of \"high\", \"medium\", \"low\"\n\
          - \"target_skill\": string (filename, required for improve/edit/remove, null for new)\n\
@@ -239,7 +325,10 @@ fn build_prompt(sessions: &[Session], existing_skills: &[Skill]) -> String {
     } else {
         prompt.push_str("## Existing Skills\n\n");
         for skill in existing_skills {
-            prompt.push_str(&format!("### {}\n\n{}\n\n---\n\n", skill.name, skill.content));
+            prompt.push_str(&format!(
+                "### {}\n\n{}\n\n---\n\n",
+                skill.name, skill.content
+            ));
         }
     }
 
@@ -259,7 +348,8 @@ fn build_prompt(sessions: &[Session], existing_skills: &[Skill]) -> String {
     }
 
     prompt.push_str(
-        "\nAnalyze these session files and produce a JSON array of skill proposals. \
+        "\nAnalyze these session files and produce a JSON object in the \
+         form {\"proposals\": [...]} containing skill proposals. \
          Focus on repeated patterns that would benefit from being codified as reusable skills.\n",
     );
 
@@ -271,8 +361,10 @@ fn build_prompt(sessions: &[Session], existing_skills: &[Skill]) -> String {
 /// The prompt is piped via stdin rather than passed as a command-line argument
 /// to avoid hitting the OS `ARG_MAX` limit (`E2BIG` / "Argument list too long").
 fn invoke_agent(command: &str, args: &[String], prompt: &str) -> Result<String> {
+    let (effective_args, codex_output_path, temp_files) = prepare_codex_invocation(command, args)?;
+
     let mut child = Command::new(command)
-        .args(args)
+        .args(&effective_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit()) // let agent progress output show in real time
@@ -302,15 +394,21 @@ fn invoke_agent(command: &str, args: &[String], prompt: &str) -> Result<String> 
         eprint!("\r                            \r"); // clear the line
     });
 
-    let output = child
-        .wait_with_output()
-        .with_context(|| format!("Failed to wait for agent command: {command}"))?;
+    let output = match child.wait_with_output() {
+        Ok(output) => output,
+        Err(err) => {
+            cleanup_temp_files(&temp_files);
+            return Err(err)
+                .with_context(|| format!("Failed to wait for agent command: {command}"));
+        }
+    };
 
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = heartbeat.join();
 
     if !output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
+        cleanup_temp_files(&temp_files);
         bail!(
             "Agent command `{command}` failed with status {}:\n{}",
             output.status,
@@ -318,8 +416,20 @@ fn invoke_agent(command: &str, args: &[String], prompt: &str) -> Result<String> 
         );
     }
 
-    let stdout = String::from_utf8(output.stdout).context("Agent output is not valid UTF-8")?;
-    Ok(stdout)
+    let stdout_from_process =
+        String::from_utf8(output.stdout).context("Agent output is not valid UTF-8")?;
+
+    let final_output = if let Some(path) = codex_output_path {
+        match std::fs::read_to_string(&path) {
+            Ok(contents) if !contents.trim().is_empty() => contents,
+            _ => stdout_from_process,
+        }
+    } else {
+        stdout_from_process
+    };
+
+    cleanup_temp_files(&temp_files);
+    Ok(final_output)
 }
 
 /// A single raw proposal as returned by the agent (JSON).
@@ -365,19 +475,18 @@ pub fn parse_response(raw: &str) -> Result<Vec<Proposal>> {
     let trimmed = raw.trim();
 
     // Try to extract structured_output from a Claude JSON envelope first.
-    let proposals_value: serde_json::Value = if let Ok(envelope) =
-        serde_json::from_str::<ClaudeEnvelope>(trimmed)
-    {
-        if let Some(structured) = envelope.structured_output {
-            structured
-        } else if let Some(ref text) = envelope.result {
-            extract_json_value(text)?
+    let proposals_value: serde_json::Value =
+        if let Ok(envelope) = serde_json::from_str::<ClaudeEnvelope>(trimmed) {
+            if let Some(structured) = envelope.structured_output {
+                structured
+            } else if let Some(ref text) = envelope.result {
+                extract_json_value(text)?
+            } else {
+                extract_json_value(trimmed)?
+            }
         } else {
             extract_json_value(trimmed)?
-        }
-    } else {
-        extract_json_value(trimmed)?
-    };
+        };
 
     // The value is either {"proposals": [...]} (from --json-schema) or [...] (raw).
     let raw_proposals: Vec<RawProposal> =
@@ -505,7 +614,10 @@ mod tests {
         let proposals = parse_response(json).unwrap();
         assert_eq!(proposals.len(), 3);
         assert_eq!(proposals[0].frontmatter.proposal_type, ProposalType::New);
-        assert_eq!(proposals[1].frontmatter.proposal_type, ProposalType::Improve);
+        assert_eq!(
+            proposals[1].frontmatter.proposal_type,
+            ProposalType::Improve
+        );
         assert_eq!(
             proposals[1].frontmatter.target_skill.as_deref(),
             Some("existing-skill.md")
@@ -530,7 +642,12 @@ mod tests {
         let json = r#"[{"type":"unknown","confidence":"high","target_skill":null,"evidence":[],"body":"x"}]"#;
         let result = parse_response(json);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Unknown proposal type"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Unknown proposal type")
+        );
     }
 
     #[test]
@@ -580,7 +697,11 @@ mod tests {
     #[test]
     fn test_load_skills_reads_md_files() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("git-workflow.md"), "# Git Workflow\nDo stuff").unwrap();
+        std::fs::write(
+            dir.path().join("git-workflow.md"),
+            "# Git Workflow\nDo stuff",
+        )
+        .unwrap();
         std::fs::write(dir.path().join("not-a-skill.txt"), "ignore me").unwrap();
 
         let skills = load_skills(dir.path()).unwrap();
@@ -742,6 +863,58 @@ mod tests {
         let (cmd, args) = agent_command_for("codex");
         assert_eq!(cmd, "codex");
         assert!(args.contains(&"exec".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_invoke_agent_codex_adds_schema_and_reads_last_message_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let codex = dir.path().join("codex");
+        let script = r#"#!/bin/sh
+schema_file=""
+last_message_file=""
+saw_exec=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    exec)
+      saw_exec=1
+      shift
+      ;;
+    --output-schema)
+      schema_file="$2"
+      shift 2
+      ;;
+    --output-last-message|-o)
+      last_message_file="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+cat > /dev/null
+[ "$saw_exec" -eq 1 ] || exit 21
+[ -n "$schema_file" ] || exit 22
+[ -f "$schema_file" ] || exit 23
+grep -q '"proposals"' "$schema_file" || exit 24
+[ -n "$last_message_file" ] || exit 25
+printf '%s' '{"proposals":[]}' > "$last_message_file"
+printf '%s' 'not-json-on-stdout'
+"#;
+        std::fs::write(&codex, script).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let raw = invoke_agent(
+            codex.to_str().unwrap(),
+            &["exec".to_string()],
+            "ignored prompt",
+        )
+        .unwrap();
+        assert_eq!(raw.trim(), r#"{"proposals":[]}"#);
     }
 
     #[test]

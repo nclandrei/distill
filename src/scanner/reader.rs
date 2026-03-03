@@ -19,8 +19,8 @@ impl LastScan {
         if !path.exists() {
             return Ok(None);
         }
-        let contents =
-            std::fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
+        let contents = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
         let last_scan: Self =
             serde_json::from_str(&contents).with_context(|| "Failed to parse last-scan.json")?;
         Ok(Some(last_scan))
@@ -28,7 +28,8 @@ impl LastScan {
 
     /// Save scan watermark to disk.
     pub fn save(&self, path: &Path) -> Result<()> {
-        let json = serde_json::to_string_pretty(self).context("Failed to serialize last-scan.json")?;
+        let json =
+            serde_json::to_string_pretty(self).context("Failed to serialize last-scan.json")?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -114,7 +115,8 @@ mod tests {
             sessions: vec![shared, make_session("b-1", AgentKind::Codex, 1)],
         });
 
-        let result = collect_sessions(&[agent1, agent2], Utc::now() - chrono::Duration::days(1)).unwrap();
+        let result =
+            collect_sessions(&[agent1, agent2], Utc::now() - chrono::Duration::days(1)).unwrap();
         assert_eq!(result.len(), 3); // dup-1 only counted once
         let ids: Vec<&str> = result.iter().map(|s| s.id.as_str()).collect();
         assert!(ids.contains(&"dup-1"));

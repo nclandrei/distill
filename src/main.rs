@@ -13,7 +13,11 @@ mod sync;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "distill", version, about = "Monitor AI agent sessions and distill them into reusable skills")]
+#[command(
+    name = "distill",
+    version,
+    about = "Monitor AI agent sessions and distill them into reusable skills"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
