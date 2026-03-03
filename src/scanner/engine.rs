@@ -86,21 +86,26 @@ fn agent_command_for(agent_name: &str) -> (String, Vec<String>) {
     match agent_name {
         // `claude -p` reads the prompt from stdin.
         // `--output-format json` wraps the response in a JSON envelope.
-        // `--json-schema` enforces structured output matching our proposal schema.
+        //
+        // NOTE: `--json-schema` is intentionally omitted for Claude. In the
+        // current CLI version we observed retry loops on certain auth/org
+        // errors (403) when schema mode is enabled, which can stall scans.
+        // We validate structure locally in `parse_response` instead.
         "claude" => (
             "claude".into(),
             vec![
                 "--print".into(),
+                "--no-session-persistence".into(),
                 "--output-format".into(),
                 "json".into(),
-                "--json-schema".into(),
-                PROPOSAL_SCHEMA.into(),
             ],
         ),
         // `codex exec` is the headless CLI; reads prompt from stdin.
+        // `--ephemeral` avoids creating Codex rollout sessions during scan
+        // (otherwise those sessions can pollute future scans).
         // `--output-schema` requires a file path, so args are injected at
         // invocation time (see `prepare_codex_invocation`).
-        "codex" => ("codex".into(), vec!["exec".into()]),
+        "codex" => ("codex".into(), vec!["exec".into(), "--ephemeral".into()]),
         other => (other.into(), vec![]),
     }
 }
@@ -204,7 +209,7 @@ pub fn run_scan(agents: &[Box<dyn Agent>], scan_config: &ScanConfig) -> Result<V
         .unwrap_or_else(|| Utc::now() - chrono::Duration::days(30));
 
     // Step 2: Collect sessions
-    let sessions = reader::collect_sessions(agents, since)?;
+    let sessions = filter_distill_scan_artifacts(reader::collect_sessions(agents, since)?);
     if sessions.is_empty() {
         println!("No new sessions found since last scan.");
         // Still update the watermark so we don't re-scan the same window
@@ -260,6 +265,33 @@ pub fn run_scan(agents: &[Box<dyn Agent>], scan_config: &ScanConfig) -> Result<V
     Ok(proposals)
 }
 
+/// Distill's own proposal-agent invocations can produce Codex rollout session
+/// files that contain the scanner prompt itself. Those should not be fed back
+/// into future scans.
+fn filter_distill_scan_artifacts(sessions: Vec<Session>) -> Vec<Session> {
+    sessions
+        .into_iter()
+        .filter(|session| !is_distill_scan_artifact(&session.path))
+        .collect()
+}
+
+fn is_distill_scan_artifact(path: &Path) -> bool {
+    let filename_looks_like_rollout = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("rollout-"));
+    if !filename_looks_like_rollout {
+        return false;
+    }
+
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+
+    content.contains("You are a skill extraction engine for the `distill` tool.")
+        && content.contains("Analyze these session files and produce a JSON object")
+}
+
 /// Generate a deterministic filename for a proposal.
 fn proposal_filename(proposal: &Proposal, index: usize) -> String {
     let type_prefix = match proposal.frontmatter.proposal_type {
@@ -305,8 +337,13 @@ fn build_prompt(sessions: &[Session], existing_skills: &[Skill]) -> String {
 
     prompt.push_str(
         "You are a skill extraction engine for the `distill` tool.\n\n\
-         Your job: read the AI agent session files listed below, look for repeated \
-         patterns, workflows, or techniques, and propose reusable skills.\n\n\
+         Your job: analyze AI agent session excerpts and propose reusable skills.\n\n\
+         Output quality bar:\n\
+         - Propose only repeated, reusable workflows (not one-off tasks)\n\
+         - Prefer `improve`/`edit` when an existing skill already overlaps\n\
+         - If evidence is weak, return an empty array: {\"proposals\": []}\n\
+         - Every proposal body must be concrete and actionable (no placeholders)\n\n\
+         Do NOT execute tools/commands. All relevant context is included below.\n\n\
          IMPORTANT: Respond ONLY with valid JSON in this exact wrapper shape: \
          {\"proposals\": [...]}.\n\
          The top-level JSON value must be an object with a `proposals` array. \
@@ -316,7 +353,13 @@ fn build_prompt(sessions: &[Session], existing_skills: &[Skill]) -> String {
          - \"confidence\": one of \"high\", \"medium\", \"low\"\n\
          - \"target_skill\": string (filename, required for improve/edit/remove, null for new)\n\
          - \"evidence\": array of {\"session\": \"<path>\", \"pattern\": \"<description>\"}\n\
-         - \"body\": string containing the full proposed skill content in markdown\n\n",
+         - \"body\": string containing the full proposed skill content in markdown\n\n\
+         For each proposal body, use this markdown structure:\n\
+         - `# <Skill Name>`\n\
+         - `## When to use`\n\
+         - `## Steps`\n\
+         - `## Verification`\n\
+         - `## Pitfalls`\n\n",
     );
 
     // Existing skills so the agent knows what's already been extracted.
@@ -332,28 +375,153 @@ fn build_prompt(sessions: &[Session], existing_skills: &[Skill]) -> String {
         }
     }
 
-    // List session file paths — the agent reads the actual content itself.
+    // Include parsed excerpts from session files so proposal agents don't need
+    // to run tool calls just to inspect local JSONL logs.
     prompt.push_str(&format!(
-        "## Session Files ({} total)\n\n\
-         Read these JSONL session files and analyze them for patterns:\n\n",
+        "## Session Excerpts ({} total)\n\n\
+         These excerpts were parsed from JSONL session files:\n\n",
         sessions.len()
     ));
     for session in sessions {
         prompt.push_str(&format!(
-            "- {} ({}, {})\n",
+            "### {} ({}, {})\n",
             session.path.display(),
             session.agent,
             session.timestamp.format("%Y-%m-%d %H:%M"),
         ));
+        prompt.push_str(&render_session_excerpt(session));
+        prompt.push('\n');
     }
 
     prompt.push_str(
-        "\nAnalyze these session files and produce a JSON object in the \
-         form {\"proposals\": [...]} containing skill proposals. \
-         Focus on repeated patterns that would benefit from being codified as reusable skills.\n",
+        "\nAnalyze these session excerpts and produce a JSON object in the \
+         form {\"proposals\": [...]} containing high-signal skill proposals.\n",
     );
 
     prompt
+}
+
+fn render_session_excerpt(session: &Session) -> String {
+    const MAX_ENTRIES: usize = 18;
+    const MAX_FALLBACK_LINES: usize = 8;
+    const MAX_LINE_CHARS: usize = 240;
+
+    let content = match std::fs::read_to_string(&session.path) {
+        Ok(content) => content,
+        Err(err) => {
+            return format!("- (failed to read file: {err})\n");
+        }
+    };
+
+    let mut parsed = Vec::new();
+    for line in content.lines() {
+        if parsed.len() >= MAX_ENTRIES {
+            break;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if let Some(msg) = extract_message_excerpt(&value, MAX_LINE_CHARS) {
+                parsed.push(format!("- {msg}\n"));
+            }
+        }
+    }
+
+    if !parsed.is_empty() {
+        return parsed.concat();
+    }
+
+    let mut fallback = String::new();
+    for (idx, raw_line) in content.lines().take(MAX_FALLBACK_LINES).enumerate() {
+        fallback.push_str(&format!(
+            "- line {}: {}\n",
+            idx + 1,
+            clipped_text(raw_line, MAX_LINE_CHARS)
+        ));
+    }
+    if fallback.is_empty() {
+        "- (session file was empty)\n".to_string()
+    } else {
+        fallback
+    }
+}
+
+fn extract_message_excerpt(value: &serde_json::Value, max_chars: usize) -> Option<String> {
+    let payload = value.get("payload");
+
+    let role = value
+        .get("role")
+        .and_then(|v| v.as_str())
+        .or_else(|| payload.and_then(|p| p.get("role")).and_then(|v| v.as_str()))
+        .or_else(|| value.get("type").and_then(|v| v.as_str()))
+        .unwrap_or("event");
+
+    let timestamp = value
+        .get("timestamp")
+        .or_else(|| value.get("time"))
+        .or_else(|| payload.and_then(|p| p.get("timestamp")))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown-time");
+
+    let mut texts = Vec::new();
+    if let Some(payload) = payload {
+        collect_text_values(payload, &mut texts, 0);
+    }
+    collect_text_values(value, &mut texts, 0);
+
+    let text = texts.into_iter().find(|text| !text.trim().is_empty())?;
+
+    Some(format!(
+        "[{timestamp}] {}: {}",
+        role.to_lowercase(),
+        clipped_text(&text, max_chars)
+    ))
+}
+
+fn collect_text_values(value: &serde_json::Value, out: &mut Vec<String>, depth: usize) {
+    const MAX_DEPTH: usize = 3;
+    if depth > MAX_DEPTH {
+        return;
+    }
+
+    match value {
+        serde_json::Value::String(s) => out.push(s.clone()),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_text_values(item, out, depth + 1);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for key in [
+                "text",
+                "content",
+                "message",
+                "input",
+                "output",
+                "prompt",
+                "pattern",
+            ] {
+                if let Some(next) = map.get(key) {
+                    collect_text_values(next, out, depth + 1);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn clipped_text(input: &str, max_chars: usize) -> String {
+    let compact = input.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = compact.chars();
+    let clipped: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{clipped}...")
+    } else {
+        clipped
+    }
 }
 
 /// Invoke the generation agent command and return its stdout.
@@ -452,6 +620,7 @@ struct RawEvidence {
 /// Claude's `--output-format json` envelope.
 #[derive(serde::Deserialize)]
 struct ClaudeEnvelope {
+    is_error: Option<bool>,
     structured_output: Option<serde_json::Value>,
     result: Option<String>,
 }
@@ -477,6 +646,13 @@ pub fn parse_response(raw: &str) -> Result<Vec<Proposal>> {
     // Try to extract structured_output from a Claude JSON envelope first.
     let proposals_value: serde_json::Value =
         if let Ok(envelope) = serde_json::from_str::<ClaudeEnvelope>(trimmed) {
+            if envelope.is_error.unwrap_or(false) {
+                let msg = envelope
+                    .result
+                    .unwrap_or_else(|| "unknown Claude error".to_string());
+                bail!("Claude agent returned an error: {msg}");
+            }
+
             if let Some(structured) = envelope.structured_output {
                 structured
             } else if let Some(ref text) = envelope.result {
@@ -512,6 +688,29 @@ pub fn parse_response(raw: &str) -> Result<Vec<Proposal>> {
             "low" => Confidence::Low,
             other => bail!("Unknown confidence level: {other}"),
         };
+
+        let target_skill_is_present = rp
+            .target_skill
+            .as_deref()
+            .is_some_and(|name| !name.trim().is_empty());
+        match proposal_type {
+            ProposalType::New if target_skill_is_present => {
+                bail!("Proposal type `new` must set `target_skill` to null");
+            }
+            ProposalType::Improve | ProposalType::Edit | ProposalType::Remove
+                if !target_skill_is_present =>
+            {
+                bail!(
+                    "Proposal type `{}` requires a non-empty `target_skill`",
+                    rp.proposal_type
+                );
+            }
+            _ => {}
+        }
+        if rp.body.trim().is_empty() {
+            bail!("Proposal body must be non-empty");
+        }
+
         let evidence = rp
             .evidence
             .into_iter()
@@ -666,11 +865,12 @@ mod tests {
         }];
 
         let prompt = build_prompt(&sessions, &skills);
-        assert!(prompt.contains("Session Files"));
+        assert!(prompt.contains("Session Excerpts"));
         assert!(prompt.contains("/fake/s1.jsonl"));
         assert!(prompt.contains("Existing Skills"));
         assert!(prompt.contains("deploy"));
         assert!(prompt.contains("JSON"));
+        assert!(prompt.contains("Do NOT execute tools/commands"));
     }
 
     #[test]
@@ -854,8 +1054,9 @@ mod tests {
         let (cmd, args) = agent_command_for("claude");
         assert_eq!(cmd, "claude");
         assert!(args.contains(&"--print".to_string()));
+        assert!(args.contains(&"--no-session-persistence".to_string()));
         assert!(args.contains(&"--output-format".to_string()));
-        assert!(args.contains(&"--json-schema".to_string()));
+        assert!(!args.contains(&"--json-schema".to_string()));
     }
 
     #[test]
@@ -863,6 +1064,7 @@ mod tests {
         let (cmd, args) = agent_command_for("codex");
         assert_eq!(cmd, "codex");
         assert!(args.contains(&"exec".to_string()));
+        assert!(args.contains(&"--ephemeral".to_string()));
     }
 
     #[cfg(unix)]
@@ -940,10 +1142,67 @@ printf '%s' 'not-json-on-stdout'
     }
 
     #[test]
+    fn test_parse_response_claude_error_envelope() {
+        let envelope = r#"{"type":"result","subtype":"success","is_error":true,"result":"Your organization does not have access to Claude."}"#;
+        let err = parse_response(envelope).unwrap_err().to_string();
+        assert!(err.contains("Claude agent returned an error"));
+        assert!(err.contains("does not have access"));
+    }
+
+    #[test]
     fn test_parse_response_raw_array_still_works() {
         // Agents without structured output may return a raw JSON array
         let json = r#"[{"type":"new","confidence":"medium","target_skill":null,"evidence":[],"body":"test"}]"#;
         let proposals = parse_response(json).unwrap();
         assert_eq!(proposals.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_response_rejects_new_with_target_skill() {
+        let json = r##"[{"type":"new","confidence":"high","target_skill":"oops.md","evidence":[],"body":"# x"}]"##;
+        let err = parse_response(json).unwrap_err().to_string();
+        assert!(err.contains("target_skill"));
+    }
+
+    #[test]
+    fn test_parse_response_rejects_improve_without_target_skill() {
+        let json =
+            r##"[{"type":"improve","confidence":"high","target_skill":null,"evidence":[],"body":"# x"}]"##;
+        let err = parse_response(json).unwrap_err().to_string();
+        assert!(err.contains("requires a non-empty `target_skill`"));
+    }
+
+    #[test]
+    fn test_filter_distill_scan_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let keep_path = dir.path().join("regular.jsonl");
+        let drop_path = dir.path().join("rollout-123.jsonl");
+        std::fs::write(&keep_path, "{\"role\":\"user\",\"text\":\"real session\"}\n").unwrap();
+        std::fs::write(
+            &drop_path,
+            "You are a skill extraction engine for the `distill` tool.\nAnalyze these session files and produce a JSON object\n",
+        )
+        .unwrap();
+
+        let sessions = vec![
+            Session {
+                id: "keep".into(),
+                agent: AgentKind::Claude,
+                path: keep_path,
+                timestamp: Utc::now(),
+                content: String::new(),
+            },
+            Session {
+                id: "drop".into(),
+                agent: AgentKind::Codex,
+                path: drop_path,
+                timestamp: Utc::now(),
+                content: String::new(),
+            },
+        ];
+
+        let filtered = filter_distill_scan_artifacts(sessions);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, "keep");
     }
 }
