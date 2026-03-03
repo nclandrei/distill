@@ -314,7 +314,8 @@ impl OnboardingUiState {
             OnboardingStep::Agents => {
                 if self.selected_agents.is_empty() {
                     vec![
-                        "No monitored agents selected: scans will not collect sessions.".to_string(),
+                        "No monitored agents selected: scans will not collect sessions."
+                            .to_string(),
                         "Proposal generation falls back to detected/default agents.".to_string(),
                     ]
                 } else {
@@ -325,15 +326,15 @@ impl OnboardingUiState {
                 }
             }
             OnboardingStep::Interval => match self.selected_interval() {
-                Interval::Daily => vec![
-                    "Fastest feedback loop with higher background activity.".to_string(),
-                ],
+                Interval::Daily => {
+                    vec!["Fastest feedback loop with higher background activity.".to_string()]
+                }
                 Interval::Weekly => {
                     vec!["Balanced cadence for most repos and teams.".to_string()]
                 }
-                Interval::Monthly => vec![
-                    "Lowest noise, but proposal turnaround will be slower.".to_string(),
-                ],
+                Interval::Monthly => {
+                    vec!["Lowest noise, but proposal turnaround will be slower.".to_string()]
+                }
             },
             OnboardingStep::ProposalAgent => vec![format!(
                 "'{}' will format and generate proposed skills from collected sessions.",
@@ -352,7 +353,8 @@ impl OnboardingUiState {
             OnboardingStep::Hook => {
                 if self.install_hook_effective() {
                     vec![
-                        "A hook will run 'distill notify --check' at prompt boundaries.".to_string(),
+                        "A hook will run 'distill notify --check' at prompt boundaries."
+                            .to_string(),
                         "You can uninstall later via the watch/shell commands.".to_string(),
                     ]
                 } else {
@@ -363,18 +365,18 @@ impl OnboardingUiState {
                 }
             }
             OnboardingStep::Notifications => match self.selected_notifications() {
-                NotificationPref::Terminal => vec![
-                    "Terminal messages appear on your next prompt; no OS banners.".to_string(),
-                ],
-                NotificationPref::Native => vec![
-                    "OS notifications are shown; terminal stays clean.".to_string(),
-                ],
+                NotificationPref::Terminal => {
+                    vec!["Terminal messages appear on your next prompt; no OS banners.".to_string()]
+                }
+                NotificationPref::Native => {
+                    vec!["OS notifications are shown; terminal stays clean.".to_string()]
+                }
                 NotificationPref::Both => {
                     vec!["Terminal + native notifications for maximum visibility.".to_string()]
                 }
-                NotificationPref::None => vec![
-                    "No runtime alerts. You'll check status/review manually.".to_string(),
-                ],
+                NotificationPref::None => {
+                    vec!["No runtime alerts. You'll check status/review manually.".to_string()]
+                }
             },
             OnboardingStep::Confirm => vec![
                 "Save writes ~/.distill/config.yaml and installs scheduler integration."
@@ -754,11 +756,7 @@ fn draw_onboarding_ui(frame: &mut Frame<'_>, state: &OnboardingUiState) {
                     )),
             )
             .highlight_symbol("> ")
-            .highlight_style(
-                Style::default()
-                    .fg(EMPHASIS)
-                    .add_modifier(Modifier::BOLD),
-            );
+            .highlight_style(Style::default().fg(EMPHASIS).add_modifier(Modifier::BOLD));
 
         let mut list_state = ListState::default();
         if let Some(idx) = selected_idx {
@@ -834,13 +832,10 @@ fn draw_onboarding_ui(frame: &mut Frame<'_>, state: &OnboardingUiState) {
             Span::styled("Keys: ", Style::default().fg(ACCENT)),
             Span::raw(help),
         ]),
-        Line::from(Span::styled(
-            &state.status_line,
-            Style::default().fg(MUTED),
-        )),
+        Line::from(Span::styled(&state.status_line, Style::default().fg(MUTED))),
     ])
-        .block(Block::default().borders(Borders::TOP))
-        .wrap(Wrap { trim: true });
+    .block(Block::default().borders(Borders::TOP))
+    .wrap(Wrap { trim: true });
     frame.render_widget(footer, chunks[3]);
 }
 

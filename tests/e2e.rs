@@ -194,7 +194,9 @@ fn test_e2e_scan_without_now_runs_scheduled_path() {
         .assert()
         .success()
         .stdout(predicate::str::contains("running scheduled scan"))
-        .stdout(predicate::str::contains("No new sessions found since last scan."));
+        .stdout(predicate::str::contains(
+            "No new sessions found since last scan.",
+        ));
 
     assert!(
         dir.path().join(".distill").join("last-scan.json").is_file(),

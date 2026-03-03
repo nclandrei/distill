@@ -423,10 +423,10 @@ fn render_session_excerpt(session: &Session) -> String {
             continue;
         }
 
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
-            if let Some(msg) = extract_message_excerpt(&value, MAX_LINE_CHARS) {
-                parsed.push(format!("- {msg}\n"));
-            }
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed)
+            && let Some(msg) = extract_message_excerpt(&value, MAX_LINE_CHARS)
+        {
+            parsed.push(format!("- {msg}\n"));
         }
     }
 
@@ -496,13 +496,7 @@ fn collect_text_values(value: &serde_json::Value, out: &mut Vec<String>, depth: 
         }
         serde_json::Value::Object(map) => {
             for key in [
-                "text",
-                "content",
-                "message",
-                "input",
-                "output",
-                "prompt",
-                "pattern",
+                "text", "content", "message", "input", "output", "prompt", "pattern",
             ] {
                 if let Some(next) = map.get(key) {
                     collect_text_values(next, out, depth + 1);
@@ -1166,8 +1160,7 @@ printf '%s' 'not-json-on-stdout'
 
     #[test]
     fn test_parse_response_rejects_improve_without_target_skill() {
-        let json =
-            r##"[{"type":"improve","confidence":"high","target_skill":null,"evidence":[],"body":"# x"}]"##;
+        let json = r##"[{"type":"improve","confidence":"high","target_skill":null,"evidence":[],"body":"# x"}]"##;
         let err = parse_response(json).unwrap_err().to_string();
         assert!(err.contains("requires a non-empty `target_skill`"));
     }
@@ -1177,7 +1170,11 @@ printf '%s' 'not-json-on-stdout'
         let dir = tempfile::tempdir().unwrap();
         let keep_path = dir.path().join("regular.jsonl");
         let drop_path = dir.path().join("rollout-123.jsonl");
-        std::fs::write(&keep_path, "{\"role\":\"user\",\"text\":\"real session\"}\n").unwrap();
+        std::fs::write(
+            &keep_path,
+            "{\"role\":\"user\",\"text\":\"real session\"}\n",
+        )
+        .unwrap();
         std::fs::write(
             &drop_path,
             "You are a skill extraction engine for the `distill` tool.\nAnalyze these session files and produce a JSON object\n",

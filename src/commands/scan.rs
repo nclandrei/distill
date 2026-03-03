@@ -49,11 +49,7 @@ pub fn run(now: bool) -> Result<()> {
 }
 
 fn scan_trigger_label(now: bool) -> &'static str {
-    if now {
-        "immediate"
-    } else {
-        "scheduled"
-    }
+    if now { "immediate" } else { "scheduled" }
 }
 
 fn build_agents(config: &Config) -> Vec<Box<dyn Agent>> {
@@ -134,7 +130,10 @@ mod tests {
         let kinds: Vec<_> = agents.iter().map(|a| a.kind()).collect();
         assert_eq!(
             kinds,
-            vec![crate::agents::AgentKind::Claude, crate::agents::AgentKind::Codex]
+            vec![
+                crate::agents::AgentKind::Claude,
+                crate::agents::AgentKind::Codex
+            ]
         );
     }
 }

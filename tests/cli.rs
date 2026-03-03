@@ -74,7 +74,9 @@ fn test_scan_without_now_flag() {
         .assert()
         .success()
         .stdout(predicate::str::contains("running scheduled scan"))
-        .stdout(predicate::str::contains("No new sessions found since last scan."));
+        .stdout(predicate::str::contains(
+            "No new sessions found since last scan.",
+        ));
 }
 
 #[test]

@@ -6,15 +6,15 @@ use crossterm::{
     cursor,
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
+    Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::Line,
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
-    Frame, Terminal,
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -23,7 +23,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
-use crate::agents::{from_kind, AgentKind};
+use crate::agents::{AgentKind, from_kind};
 use crate::config::Config;
 use crate::proposals::{Proposal, ProposalType};
 
@@ -1322,7 +1322,7 @@ mod tests {
 
     #[test]
     fn test_draw_review_ui_renders_footer_actions_and_status() {
-        use ratatui::{backend::TestBackend, Terminal};
+        use ratatui::{Terminal, backend::TestBackend};
 
         let proposal = make_proposal("alpha.md", None, "# Alpha");
         let mut state = ReviewUiState::new(vec![proposal]);
@@ -1422,7 +1422,7 @@ mod tests {
 
     #[test]
     fn test_draw_review_ui_renders_confirmation_modal() {
-        use ratatui::{backend::TestBackend, Terminal};
+        use ratatui::{Terminal, backend::TestBackend};
 
         let proposal = make_proposal("alpha.md", None, "# Alpha");
         let mut state = ReviewUiState::new(vec![proposal]);
