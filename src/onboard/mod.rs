@@ -309,6 +309,81 @@ impl OnboardingUiState {
         self.selected_shell() != ShellType::Other && self.install_shell_hook
     }
 
+    fn contextual_help(&self) -> Vec<String> {
+        match self.step {
+            OnboardingStep::Agents => {
+                if self.selected_agents.is_empty() {
+                    vec![
+                        "No monitored agents selected: scans will not collect sessions.".to_string(),
+                        "Proposal generation falls back to detected/default agents.".to_string(),
+                    ]
+                } else {
+                    vec![
+                        "Only checked agents are scanned for new session patterns.".to_string(),
+                        "Disable an agent if you don't want its skills mixed in.".to_string(),
+                    ]
+                }
+            }
+            OnboardingStep::Interval => match self.selected_interval() {
+                Interval::Daily => vec![
+                    "Fastest feedback loop with higher background activity.".to_string(),
+                ],
+                Interval::Weekly => {
+                    vec!["Balanced cadence for most repos and teams.".to_string()]
+                }
+                Interval::Monthly => vec![
+                    "Lowest noise, but proposal turnaround will be slower.".to_string(),
+                ],
+            },
+            OnboardingStep::ProposalAgent => vec![format!(
+                "'{}' will format and generate proposed skills from collected sessions.",
+                self.proposal_agent
+            )],
+            OnboardingStep::Shell => match self.selected_shell() {
+                ShellType::Other => vec![
+                    "Auto hook install is disabled for 'other' shells.".to_string(),
+                    "Use 'distill notify --check' manually from your prompt flow.".to_string(),
+                ],
+                shell => vec![format!(
+                    "Hook snippets and integration paths will target the {} shell.",
+                    shell
+                )],
+            },
+            OnboardingStep::Hook => {
+                if self.install_hook_effective() {
+                    vec![
+                        "A hook will run 'distill notify --check' at prompt boundaries.".to_string(),
+                        "You can uninstall later via the watch/shell commands.".to_string(),
+                    ]
+                } else {
+                    vec![
+                        "No shell file changes will be made during setup.".to_string(),
+                        "Notifications still work via native alerts/scheduled scans.".to_string(),
+                    ]
+                }
+            }
+            OnboardingStep::Notifications => match self.selected_notifications() {
+                NotificationPref::Terminal => vec![
+                    "Terminal messages appear on your next prompt; no OS banners.".to_string(),
+                ],
+                NotificationPref::Native => vec![
+                    "OS notifications are shown; terminal stays clean.".to_string(),
+                ],
+                NotificationPref::Both => {
+                    vec!["Terminal + native notifications for maximum visibility.".to_string()]
+                }
+                NotificationPref::None => vec![
+                    "No runtime alerts. You'll check status/review manually.".to_string(),
+                ],
+            },
+            OnboardingStep::Confirm => vec![
+                "Save writes ~/.distill/config.yaml and installs scheduler integration."
+                    .to_string(),
+                "Cancel leaves your environment unchanged.".to_string(),
+            ],
+        }
+    }
+
     fn next_step(&mut self) {
         self.step = match self.step {
             OnboardingStep::Agents => OnboardingStep::Interval,
@@ -664,6 +739,8 @@ fn draw_onboarding_ui(frame: &mut Frame<'_>, state: &OnboardingUiState) {
          Shell        : {}\n\
          Hook install : {}\n\
          Notifications: {}\n\n\
+         Why this choice\n\n\
+         {}\n\n\
          Notes\n\n\
          - Detected: {}\n\
          - You can cancel any time with q.",
@@ -678,6 +755,12 @@ fn draw_onboarding_ui(frame: &mut Frame<'_>, state: &OnboardingUiState) {
             "no"
         },
         state.selected_notifications(),
+        state
+            .contextual_help()
+            .into_iter()
+            .map(|line| format!("- {line}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
         state.detection_label(),
     );
 
