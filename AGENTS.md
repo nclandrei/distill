@@ -30,7 +30,7 @@ SCRIPT="/Users/anicolae/code/dotfiles/config/skills/distill-verify/scripts/disti
   --state-file /Users/anicolae/code/distill/.distill-runtime/verify-session.env \
   --socket distill-ui \
   --session distill-ui \
-  --command 'cd /Users/anicolae/code/distill && make run'
+  --command 'cd /Users/anicolae/code/distill && cargo run --quiet --'
 ```
 
 ### Start or Reuse Session (Manual Fallback)
@@ -41,7 +41,7 @@ SESSION="distill-ui"
 TARGET="$SESSION:0.0"
 
 tmux -L "$TMUX_SOCKET" -f /dev/null new-session -Ad -s "$SESSION" \
-  'cd /Users/anicolae/code/distill && make run'
+  'cd /Users/anicolae/code/distill && cargo run --quiet --'
 open -na Ghostty --args -e tmux -L "$TMUX_SOCKET" attach -t "$SESSION"
 ```
 

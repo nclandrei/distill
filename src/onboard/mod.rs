@@ -580,6 +580,10 @@ enum OnboardingExit {
 }
 
 fn draw_onboarding_ui(frame: &mut Frame<'_>, state: &OnboardingUiState) {
+    const ACCENT: Color = Color::Cyan;
+    const EMPHASIS: Color = Color::Yellow;
+    const MUTED: Color = Color::DarkGray;
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -595,24 +599,30 @@ fn draw_onboarding_ui(frame: &mut Frame<'_>, state: &OnboardingUiState) {
 
     let header = Paragraph::new(vec![
         Line::from(vec![
-            Span::styled("distill onboarding", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "DISTILL ONBOARDING",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
             Span::raw("  "),
             Span::styled(
                 format!("Step {step_num}/{step_total}"),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
-            Span::raw(state.step_title()),
+            Span::styled(
+                state.step_title(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
         ]),
         Line::from(Span::styled(
             state.detection_label(),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(MUTED),
         )),
     ]);
     frame.render_widget(header, chunks[0]);
 
     let gauge = Gauge::default()
-        .gauge_style(Style::default().fg(Color::Cyan))
+        .gauge_style(Style::default().fg(ACCENT))
         .label(format!("{progress}%"))
         .percent(progress);
     frame.render_widget(gauge, chunks[1]);
@@ -631,7 +641,7 @@ fn draw_onboarding_ui(frame: &mut Frame<'_>, state: &OnboardingUiState) {
                 Span::raw("Save and finish setup"),
             ]),
             Line::from(vec![
-                Span::styled("[Backspace] ", Style::default().fg(Color::Yellow)),
+                Span::styled("[Backspace] ", Style::default().fg(EMPHASIS)),
                 Span::raw("Go back and edit choices"),
             ]),
             Line::from(vec![
@@ -639,7 +649,15 @@ fn draw_onboarding_ui(frame: &mut Frame<'_>, state: &OnboardingUiState) {
                 Span::raw("Cancel without writing config"),
             ]),
         ])
-        .block(Block::default().borders(Borders::ALL).title("Save / Cancel"));
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(MUTED))
+                .title(Span::styled(
+                    "SAVE / CANCEL",
+                    Style::default().add_modifier(Modifier::BOLD),
+                )),
+        );
         frame.render_widget(confirm, body_chunks[0]);
     } else {
         let (options_title, options, selected_idx): (&str, Vec<String>, Option<usize>) =
@@ -724,12 +742,21 @@ fn draw_onboarding_ui(frame: &mut Frame<'_>, state: &OnboardingUiState) {
             .iter()
             .map(|line| ListItem::new(line.clone()))
             .collect::<Vec<_>>();
+        let option_title = options_title.to_uppercase();
         let option_list = List::new(option_items)
-            .block(Block::default().borders(Borders::ALL).title(options_title))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(MUTED))
+                    .title(Span::styled(
+                        option_title,
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )),
+            )
             .highlight_symbol("> ")
             .highlight_style(
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(EMPHASIS)
                     .add_modifier(Modifier::BOLD),
             );
 
@@ -752,9 +779,11 @@ fn draw_onboarding_ui(frame: &mut Frame<'_>, state: &OnboardingUiState) {
          Proposal     : {} ({})\n\
          Shell        : {}\n\
          Hook install : {}\n\
-         Notifications: {}\n\n\
+         Notifications: {}\n\
+         \n\
          Why this choice\n\n\
-         {}\n\n\
+         {}\n\
+         \n\
          Notes\n\n\
          - Detected: {}\n\
          - You can cancel any time with q.",
@@ -782,8 +811,11 @@ fn draw_onboarding_ui(frame: &mut Frame<'_>, state: &OnboardingUiState) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Current setup")
-                .border_style(Style::default().fg(Color::DarkGray)),
+                .title(Span::styled(
+                    "CURRENT SETUP",
+                    Style::default().add_modifier(Modifier::BOLD),
+                ))
+                .border_style(Style::default().fg(MUTED)),
         )
         .wrap(Wrap { trim: false });
     frame.render_widget(summary_pane, body_chunks[1]);
@@ -797,8 +829,17 @@ fn draw_onboarding_ui(frame: &mut Frame<'_>, state: &OnboardingUiState) {
         _ => "Up/Down change selection | Enter next | Backspace previous",
     };
 
-    let footer = Paragraph::new(format!("{help}\n{}", state.status_line))
-        .block(Block::default().borders(Borders::TOP).title("Keys"))
+    let footer = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled("Keys: ", Style::default().fg(ACCENT)),
+            Span::raw(help),
+        ]),
+        Line::from(Span::styled(
+            &state.status_line,
+            Style::default().fg(MUTED),
+        )),
+    ])
+        .block(Block::default().borders(Borders::TOP))
         .wrap(Wrap { trim: true });
     frame.render_widget(footer, chunks[3]);
 }
