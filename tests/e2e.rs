@@ -168,6 +168,26 @@ fn test_e2e_scan_creates_proposals_dir() {
     );
 }
 
+/// With a valid config, plain `scan` (without `--now`) should execute the
+/// scheduled scan path and still run the scan engine.
+#[test]
+fn test_e2e_scan_without_now_runs_scheduled_path() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_config(dir.path());
+
+    distill_cmd(dir.path())
+        .arg("scan")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("running scheduled scan"))
+        .stdout(predicate::str::contains("No new sessions found since last scan."));
+
+    assert!(
+        dir.path().join(".distill").join("last-scan.json").is_file(),
+        "last-scan.json should be written after scheduled scan path"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Test 5 — full flow: seed config → verify status → verify proposals → verify notify
 // ---------------------------------------------------------------------------

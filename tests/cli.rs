@@ -61,11 +61,20 @@ fn test_scan_now_without_config() {
 #[test]
 fn test_scan_without_now_flag() {
     let dir = tempfile::tempdir().unwrap();
+    // Seed a minimal config so plain `scan` can execute the scheduled path.
+    let distill_dir = dir.path().join(".distill");
+    std::fs::create_dir_all(&distill_dir).unwrap();
+    std::fs::write(
+        distill_dir.join("config.yaml"),
+        "agents:\n  - name: claude\n    enabled: true\nscan_interval: weekly\nproposal_agent: claude\nshell: zsh\nnotifications: both\n",
+    ).unwrap();
+
     distill_cmd(dir.path())
         .arg("scan")
         .assert()
         .success()
-        .stdout(predicate::str::contains("scheduled scan not yet implemented"));
+        .stdout(predicate::str::contains("running scheduled scan"))
+        .stdout(predicate::str::contains("No new sessions found since last scan."));
 }
 
 #[test]

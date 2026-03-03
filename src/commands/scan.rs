@@ -1,17 +1,13 @@
 use anyhow::{Context, Result};
 
-use crate::agents::{ClaudeAdapter, CodexAdapter, Agent};
+use crate::agents::{Agent, ClaudeAdapter, CodexAdapter};
 use crate::config::Config;
 use crate::notify::notify_scan_complete;
 use crate::scanner::engine::{self, ScanConfig};
 
 pub fn run(now: bool) -> Result<()> {
-    if !now {
-        println!("distill scan: scheduled scan not yet implemented. Use --now for immediate scan.");
-        return Ok(());
-    }
-
-    println!("distill scan: running immediate scan...");
+    let trigger = scan_trigger_label(now);
+    println!("distill scan: running {trigger} scan...");
 
     // Load config
     let config = Config::load().context(
@@ -52,6 +48,14 @@ pub fn run(now: bool) -> Result<()> {
     Ok(())
 }
 
+fn scan_trigger_label(now: bool) -> &'static str {
+    if now {
+        "immediate"
+    } else {
+        "scheduled"
+    }
+}
+
 fn build_agents(config: &Config) -> Vec<Box<dyn Agent>> {
     let mut agents: Vec<Box<dyn Agent>> = Vec::new();
 
@@ -69,4 +73,68 @@ fn build_agents(config: &Config) -> Vec<Box<dyn Agent>> {
     }
 
     agents
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_scan_trigger_label_now_true() {
+        assert_eq!(scan_trigger_label(true), "immediate");
+    }
+
+    #[test]
+    fn test_scan_trigger_label_now_false() {
+        assert_eq!(scan_trigger_label(false), "scheduled");
+    }
+
+    #[test]
+    fn test_build_agents_enables_only_known_enabled_agents() {
+        let config = Config {
+            agents: vec![
+                crate::config::AgentEntry {
+                    name: "claude".into(),
+                    enabled: true,
+                },
+                crate::config::AgentEntry {
+                    name: "codex".into(),
+                    enabled: false,
+                },
+                crate::config::AgentEntry {
+                    name: "unknown-agent".into(),
+                    enabled: true,
+                },
+            ],
+            ..Config::default()
+        };
+
+        let agents = build_agents(&config);
+        let kinds: Vec<_> = agents.iter().map(|a| a.kind()).collect();
+        assert_eq!(kinds, vec![crate::agents::AgentKind::Claude]);
+    }
+
+    #[test]
+    fn test_build_agents_keeps_both_supported_agents_when_enabled() {
+        let config = Config {
+            agents: vec![
+                crate::config::AgentEntry {
+                    name: "claude".into(),
+                    enabled: true,
+                },
+                crate::config::AgentEntry {
+                    name: "codex".into(),
+                    enabled: true,
+                },
+            ],
+            ..Config::default()
+        };
+
+        let agents = build_agents(&config);
+        let kinds: Vec<_> = agents.iter().map(|a| a.kind()).collect();
+        assert_eq!(
+            kinds,
+            vec![crate::agents::AgentKind::Claude, crate::agents::AgentKind::Codex]
+        );
+    }
 }
