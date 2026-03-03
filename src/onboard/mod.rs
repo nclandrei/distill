@@ -6,6 +6,8 @@ use std::path::Path;
 
 use crate::agents::AgentKind;
 use crate::config::{AgentEntry, Config, Interval, NotificationPref, ShellType};
+use crate::schedule;
+use crate::shell::{self, HookStatus};
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -72,6 +74,38 @@ pub fn build_config(answers: &OnboardingAnswers) -> Config {
         shell: answers.shell.clone(),
         notifications: answers.notifications.clone(),
     }
+}
+
+/// Side effects applied after onboarding choices are persisted.
+pub struct PostSetupResult {
+    /// Shell hook install result (or `None` when user skipped installation).
+    pub hook_status: Option<HookStatus>,
+    /// Path to the scheduler file created during installation.
+    pub scheduler_path: std::path::PathBuf,
+}
+
+/// Apply post-onboarding setup:
+/// * Optionally install shell hook
+/// * Always install scheduler with the chosen interval
+pub fn apply_post_onboarding_setup(
+    config: &Config,
+    home: &Path,
+    install_shell_hook: bool,
+) -> Result<PostSetupResult> {
+    let hook_status = if install_shell_hook {
+        Some(shell::install_hook(&config.shell, home)?)
+    } else {
+        None
+    };
+
+    let scheduler = schedule::create_scheduler(home.to_path_buf());
+    scheduler.install(&config.scan_interval)?;
+    let scheduler_path = scheduler.plist_or_unit_path();
+
+    Ok(PostSetupResult {
+        hook_status,
+        scheduler_path,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -256,6 +290,18 @@ pub fn run_interactive() -> Result<()> {
     };
     println!();
 
+    let install_shell_hook = if shell == ShellType::Other {
+        println!("Automatic shell hook install is not available for 'other'.");
+        false
+    } else {
+        let install_hook_input = prompt("Install terminal notification hook now? [Y/n]: ")?;
+        !matches!(
+            install_hook_input.trim().to_ascii_lowercase().as_str(),
+            "n" | "no"
+        )
+    };
+    println!();
+
     // ------------------------------------------------------------------
     // Step 6: Ask notification preference
     // ------------------------------------------------------------------
@@ -290,6 +336,7 @@ pub fn run_interactive() -> Result<()> {
 
     let config = build_config(&answers);
     config.save()?;
+    let post_setup = apply_post_onboarding_setup(&config, &home, install_shell_hook)?;
 
     // ------------------------------------------------------------------
     // Step 8: Print summary
@@ -307,10 +354,7 @@ pub fn run_interactive() -> Result<()> {
         enabled_names.join(", ")
     };
 
-    println!(
-        "Configuration saved to {}",
-        Config::config_path().display()
-    );
+    println!("Configuration saved to {}", Config::config_path().display());
     println!();
     println!("Summary:");
     println!("  Agents monitored : {enabled_display}");
@@ -318,6 +362,23 @@ pub fn run_interactive() -> Result<()> {
     println!("  Proposal agent   : {}", config.proposal_agent);
     println!("  Shell            : {}", config.shell);
     println!("  Notifications    : {}", config.notifications);
+    println!();
+    println!("Setup:");
+    match post_setup.hook_status {
+        Some(HookStatus::Installed) => println!("  Shell hook       : installed"),
+        Some(HookStatus::AlreadyInstalled) => println!("  Shell hook       : already installed"),
+        Some(HookStatus::Unsupported) => {
+            println!("  Shell hook       : unsupported shell (manual setup required)")
+        }
+        Some(HookStatus::Removed) | Some(HookStatus::NotFound) => {
+            println!("  Shell hook       : not installed")
+        }
+        None => println!("  Shell hook       : skipped"),
+    }
+    println!(
+        "  Scheduler        : installed ({})",
+        post_setup.scheduler_path.display()
+    );
     println!();
     println!("Run 'distill scan --now' to start your first scan.");
     println!("Run 'distill review' to review pending proposals.");
@@ -332,7 +393,7 @@ pub fn run_interactive() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Interval, NotificationPref, ShellType};
+    use crate::config::{Config, Interval, NotificationPref, ShellType};
 
     // --- detect_agents ---
 
@@ -342,7 +403,11 @@ mod tests {
         let home = dir.path().to_path_buf();
         // Neither .claude nor .codex exists.
         let detected = detect_agents(&home);
-        assert_eq!(detected.len(), 2, "should report an entry for every known agent");
+        assert_eq!(
+            detected.len(),
+            2,
+            "should report an entry for every known agent"
+        );
         for (_, installed) in &detected {
             assert!(!installed, "no agent should be detected");
         }
@@ -355,8 +420,14 @@ mod tests {
         std::fs::create_dir_all(home.join(".claude")).unwrap();
 
         let detected = detect_agents(&home);
-        let claude = detected.iter().find(|(k, _)| *k == AgentKind::Claude).unwrap();
-        let codex = detected.iter().find(|(k, _)| *k == AgentKind::Codex).unwrap();
+        let claude = detected
+            .iter()
+            .find(|(k, _)| *k == AgentKind::Claude)
+            .unwrap();
+        let codex = detected
+            .iter()
+            .find(|(k, _)| *k == AgentKind::Codex)
+            .unwrap();
         assert!(claude.1, "Claude should be detected");
         assert!(!codex.1, "Codex should not be detected");
     }
@@ -368,8 +439,14 @@ mod tests {
         std::fs::create_dir_all(home.join(".codex")).unwrap();
 
         let detected = detect_agents(&home);
-        let claude = detected.iter().find(|(k, _)| *k == AgentKind::Claude).unwrap();
-        let codex = detected.iter().find(|(k, _)| *k == AgentKind::Codex).unwrap();
+        let claude = detected
+            .iter()
+            .find(|(k, _)| *k == AgentKind::Claude)
+            .unwrap();
+        let codex = detected
+            .iter()
+            .find(|(k, _)| *k == AgentKind::Codex)
+            .unwrap();
         assert!(!claude.1, "Claude should not be detected");
         assert!(codex.1, "Codex should be detected");
     }
@@ -571,5 +648,72 @@ mod tests {
         let config = build_config(&answers);
         assert_eq!(config.proposal_agent, "codex");
         assert_eq!(config.notifications, NotificationPref::None);
+    }
+
+    // --- post-onboarding setup side effects ---
+
+    #[test]
+    fn test_apply_post_onboarding_setup_installs_hook_and_scheduler() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+
+        let config = Config {
+            shell: ShellType::Zsh,
+            scan_interval: Interval::Weekly,
+            ..Config::default()
+        };
+
+        let result = apply_post_onboarding_setup(&config, home, true).unwrap();
+        assert_eq!(result.hook_status, Some(HookStatus::Installed));
+        assert!(
+            home.join(".zshrc").exists(),
+            "expected .zshrc to be created"
+        );
+        assert!(
+            result.scheduler_path.exists(),
+            "expected scheduler file to be installed"
+        );
+    }
+
+    #[test]
+    fn test_apply_post_onboarding_setup_skips_hook_when_declined() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+
+        let config = Config {
+            shell: ShellType::Bash,
+            scan_interval: Interval::Weekly,
+            ..Config::default()
+        };
+
+        let result = apply_post_onboarding_setup(&config, home, false).unwrap();
+        assert_eq!(result.hook_status, None);
+        assert!(
+            !home.join(".bashrc").exists(),
+            "expected .bashrc to remain untouched when hook is skipped"
+        );
+        assert!(
+            result.scheduler_path.exists(),
+            "expected scheduler file to be installed"
+        );
+    }
+
+    #[test]
+    fn test_apply_post_onboarding_setup_reports_unsupported_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+
+        let config = Config {
+            shell: ShellType::Other,
+            scan_interval: Interval::Daily,
+            ..Config::default()
+        };
+
+        let result = apply_post_onboarding_setup(&config, home, true).unwrap();
+        assert_eq!(result.hook_status, Some(HookStatus::Unsupported));
+        assert!(
+            result.scheduler_path.exists(),
+            "expected scheduler file to be installed"
+        );
     }
 }
