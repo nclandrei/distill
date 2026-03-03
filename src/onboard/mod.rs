@@ -110,6 +110,9 @@ pub fn apply_post_onboarding_setup(
         None
     };
 
+    #[cfg(test)]
+    let scheduler = schedule::create_scheduler_for_tests(home.to_path_buf());
+    #[cfg(not(test))]
     let scheduler = schedule::create_scheduler(home.to_path_buf());
     scheduler.install(&config.scan_interval)?;
     let scheduler_path = scheduler.plist_or_unit_path();

@@ -338,6 +338,24 @@ pub fn create_scheduler_default() -> Box<dyn Scheduler> {
     create_scheduler(home)
 }
 
+#[cfg(test)]
+pub(crate) fn create_scheduler_for_tests(home: PathBuf) -> Box<dyn Scheduler> {
+    #[cfg(target_os = "linux")]
+    {
+        Box::new(SystemdScheduler::with_systemctl_path(
+            home,
+            PathBuf::from("true"),
+        ))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Box::new(LaunchdScheduler::with_launchctl_path(
+            home,
+            PathBuf::from("true"),
+        ))
+    }
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
