@@ -12,6 +12,7 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
+    text::{Line, Span},
     widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Wrap},
 };
 use std::io::{self, IsTerminal};
@@ -507,38 +508,44 @@ fn draw_onboarding_ui(frame: &mut Frame<'_>, state: &OnboardingUiState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),
+            Constraint::Length(3),
+            Constraint::Length(1),
             Constraint::Min(10),
-            Constraint::Length(4),
+            Constraint::Length(3),
         ])
         .split(frame.area());
-
-    let header_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Length(3)])
-        .split(chunks[0]);
 
     let (step_num, step_total) = state.progress();
     let progress = ((step_num as f64 / step_total as f64) * 100.0).round() as u16;
 
-    let header = Paragraph::new(format!(
-        "distill onboarding | Step {step_num}/{step_total}: {}\n{}",
-        state.step_title(),
-        state.detection_label()
-    ))
-    .block(Block::default().borders(Borders::ALL));
-    frame.render_widget(header, header_chunks[0]);
+    let header = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled("distill onboarding", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("  "),
+            Span::styled(
+                format!("Step {step_num}/{step_total}"),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::raw(state.step_title()),
+        ]),
+        Line::from(Span::styled(
+            state.detection_label(),
+            Style::default().fg(Color::DarkGray),
+        )),
+    ]);
+    frame.render_widget(header, chunks[0]);
 
     let gauge = Gauge::default()
-        .block(Block::default().borders(Borders::ALL).title("Progress"))
         .gauge_style(Style::default().fg(Color::Cyan))
+        .label(format!("{progress}%"))
         .percent(progress);
-    frame.render_widget(gauge, header_chunks[1]);
+    frame.render_widget(gauge, chunks[1]);
 
     let body_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
-        .split(chunks[1]);
+        .split(chunks[2]);
 
     let (options_title, options, selected_idx): (&str, Vec<String>, Option<usize>) =
         match state.step {
@@ -634,7 +641,7 @@ fn draw_onboarding_ui(frame: &mut Frame<'_>, state: &OnboardingUiState) {
         .highlight_symbol("> ")
         .highlight_style(
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         );
 
@@ -675,7 +682,12 @@ fn draw_onboarding_ui(frame: &mut Frame<'_>, state: &OnboardingUiState) {
     );
 
     let summary_pane = Paragraph::new(summary)
-        .block(Block::default().borders(Borders::ALL).title("Summary"))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Current setup")
+                .border_style(Style::default().fg(Color::DarkGray)),
+        )
         .wrap(Wrap { trim: false });
     frame.render_widget(summary_pane, body_chunks[1]);
 
@@ -689,9 +701,9 @@ fn draw_onboarding_ui(frame: &mut Frame<'_>, state: &OnboardingUiState) {
     };
 
     let footer = Paragraph::new(format!("{help}\n{}", state.status_line))
-        .block(Block::default().borders(Borders::ALL).title("Keys"))
+        .block(Block::default().borders(Borders::TOP).title("Keys"))
         .wrap(Wrap { trim: true });
-    frame.render_widget(footer, chunks[2]);
+    frame.render_widget(footer, chunks[3]);
 }
 
 fn run_tui_flow(state: &mut OnboardingUiState) -> Result<OnboardingExit> {
