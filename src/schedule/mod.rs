@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
 
 use crate::config::Interval;
 
@@ -30,11 +31,44 @@ pub trait Scheduler {
 
 pub struct LaunchdScheduler {
     home: PathBuf,
+    launchctl_path: PathBuf,
 }
 
 impl LaunchdScheduler {
     pub fn new(home: PathBuf) -> Self {
-        Self { home }
+        Self {
+            home,
+            launchctl_path: PathBuf::from("launchctl"),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_launchctl_path(home: PathBuf, launchctl_path: PathBuf) -> Self {
+        Self {
+            home,
+            launchctl_path,
+        }
+    }
+
+    fn run_launchctl(&self, action: &str, plist_path: &PathBuf) -> Result<()> {
+        let status = Command::new(&self.launchctl_path)
+            .arg(action)
+            .arg(plist_path)
+            .status()
+            .with_context(|| {
+                format!("Failed to run {} {}", self.launchctl_path.display(), action)
+            })?;
+
+        if !status.success() {
+            anyhow::bail!(
+                "{} {} failed with status {}",
+                self.launchctl_path.display(),
+                action,
+                status
+            );
+        }
+
+        Ok(())
     }
 }
 
@@ -87,23 +121,18 @@ impl Scheduler for LaunchdScheduler {
         }
         fs::write(&plist_path, &plist)
             .with_context(|| format!("Failed to write plist: {}", plist_path.display()))?;
+        self.run_launchctl("load", &plist_path)?;
 
         println!("Plist written to {}", plist_path.display());
-        println!(
-            "To activate, run:\n  launchctl load {}",
-            plist_path.display()
-        );
+        println!("Loaded via launchctl.");
 
         Ok(())
     }
 
     fn uninstall(&self) -> Result<()> {
         let plist_path = self.plist_or_unit_path();
-        println!(
-            "To deactivate first, run:\n  launchctl unload {}",
-            plist_path.display()
-        );
         if plist_path.exists() {
+            self.run_launchctl("unload", &plist_path)?;
             fs::remove_file(&plist_path)
                 .with_context(|| format!("Failed to remove plist: {}", plist_path.display()))?;
         }
@@ -123,11 +152,23 @@ impl Scheduler for LaunchdScheduler {
 
 pub struct SystemdScheduler {
     home: PathBuf,
+    systemctl_path: PathBuf,
 }
 
 impl SystemdScheduler {
     pub fn new(home: PathBuf) -> Self {
-        Self { home }
+        Self {
+            home,
+            systemctl_path: PathBuf::from("systemctl"),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_systemctl_path(home: PathBuf, systemctl_path: PathBuf) -> Self {
+        Self {
+            home,
+            systemctl_path,
+        }
     }
 
     fn unit_dir(&self) -> PathBuf {
@@ -140,6 +181,30 @@ impl SystemdScheduler {
 
     pub fn timer_path(&self) -> PathBuf {
         self.unit_dir().join("distill.timer")
+    }
+
+    fn run_systemctl(&self, args: &[&str]) -> Result<()> {
+        let status = Command::new(&self.systemctl_path)
+            .args(args)
+            .status()
+            .with_context(|| {
+                format!(
+                    "Failed to run {} {}",
+                    self.systemctl_path.display(),
+                    args.join(" ")
+                )
+            })?;
+
+        if !status.success() {
+            anyhow::bail!(
+                "{} {} failed with status {}",
+                self.systemctl_path.display(),
+                args.join(" "),
+                status
+            );
+        }
+
+        Ok(())
     }
 }
 
@@ -196,30 +261,37 @@ impl Scheduler for SystemdScheduler {
             .with_context(|| format!("Failed to write service unit: {}", service_path.display()))?;
         fs::write(&timer_path, &timer)
             .with_context(|| format!("Failed to write timer unit: {}", timer_path.display()))?;
+        self.run_systemctl(&["--user", "daemon-reload"])?;
+        self.run_systemctl(&["--user", "enable", "--now", "distill.timer"])?;
 
         println!("Service written to {}", service_path.display());
         println!("Timer written to {}", timer_path.display());
-        println!(
-            "To activate, run:\n  systemctl --user daemon-reload\n  systemctl --user enable --now distill.timer"
-        );
+        println!("Enabled via systemctl --user.");
 
         Ok(())
     }
 
     fn uninstall(&self) -> Result<()> {
-        println!("To deactivate first, run:\n  systemctl --user disable --now distill.timer");
-
         let timer_path = self.timer_path();
         let service_path = self.service_path();
+        let had_units = timer_path.exists() || service_path.exists();
+
+        if had_units {
+            self.run_systemctl(&["--user", "disable", "--now", "distill.timer"])?;
+        }
 
         if timer_path.exists() {
-            fs::remove_file(&timer_path)
-                .with_context(|| format!("Failed to remove timer unit: {}", timer_path.display()))?;
+            fs::remove_file(&timer_path).with_context(|| {
+                format!("Failed to remove timer unit: {}", timer_path.display())
+            })?;
         }
         if service_path.exists() {
             fs::remove_file(&service_path).with_context(|| {
                 format!("Failed to remove service unit: {}", service_path.display())
             })?;
+        }
+        if had_units {
+            self.run_systemctl(&["--user", "daemon-reload"])?;
         }
 
         Ok(())
@@ -263,6 +335,14 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn launchd_scheduler_for_command_tests(home: PathBuf) -> LaunchdScheduler {
+        LaunchdScheduler::with_launchctl_path(home, PathBuf::from("true"))
+    }
+
+    fn systemd_scheduler_for_command_tests(home: PathBuf) -> SystemdScheduler {
+        SystemdScheduler::with_systemctl_path(home, PathBuf::from("true"))
+    }
+
     // ── LaunchdScheduler ─────────────────────────────────────────────────────
 
     #[test]
@@ -279,7 +359,7 @@ mod tests {
     #[test]
     fn test_launchd_install_creates_plist() {
         let dir = tempdir().unwrap();
-        let scheduler = LaunchdScheduler::new(dir.path().to_path_buf());
+        let scheduler = launchd_scheduler_for_command_tests(dir.path().to_path_buf());
         scheduler.install(&Interval::Daily).unwrap();
         assert!(scheduler.plist_or_unit_path().exists());
     }
@@ -287,7 +367,7 @@ mod tests {
     #[test]
     fn test_launchd_plist_contains_interval() {
         let dir = tempdir().unwrap();
-        let scheduler = LaunchdScheduler::new(dir.path().to_path_buf());
+        let scheduler = launchd_scheduler_for_command_tests(dir.path().to_path_buf());
 
         scheduler.install(&Interval::Daily).unwrap();
         let content = fs::read_to_string(scheduler.plist_or_unit_path()).unwrap();
@@ -314,7 +394,7 @@ mod tests {
     #[test]
     fn test_launchd_uninstall_removes_plist() {
         let dir = tempdir().unwrap();
-        let scheduler = LaunchdScheduler::new(dir.path().to_path_buf());
+        let scheduler = launchd_scheduler_for_command_tests(dir.path().to_path_buf());
         scheduler.install(&Interval::Weekly).unwrap();
         assert!(scheduler.plist_or_unit_path().exists());
         scheduler.uninstall().unwrap();
@@ -331,7 +411,7 @@ mod tests {
     #[test]
     fn test_launchd_status_installed() {
         let dir = tempdir().unwrap();
-        let scheduler = LaunchdScheduler::new(dir.path().to_path_buf());
+        let scheduler = launchd_scheduler_for_command_tests(dir.path().to_path_buf());
         scheduler.install(&Interval::Weekly).unwrap();
         assert_eq!(scheduler.status().unwrap(), SchedulerStatus::Installed);
     }
@@ -359,7 +439,7 @@ mod tests {
     #[test]
     fn test_systemd_install_creates_files() {
         let dir = tempdir().unwrap();
-        let scheduler = SystemdScheduler::new(dir.path().to_path_buf());
+        let scheduler = systemd_scheduler_for_command_tests(dir.path().to_path_buf());
         scheduler.install(&Interval::Daily).unwrap();
         assert!(scheduler.service_path().exists(), "service file missing");
         assert!(scheduler.timer_path().exists(), "timer file missing");
@@ -368,7 +448,7 @@ mod tests {
     #[test]
     fn test_systemd_timer_contains_calendar() {
         let dir = tempdir().unwrap();
-        let scheduler = SystemdScheduler::new(dir.path().to_path_buf());
+        let scheduler = systemd_scheduler_for_command_tests(dir.path().to_path_buf());
 
         scheduler.install(&Interval::Daily).unwrap();
         let content = fs::read_to_string(scheduler.timer_path()).unwrap();
@@ -395,13 +475,19 @@ mod tests {
     #[test]
     fn test_systemd_uninstall_removes_files() {
         let dir = tempdir().unwrap();
-        let scheduler = SystemdScheduler::new(dir.path().to_path_buf());
+        let scheduler = systemd_scheduler_for_command_tests(dir.path().to_path_buf());
         scheduler.install(&Interval::Daily).unwrap();
         assert!(scheduler.service_path().exists());
         assert!(scheduler.timer_path().exists());
         scheduler.uninstall().unwrap();
-        assert!(!scheduler.service_path().exists(), "service file still exists after uninstall");
-        assert!(!scheduler.timer_path().exists(), "timer file still exists after uninstall");
+        assert!(
+            !scheduler.service_path().exists(),
+            "service file still exists after uninstall"
+        );
+        assert!(
+            !scheduler.timer_path().exists(),
+            "timer file still exists after uninstall"
+        );
     }
 
     #[test]
@@ -414,7 +500,7 @@ mod tests {
     #[test]
     fn test_systemd_status_installed() {
         let dir = tempdir().unwrap();
-        let scheduler = SystemdScheduler::new(dir.path().to_path_buf());
+        let scheduler = systemd_scheduler_for_command_tests(dir.path().to_path_buf());
         scheduler.install(&Interval::Weekly).unwrap();
         assert_eq!(scheduler.status().unwrap(), SchedulerStatus::Installed);
     }
@@ -422,11 +508,17 @@ mod tests {
     #[test]
     fn test_launchd_plist_is_valid_xml() {
         let dir = tempdir().unwrap();
-        let scheduler = LaunchdScheduler::new(dir.path().to_path_buf());
+        let scheduler = launchd_scheduler_for_command_tests(dir.path().to_path_buf());
         scheduler.install(&Interval::Daily).unwrap();
         let content = fs::read_to_string(scheduler.plist_or_unit_path()).unwrap();
-        assert!(content.starts_with("<?xml"), "plist does not start with XML declaration");
-        assert!(content.contains("<plist version=\"1.0\">"), "missing plist root element");
+        assert!(
+            content.starts_with("<?xml"),
+            "plist does not start with XML declaration"
+        );
+        assert!(
+            content.contains("<plist version=\"1.0\">"),
+            "missing plist root element"
+        );
         assert!(content.contains("</plist>"), "plist missing closing tag");
         assert!(
             content.contains("com.distill.agent"),
@@ -437,12 +529,21 @@ mod tests {
     #[test]
     fn test_systemd_service_contains_exec_start() {
         let dir = tempdir().unwrap();
-        let scheduler = SystemdScheduler::new(dir.path().to_path_buf());
+        let scheduler = systemd_scheduler_for_command_tests(dir.path().to_path_buf());
         scheduler.install(&Interval::Daily).unwrap();
         let content = fs::read_to_string(scheduler.service_path()).unwrap();
-        assert!(content.contains("ExecStart="), "service missing ExecStart directive");
-        assert!(content.contains("scan"), "service ExecStart missing 'scan' subcommand");
-        assert!(content.contains("[Service]"), "service missing [Service] section");
+        assert!(
+            content.contains("ExecStart="),
+            "service missing ExecStart directive"
+        );
+        assert!(
+            content.contains("scan"),
+            "service ExecStart missing 'scan' subcommand"
+        );
+        assert!(
+            content.contains("[Service]"),
+            "service missing [Service] section"
+        );
         assert!(content.contains("[Unit]"), "service missing [Unit] section");
     }
 
@@ -457,8 +558,24 @@ mod tests {
     #[test]
     fn test_uninstall_is_idempotent_systemd() {
         let dir = tempdir().unwrap();
-        let scheduler = SystemdScheduler::new(dir.path().to_path_buf());
+        let scheduler = systemd_scheduler_for_command_tests(dir.path().to_path_buf());
         // Uninstall without prior install — must not panic or error.
         scheduler.uninstall().unwrap();
+    }
+
+    #[test]
+    fn test_launchd_install_fails_if_launchctl_fails() {
+        let dir = tempdir().unwrap();
+        let scheduler =
+            LaunchdScheduler::with_launchctl_path(dir.path().to_path_buf(), PathBuf::from("false"));
+        assert!(scheduler.install(&Interval::Daily).is_err());
+    }
+
+    #[test]
+    fn test_systemd_install_fails_if_systemctl_fails() {
+        let dir = tempdir().unwrap();
+        let scheduler =
+            SystemdScheduler::with_systemctl_path(dir.path().to_path_buf(), PathBuf::from("false"));
+        assert!(scheduler.install(&Interval::Daily).is_err());
     }
 }
