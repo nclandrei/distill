@@ -39,7 +39,9 @@ impl LaunchdScheduler {
     pub fn new(home: PathBuf) -> Self {
         Self {
             home,
-            launchctl_path: PathBuf::from("launchctl"),
+            launchctl_path: std::env::var_os("DISTILL_LAUNCHCTL_PATH")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("launchctl")),
         }
     }
 
@@ -165,7 +167,9 @@ impl SystemdScheduler {
     pub fn new(home: PathBuf) -> Self {
         Self {
             home,
-            systemctl_path: PathBuf::from("systemctl"),
+            systemctl_path: std::env::var_os("DISTILL_SYSTEMCTL_PATH")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("systemctl")),
         }
     }
 

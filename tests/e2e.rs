@@ -11,6 +11,8 @@ use std::fs;
 fn distill_cmd(home: &std::path::Path) -> Command {
     let mut cmd = Command::cargo_bin("distill").unwrap();
     cmd.env("HOME", home);
+    cmd.env("DISTILL_SYSTEMCTL_PATH", "true");
+    cmd.env("DISTILL_LAUNCHCTL_PATH", "true");
     cmd
 }
 
