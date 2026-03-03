@@ -50,20 +50,26 @@ impl LaunchdScheduler {
     }
 
     fn run_launchctl(&self, action: &str, plist_path: &PathBuf) -> Result<()> {
-        let status = Command::new(&self.launchctl_path)
+        let output = Command::new(&self.launchctl_path)
             .arg(action)
             .arg(plist_path)
-            .status()
+            .output()
             .with_context(|| {
                 format!("Failed to run {} {}", self.launchctl_path.display(), action)
             })?;
 
-        if !status.success() {
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             anyhow::bail!(
-                "{} {} failed with status {}",
+                "{} {} failed with status {}{}",
                 self.launchctl_path.display(),
                 action,
-                status
+                output.status,
+                if stderr.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {stderr}")
+                }
             );
         }
 
@@ -121,10 +127,6 @@ impl Scheduler for LaunchdScheduler {
         fs::write(&plist_path, &plist)
             .with_context(|| format!("Failed to write plist: {}", plist_path.display()))?;
         self.run_launchctl("load", &plist_path)?;
-
-        println!("Plist written to {}", plist_path.display());
-        println!("Loaded via launchctl.");
-
         Ok(())
     }
 
@@ -185,9 +187,9 @@ impl SystemdScheduler {
     }
 
     fn run_systemctl(&self, args: &[&str]) -> Result<()> {
-        let status = Command::new(&self.systemctl_path)
+        let output = Command::new(&self.systemctl_path)
             .args(args)
-            .status()
+            .output()
             .with_context(|| {
                 format!(
                     "Failed to run {} {}",
@@ -196,12 +198,18 @@ impl SystemdScheduler {
                 )
             })?;
 
-        if !status.success() {
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             anyhow::bail!(
-                "{} {} failed with status {}",
+                "{} {} failed with status {}{}",
                 self.systemctl_path.display(),
                 args.join(" "),
-                status
+                output.status,
+                if stderr.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {stderr}")
+                }
             );
         }
 
@@ -265,11 +273,6 @@ impl Scheduler for SystemdScheduler {
             .with_context(|| format!("Failed to write timer unit: {}", timer_path.display()))?;
         self.run_systemctl(&["--user", "daemon-reload"])?;
         self.run_systemctl(&["--user", "enable", "--now", "distill.timer"])?;
-
-        println!("Service written to {}", service_path.display());
-        println!("Timer written to {}", timer_path.display());
-        println!("Enabled via systemctl --user.");
-
         Ok(())
     }
 
