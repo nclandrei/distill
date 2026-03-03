@@ -17,10 +17,12 @@ pub trait Notifier {
 
 /// macOS native notifier via `osascript`.
 ///
-/// Defined unconditionally so that it is always reachable by tests.
-/// Only `is_available()` gates actual use to macOS at runtime.
+/// Included on macOS and in tests.
+/// `is_available()` still gates runtime use to macOS.
+#[cfg(any(target_os = "macos", test))]
 pub struct MacOsNotifier;
 
+#[cfg(any(target_os = "macos", test))]
 impl Notifier for MacOsNotifier {
     fn send(&self, title: &str, body: &str) -> Result<()> {
         let script = format!("display notification \"{}\" with title \"{}\"", body, title);

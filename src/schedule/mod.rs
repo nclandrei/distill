@@ -28,11 +28,13 @@ pub trait Scheduler {
 
 // ─── macOS launchd ────────────────────────────────────────────────────────────
 
+#[cfg(any(not(target_os = "linux"), test))]
 pub struct LaunchdScheduler {
     home: PathBuf,
     launchctl_path: PathBuf,
 }
 
+#[cfg(any(not(target_os = "linux"), test))]
 impl LaunchdScheduler {
     pub fn new(home: PathBuf) -> Self {
         Self {
@@ -77,6 +79,7 @@ impl LaunchdScheduler {
     }
 }
 
+#[cfg(any(not(target_os = "linux"), test))]
 impl Scheduler for LaunchdScheduler {
     fn plist_or_unit_path(&self) -> PathBuf {
         self.home
@@ -189,6 +192,8 @@ impl SystemdScheduler {
     fn run_systemctl(&self, args: &[&str]) -> Result<()> {
         let output = Command::new(&self.systemctl_path)
             .args(args)
+            .env("HOME", &self.home)
+            .env("XDG_CONFIG_HOME", self.home.join(".config"))
             .output()
             .with_context(|| {
                 format!(
