@@ -13,6 +13,7 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
+    text::Line,
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 use serde::{Deserialize, Serialize};
@@ -24,7 +25,7 @@ use std::time::Duration;
 
 use crate::agents::{AgentKind, from_kind};
 use crate::config::Config;
-use crate::proposals::Proposal;
+use crate::proposals::{Proposal, ProposalType};
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -100,6 +101,12 @@ pub fn load_proposals(proposals_dir: &Path) -> Result<Vec<Proposal>> {
         }
     }
 
+    proposals.sort_by(|a, b| {
+        let a_name = a.filename.as_deref().unwrap_or("");
+        let b_name = b.filename.as_deref().unwrap_or("");
+        a_name.cmp(b_name)
+    });
+
     Ok(proposals)
 }
 
@@ -134,14 +141,18 @@ pub fn log_decision(history_dir: &Path, entry: &HistoryEntry) -> Result<()> {
 /// 1. `target_skill` frontmatter field — normalised to a slug, with `.md` appended.
 /// 2. The proposal's own filename (kept as-is, since it already ends with `.md`).
 /// 3. A timestamp-based fallback.
+fn normalize_target_skill_filename(target: &str) -> String {
+    let slug = target.trim().to_lowercase().replace([' ', '_'], "-");
+    if slug.ends_with(".md") {
+        slug
+    } else {
+        format!("{slug}.md")
+    }
+}
+
 fn skill_filename_for(proposal: &Proposal) -> String {
     if let Some(target) = &proposal.frontmatter.target_skill {
-        let slug = target.to_lowercase().replace([' ', '_'], "-");
-        if slug.ends_with(".md") {
-            slug
-        } else {
-            format!("{slug}.md")
-        }
+        normalize_target_skill_filename(target)
     } else if let Some(filename) = &proposal.filename {
         filename.clone()
     } else {
@@ -156,24 +167,40 @@ pub fn accept_proposal(
     history_dir: &Path,
     proposals_dir: &Path,
 ) -> Result<()> {
-    let skill_file = skill_filename_for(proposal);
-
-    // Write proposal body to skills directory.
-    fs::create_dir_all(skills_dir).with_context(|| {
-        format!(
-            "Failed to create skills directory: {}",
-            skills_dir.display()
-        )
-    })?;
-    let skill_path = skills_dir.join(&skill_file);
-    fs::write(&skill_path, &proposal.body)
-        .with_context(|| format!("Failed to write skill to {}", skill_path.display()))?;
-
-    // Log the decision.
     let proposal_filename = proposal
         .filename
         .clone()
-        .unwrap_or_else(|| skill_file.clone());
+        .unwrap_or_else(|| skill_filename_for(proposal));
+
+    match proposal.frontmatter.proposal_type {
+        ProposalType::Remove => {
+            let target_skill = proposal
+                .frontmatter
+                .target_skill
+                .as_deref()
+                .context("Remove proposal is missing target_skill")?;
+            let skill_file = normalize_target_skill_filename(target_skill);
+            let skill_path = skills_dir.join(&skill_file);
+            if skill_path.exists() {
+                fs::remove_file(&skill_path)
+                    .with_context(|| format!("Failed to remove skill {}", skill_path.display()))?;
+            }
+        }
+        ProposalType::New | ProposalType::Improve | ProposalType::Edit => {
+            let skill_file = skill_filename_for(proposal);
+            fs::create_dir_all(skills_dir).with_context(|| {
+                format!(
+                    "Failed to create skills directory: {}",
+                    skills_dir.display()
+                )
+            })?;
+            let skill_path = skills_dir.join(&skill_file);
+            fs::write(&skill_path, &proposal.body)
+                .with_context(|| format!("Failed to write skill to {}", skill_path.display()))?;
+        }
+    }
+
+    // Log the decision.
     let entry = HistoryEntry {
         proposal_filename: proposal_filename.clone(),
         decision: "accepted".to_string(),
@@ -450,7 +477,7 @@ fn draw_review_ui(frame: &mut Frame<'_>, state: &ReviewUiState) {
         .constraints([
             Constraint::Length(3),
             Constraint::Min(10),
-            Constraint::Length(3),
+            Constraint::Length(4),
         ])
         .split(frame.area());
 
@@ -505,12 +532,13 @@ fn draw_review_ui(frame: &mut Frame<'_>, state: &ReviewUiState) {
         .scroll((state.content_scroll, 0));
     frame.render_widget(detail_pane, body_chunks[1]);
 
-    let footer = Paragraph::new(format!(
-        "a accept | r reject | e edit | s snooze | A accept-all | q quit | arrows move | PgUp/PgDn scroll\n{}",
-        state.status_line
-    ))
-    .block(Block::default().borders(Borders::ALL).title("Actions"))
-    .wrap(Wrap { trim: true });
+    let footer = Paragraph::new(vec![
+        Line::from(
+            "a accept | r reject | e edit | s snooze | A accept-all | q quit | arrows move | PgUp/PgDn scroll",
+        ),
+        Line::from(state.status_line.clone()),
+    ])
+    .block(Block::default().borders(Borders::ALL).title("Actions"));
     frame.render_widget(footer, chunks[2]);
 }
 
@@ -889,6 +917,27 @@ mod tests {
         assert!(filenames.contains(&"beta.md"));
     }
 
+    #[test]
+    fn test_load_proposals_sorted_by_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        let proposals_dir = dir.path();
+
+        let p1 = make_proposal("zeta.md", None, "# Zeta\nContent.");
+        let p2 = make_proposal("alpha.md", None, "# Alpha\nContent.");
+        let p3 = make_proposal("mid.md", None, "# Mid\nContent.");
+        write_proposal_file(proposals_dir, &p1);
+        write_proposal_file(proposals_dir, &p2);
+        write_proposal_file(proposals_dir, &p3);
+
+        let proposals = load_proposals(proposals_dir).unwrap();
+        let filenames: Vec<&str> = proposals
+            .iter()
+            .map(|p| p.filename.as_deref().unwrap())
+            .collect();
+
+        assert_eq!(filenames, vec!["alpha.md", "mid.md", "zeta.md"]);
+    }
+
     // -----------------------------------------------------------------------
     // accept_proposal
     // -----------------------------------------------------------------------
@@ -989,6 +1038,65 @@ mod tests {
         assert!(
             !other_path.exists(),
             "should NOT write to the proposal filename when target_skill is set"
+        );
+    }
+
+    #[test]
+    fn test_accept_remove_proposal_deletes_target_skill() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills_dir = dir.path().join("skills");
+        let history_dir = dir.path().join("history");
+        let proposals_dir = dir.path().join("proposals");
+        fs::create_dir_all(&skills_dir).unwrap();
+        fs::create_dir_all(&proposals_dir).unwrap();
+
+        let target_skill = skills_dir.join("stale-skill.md");
+        fs::write(&target_skill, "# Stale\nOld content.").unwrap();
+
+        let mut proposal = make_proposal(
+            "remove-123.md",
+            Some("stale-skill"),
+            "# Remove stale skill\nNo longer needed.",
+        );
+        proposal.frontmatter.proposal_type = ProposalType::Remove;
+        let proposal_path = proposals_dir.join("remove-123.md");
+        write_proposal_file(&proposals_dir, &proposal);
+
+        accept_proposal(&proposal, &skills_dir, &history_dir, &proposals_dir).unwrap();
+
+        assert!(!target_skill.exists(), "remove should delete target skill");
+        assert!(
+            !proposal_path.exists(),
+            "accepted remove proposal should be deleted"
+        );
+        assert!(
+            !skills_dir.join("remove-123.md").exists(),
+            "remove should not write proposal body as a new skill file"
+        );
+    }
+
+    #[test]
+    fn test_accept_remove_proposal_requires_target_skill() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills_dir = dir.path().join("skills");
+        let history_dir = dir.path().join("history");
+        let proposals_dir = dir.path().join("proposals");
+        fs::create_dir_all(&proposals_dir).unwrap();
+
+        let mut proposal = make_proposal("remove-missing-target.md", None, "# Missing target");
+        proposal.frontmatter.proposal_type = ProposalType::Remove;
+        let proposal_path = proposals_dir.join("remove-missing-target.md");
+        write_proposal_file(&proposals_dir, &proposal);
+
+        let result = accept_proposal(&proposal, &skills_dir, &history_dir, &proposals_dir);
+        assert!(result.is_err(), "remove without target_skill should fail");
+        assert!(
+            proposal_path.exists(),
+            "failed accept should keep proposal file for later review"
+        );
+        assert!(
+            !history_dir.join("decisions.jsonl").exists(),
+            "failed accept should not log an accepted decision"
         );
     }
 
