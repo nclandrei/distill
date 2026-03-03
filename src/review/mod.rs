@@ -6,15 +6,15 @@ use crossterm::{
     cursor,
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
-    Frame, Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::Line,
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    Frame, Terminal,
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -23,7 +23,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
-use crate::agents::{AgentKind, from_kind};
+use crate::agents::{from_kind, AgentKind};
 use crate::config::Config;
 use crate::proposals::{Proposal, ProposalType};
 
@@ -298,6 +298,35 @@ struct ReviewUiState {
     rejected: usize,
     skipped: usize,
     status_line: String,
+    confirmation: Option<PendingConfirmation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UiIntent {
+    MoveUp,
+    MoveDown,
+    ScrollUp,
+    ScrollDown,
+    ScrollHome,
+    Accept,
+    Reject,
+    Snooze,
+    Edit,
+    AcceptAll,
+    Quit,
+    Noop,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PendingConfirmation {
+    AcceptRemove { proposal_filename: String },
+    AcceptAllWithRemovals { remove_count: usize },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConfirmationResolution {
+    Proceed { clear_existing: bool },
+    Await(PendingConfirmation),
 }
 
 impl ReviewUiState {
@@ -310,6 +339,7 @@ impl ReviewUiState {
             rejected: 0,
             skipped: 0,
             status_line: "Select a proposal and choose an action.".to_string(),
+            confirmation: None,
         }
     }
 
@@ -344,6 +374,85 @@ impl ReviewUiState {
         }
         self.content_scroll = 0;
     }
+
+    fn clear_confirmation(&mut self) {
+        self.confirmation = None;
+    }
+}
+
+fn intent_from_key(code: KeyCode) -> UiIntent {
+    match code {
+        KeyCode::Up | KeyCode::Char('k') => UiIntent::MoveUp,
+        KeyCode::Down | KeyCode::Char('j') => UiIntent::MoveDown,
+        KeyCode::PageUp => UiIntent::ScrollUp,
+        KeyCode::PageDown => UiIntent::ScrollDown,
+        KeyCode::Home => UiIntent::ScrollHome,
+        KeyCode::Char('a') => UiIntent::Accept,
+        KeyCode::Char('r') => UiIntent::Reject,
+        KeyCode::Char('s') => UiIntent::Snooze,
+        KeyCode::Char('e') => UiIntent::Edit,
+        KeyCode::Char('A') => UiIntent::AcceptAll,
+        KeyCode::Char('q') | KeyCode::Esc => UiIntent::Quit,
+        _ => UiIntent::Noop,
+    }
+}
+
+fn required_confirmation_for_intent(
+    intent: UiIntent,
+    selected_proposal: Option<&Proposal>,
+    pending: &[Proposal],
+) -> Option<PendingConfirmation> {
+    match intent {
+        UiIntent::Accept => {
+            let proposal = selected_proposal?;
+            if proposal.frontmatter.proposal_type == ProposalType::Remove {
+                let name = proposal.filename.as_deref().unwrap_or("(unknown)");
+                Some(PendingConfirmation::AcceptRemove {
+                    proposal_filename: name.to_string(),
+                })
+            } else {
+                None
+            }
+        }
+        UiIntent::AcceptAll => {
+            let remove_count = pending
+                .iter()
+                .filter(|proposal| proposal.frontmatter.proposal_type == ProposalType::Remove)
+                .count();
+            if remove_count > 0 {
+                Some(PendingConfirmation::AcceptAllWithRemovals { remove_count })
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn resolve_confirmation(
+    current: Option<&PendingConfirmation>,
+    required: Option<PendingConfirmation>,
+) -> ConfirmationResolution {
+    match required {
+        Some(required) if current == Some(&required) => ConfirmationResolution::Proceed {
+            clear_existing: true,
+        },
+        Some(required) => ConfirmationResolution::Await(required),
+        None => ConfirmationResolution::Proceed {
+            clear_existing: current.is_some(),
+        },
+    }
+}
+
+fn confirmation_prompt(confirmation: &PendingConfirmation) -> String {
+    match confirmation {
+        PendingConfirmation::AcceptRemove { proposal_filename } => {
+            format!("Confirm remove accept for {proposal_filename}: press 'a' again.")
+        }
+        PendingConfirmation::AcceptAllWithRemovals { remove_count } => format!(
+            "Accept-all includes {remove_count} remove proposal(s). Press 'A' again to confirm."
+        ),
+    }
 }
 
 struct TuiSession {
@@ -367,9 +476,9 @@ impl TuiSession {
         })
     }
 
-    fn draw(&mut self, state: &ReviewUiState) -> Result<()> {
+    fn draw(&mut self, state: &ReviewUiState, skills_dir: &Path) -> Result<()> {
         self.terminal
-            .draw(|frame| draw_review_ui(frame, state))
+            .draw(|frame| draw_review_ui(frame, state, skills_dir))
             .context("Failed to render review UI")?;
         Ok(())
     }
@@ -433,7 +542,7 @@ fn proposal_label(proposal: &Proposal) -> String {
     format!("{filename} [{kind}]")
 }
 
-fn proposal_details_text(proposal: &Proposal) -> String {
+fn proposal_details_text(proposal: &Proposal, skills_dir: &Path) -> String {
     use crate::proposals::{Confidence, ProposalType};
 
     let filename = proposal.filename.as_deref().unwrap_or("(unknown)");
@@ -466,12 +575,30 @@ fn proposal_details_text(proposal: &Proposal) -> String {
         }
     }
 
+    if proposal.frontmatter.proposal_type == ProposalType::Remove {
+        text.push_str("\nWarning:\n");
+        if let Some(target_skill) = proposal.frontmatter.target_skill.as_deref() {
+            let skill_file = normalize_target_skill_filename(target_skill);
+            let skill_path = skills_dir.join(&skill_file);
+            if !skill_path.exists() {
+                text.push_str(&format!(
+                    "- Target skill file not found: {}\n",
+                    skill_path.display()
+                ));
+            } else {
+                text.push_str("- This will permanently delete the target skill file.\n");
+            }
+        } else {
+            text.push_str("- Remove proposal is missing target_skill and will fail.\n");
+        }
+    }
+
     text.push_str("\n--- Content ---\n");
     text.push_str(&proposal.body);
     text
 }
 
-fn draw_review_ui(frame: &mut Frame<'_>, state: &ReviewUiState) {
+fn draw_review_ui(frame: &mut Frame<'_>, state: &ReviewUiState, skills_dir: &Path) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -524,7 +651,7 @@ fn draw_review_ui(frame: &mut Frame<'_>, state: &ReviewUiState) {
 
     let details = state
         .selected_proposal()
-        .map(proposal_details_text)
+        .map(|proposal| proposal_details_text(proposal, skills_dir))
         .unwrap_or_else(|| "No pending proposals.".to_string());
     let detail_pane = Paragraph::new(details)
         .block(Block::default().borders(Borders::ALL).title("Details"))
@@ -540,6 +667,43 @@ fn draw_review_ui(frame: &mut Frame<'_>, state: &ReviewUiState) {
     ])
     .block(Block::default().borders(Borders::ALL).title("Actions"));
     frame.render_widget(footer, chunks[2]);
+
+    if let Some(confirmation) = state.confirmation.as_ref() {
+        let modal = centered_rect(60, 22, frame.area());
+        let text = vec![
+            Line::from("Confirm Action"),
+            Line::from(""),
+            Line::from(confirmation_prompt(confirmation)),
+            Line::from(""),
+            Line::from("Press the same action key again to confirm."),
+            Line::from("Any other action key cancels this confirmation."),
+        ];
+        let widget = Paragraph::new(text)
+            .block(Block::default().borders(Borders::ALL).title("Confirmation"))
+            .wrap(Wrap { trim: true });
+        frame.render_widget(Clear, modal);
+        frame.render_widget(widget, modal);
+    }
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+    let horizontal = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical[1]);
+    horizontal[1]
 }
 
 fn shell_quote_single(input: &str) -> String {
@@ -628,7 +792,7 @@ pub fn run_review_interactive(
     let mut tui = TuiSession::enter()?;
 
     while !state.pending.is_empty() {
-        tui.draw(&state)?;
+        tui.draw(&state, skills_dir)?;
 
         if !event::poll(Duration::from_millis(200)).context("Failed to poll terminal events")? {
             continue;
@@ -641,13 +805,36 @@ pub fn run_review_interactive(
             continue;
         }
 
-        match key.code {
-            KeyCode::Up | KeyCode::Char('k') => state.select_prev(),
-            KeyCode::Down | KeyCode::Char('j') => state.select_next(),
-            KeyCode::PageUp => state.content_scroll = state.content_scroll.saturating_sub(5),
-            KeyCode::PageDown => state.content_scroll = state.content_scroll.saturating_add(5),
-            KeyCode::Home => state.content_scroll = 0,
-            KeyCode::Char('a') => {
+        let intent = intent_from_key(key.code);
+        if intent == UiIntent::Noop {
+            continue;
+        }
+
+        let required =
+            required_confirmation_for_intent(intent, state.selected_proposal(), &state.pending);
+        match resolve_confirmation(state.confirmation.as_ref(), required) {
+            ConfirmationResolution::Await(confirmation) => {
+                state.status_line = confirmation_prompt(&confirmation);
+                state.confirmation = Some(confirmation);
+                continue;
+            }
+            ConfirmationResolution::Proceed { clear_existing } => {
+                if clear_existing {
+                    state.clear_confirmation();
+                    if !matches!(intent, UiIntent::Accept | UiIntent::AcceptAll) {
+                        state.status_line = "Confirmation cancelled.".to_string();
+                    }
+                }
+            }
+        }
+
+        match intent {
+            UiIntent::MoveUp => state.select_prev(),
+            UiIntent::MoveDown => state.select_next(),
+            UiIntent::ScrollUp => state.content_scroll = state.content_scroll.saturating_sub(5),
+            UiIntent::ScrollDown => state.content_scroll = state.content_scroll.saturating_add(5),
+            UiIntent::ScrollHome => state.content_scroll = 0,
+            UiIntent::Accept => {
                 if let Some(proposal) = state.selected_proposal().cloned() {
                     let name = proposal
                         .filename
@@ -666,7 +853,7 @@ pub fn run_review_interactive(
                     }
                 }
             }
-            KeyCode::Char('r') => {
+            UiIntent::Reject => {
                 if let Some(proposal) = state.selected_proposal().cloned() {
                     let name = proposal
                         .filename
@@ -685,7 +872,7 @@ pub fn run_review_interactive(
                     }
                 }
             }
-            KeyCode::Char('s') => {
+            UiIntent::Snooze => {
                 if let Some(proposal) = state.selected_proposal() {
                     let name = proposal
                         .filename
@@ -697,7 +884,7 @@ pub fn run_review_interactive(
                     state.status_line = format!("Snoozed {name}");
                 }
             }
-            KeyCode::Char('e') => {
+            UiIntent::Edit => {
                 let Some(proposal) = state.selected_proposal().cloned() else {
                     continue;
                 };
@@ -735,7 +922,7 @@ pub fn run_review_interactive(
                     }
                 }
             }
-            KeyCode::Char('A') => {
+            UiIntent::AcceptAll => {
                 let total = state.pending.len();
                 let mut failed = Vec::new();
                 let mut accepted_now = 0usize;
@@ -764,14 +951,14 @@ pub fn run_review_interactive(
                     );
                 }
             }
-            KeyCode::Char('q') | KeyCode::Esc => {
+            UiIntent::Quit => {
                 let remaining = state.pending.len();
                 state.skipped += remaining;
                 state.pending.clear();
                 state.status_line =
                     format!("Exited review. Snoozed {remaining} remaining proposal(s).");
             }
-            _ => {}
+            UiIntent::Noop => {}
         }
     }
 
@@ -848,6 +1035,18 @@ mod tests {
         let md = proposal.to_markdown().unwrap();
         let fname = proposal.filename.as_deref().unwrap();
         fs::write(dir.join(fname), md).unwrap();
+    }
+
+    fn render_buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
+        let area = *buffer.area();
+        let mut out = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                out.push_str(buffer[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
     }
 
     // -----------------------------------------------------------------------
@@ -1098,6 +1297,148 @@ mod tests {
             !history_dir.join("decisions.jsonl").exists(),
             "failed accept should not log an accepted decision"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // UI rendering
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_proposal_details_warns_when_remove_target_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut proposal = make_proposal("remove.md", Some("missing-skill"), "# Remove");
+        proposal.frontmatter.proposal_type = ProposalType::Remove;
+
+        let details = proposal_details_text(&proposal, dir.path());
+        assert!(
+            details.contains("Warning:"),
+            "remove proposals should include a warning section"
+        );
+        assert!(
+            details.contains("Target skill file not found"),
+            "remove proposals with missing targets should show an explicit warning"
+        );
+    }
+
+    #[test]
+    fn test_draw_review_ui_renders_footer_actions_and_status() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let proposal = make_proposal("alpha.md", None, "# Alpha");
+        let mut state = ReviewUiState::new(vec![proposal]);
+        state.status_line = "Accepted alpha.md".to_string();
+
+        let skills_dir = tempfile::tempdir().unwrap();
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw_review_ui(frame, &state, skills_dir.path()))
+            .unwrap();
+
+        let rendered = render_buffer_text(terminal.backend().buffer());
+        assert!(
+            rendered.contains("a accept | r reject"),
+            "actions row must render"
+        );
+        assert!(
+            rendered.contains("Accepted alpha.md"),
+            "status line should be visible in footer"
+        );
+    }
+
+    #[test]
+    fn test_required_confirmation_for_accept_remove() {
+        let mut proposal = make_proposal("remove-me.md", Some("legacy"), "# Remove");
+        proposal.frontmatter.proposal_type = ProposalType::Remove;
+        let pending = vec![proposal.clone()];
+
+        let required =
+            required_confirmation_for_intent(UiIntent::Accept, Some(&proposal), &pending);
+        assert_eq!(
+            required,
+            Some(PendingConfirmation::AcceptRemove {
+                proposal_filename: "remove-me.md".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn test_required_confirmation_for_accept_all_with_removals() {
+        let mut remove = make_proposal("remove.md", Some("legacy"), "# Remove");
+        remove.frontmatter.proposal_type = ProposalType::Remove;
+        let keep = make_proposal("new.md", None, "# New");
+        let pending = vec![remove, keep];
+
+        let required = required_confirmation_for_intent(
+            UiIntent::AcceptAll,
+            pending.first(),
+            pending.as_slice(),
+        );
+        assert_eq!(
+            required,
+            Some(PendingConfirmation::AcceptAllWithRemovals { remove_count: 1 })
+        );
+    }
+
+    #[test]
+    fn test_resolve_confirmation_needs_first_confirmation() {
+        let required = Some(PendingConfirmation::AcceptRemove {
+            proposal_filename: "remove.md".to_string(),
+        });
+        let outcome = resolve_confirmation(None, required);
+        assert_eq!(
+            outcome,
+            ConfirmationResolution::Await(PendingConfirmation::AcceptRemove {
+                proposal_filename: "remove.md".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn test_resolve_confirmation_allows_on_second_press() {
+        let pending = PendingConfirmation::AcceptAllWithRemovals { remove_count: 2 };
+        let outcome = resolve_confirmation(Some(&pending), Some(pending.clone()));
+        assert_eq!(
+            outcome,
+            ConfirmationResolution::Proceed {
+                clear_existing: true
+            }
+        );
+    }
+
+    #[test]
+    fn test_resolve_confirmation_clears_on_other_action() {
+        let pending = PendingConfirmation::AcceptRemove {
+            proposal_filename: "remove.md".to_string(),
+        };
+        let outcome = resolve_confirmation(Some(&pending), None);
+        assert_eq!(
+            outcome,
+            ConfirmationResolution::Proceed {
+                clear_existing: true
+            }
+        );
+    }
+
+    #[test]
+    fn test_draw_review_ui_renders_confirmation_modal() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let proposal = make_proposal("alpha.md", None, "# Alpha");
+        let mut state = ReviewUiState::new(vec![proposal]);
+        state.confirmation = Some(PendingConfirmation::AcceptAllWithRemovals { remove_count: 1 });
+
+        let skills_dir = tempfile::tempdir().unwrap();
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw_review_ui(frame, &state, skills_dir.path()))
+            .unwrap();
+
+        let rendered = render_buffer_text(terminal.backend().buffer());
+        assert!(rendered.contains("Confirmation"));
+        assert!(rendered.contains("Confirm Action"));
+        assert!(rendered.contains("Press 'A' again"));
     }
 
     // -----------------------------------------------------------------------
