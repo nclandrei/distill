@@ -1,5 +1,7 @@
-use crate::config::Config;
+use crate::config::{Config, Interval};
+use crate::scanner::reader::LastScan;
 use anyhow::Result;
+use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use std::path::Path;
 
 /// All the data needed to render the status output.
@@ -10,6 +12,22 @@ pub struct StatusInfo {
     /// Human-readable timestamp string from `last-scan.json`, or `None` when
     /// the file does not exist (i.e. the tool has never run a scan).
     pub last_scan: Option<String>,
+    /// Human-readable timestamp of the next expected scan run derived from the
+    /// configured interval and the last scan timestamp.
+    pub next_scheduled_scan: Option<String>,
+}
+
+fn interval_duration(interval: &Interval) -> Duration {
+    match interval {
+        Interval::Daily => Duration::days(1),
+        Interval::Weekly => Duration::weeks(1),
+        // Keep this aligned with launchd's 2,592,000 second interval.
+        Interval::Monthly => Duration::days(30),
+    }
+}
+
+fn format_utc_timestamp(timestamp: DateTime<Utc>) -> String {
+    timestamp.to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
 /// Pure formatting function — takes pre-collected data and returns the full
@@ -37,6 +55,8 @@ pub fn format_status(info: &StatusInfo) -> String {
 
     let last_scan_display = info.last_scan.as_deref().unwrap_or("never");
     out.push_str(&format!("Last scan:         {last_scan_display}\n"));
+    let next_scan_display = info.next_scheduled_scan.as_deref().unwrap_or("unknown");
+    out.push_str(&format!("Next scheduled scan: {next_scan_display}\n"));
 
     out
 }
@@ -66,10 +86,15 @@ pub fn collect_status_info(config: &Config, base_dir: &Path) -> Result<StatusInf
     };
 
     let last_scan_path = base_dir.join("last-scan.json");
-    let last_scan = if last_scan_path.exists() {
-        Some(std::fs::read_to_string(&last_scan_path)?.trim().to_string())
+    let last_scan_data = LastScan::load(&last_scan_path)?;
+    let (last_scan, next_scheduled_scan) = if let Some(last_scan_data) = last_scan_data {
+        let last_scan = format_utc_timestamp(last_scan_data.timestamp);
+        let next_scan = format_utc_timestamp(
+            last_scan_data.timestamp + interval_duration(&config.scan_interval),
+        );
+        (Some(last_scan), Some(next_scan))
     } else {
-        None
+        (None, None)
     };
 
     Ok(StatusInfo {
@@ -77,6 +102,7 @@ pub fn collect_status_info(config: &Config, base_dir: &Path) -> Result<StatusInf
         pending_proposals,
         accepted_skills,
         last_scan,
+        next_scheduled_scan,
     })
 }
 
@@ -109,6 +135,7 @@ mod tests {
             pending_proposals: 0,
             accepted_skills: 0,
             last_scan: None,
+            next_scheduled_scan: None,
         }
     }
 
@@ -161,16 +188,19 @@ mod tests {
         let output = format_status(&default_info());
 
         assert!(output.contains("Last scan:         never"));
+        assert!(output.contains("Next scheduled scan: unknown"));
     }
 
     #[test]
     fn test_format_status_with_last_scan() {
         let mut info = default_info();
         info.last_scan = Some("2024-11-20T08:15:00Z".to_string());
+        info.next_scheduled_scan = Some("2024-11-27T08:15:00Z".to_string());
 
         let output = format_status(&info);
 
         assert!(output.contains("Last scan:         2024-11-20T08:15:00Z"));
+        assert!(output.contains("Next scheduled scan: 2024-11-27T08:15:00Z"));
         // Must not also say "never"
         assert!(!output.contains("never"));
     }
@@ -180,8 +210,14 @@ mod tests {
     fn test_format_status_disabled_agent() {
         let mut info = default_info();
         info.config.agents = vec![
-            AgentEntry { name: "claude".into(), enabled: true },
-            AgentEntry { name: "codex".into(), enabled: false },
+            AgentEntry {
+                name: "claude".into(),
+                enabled: true,
+            },
+            AgentEntry {
+                name: "codex".into(),
+                enabled: false,
+            },
         ];
 
         let output = format_status(&info);
@@ -233,7 +269,11 @@ mod tests {
         std::fs::write(skills.join("s3.md"), "skill 3").unwrap();
 
         // last-scan.json
-        std::fs::write(base.join("last-scan.json"), "2024-06-01T12:00:00Z").unwrap();
+        std::fs::write(
+            base.join("last-scan.json"),
+            r#"{"timestamp":"2024-06-01T12:00:00Z","session_ids":[]}"#,
+        )
+        .unwrap();
 
         let config = Config::default();
         let info = collect_status_info(&config, base).unwrap();
@@ -241,6 +281,10 @@ mod tests {
         assert_eq!(info.pending_proposals, 2);
         assert_eq!(info.accepted_skills, 3);
         assert_eq!(info.last_scan.as_deref(), Some("2024-06-01T12:00:00Z"));
+        assert_eq!(
+            info.next_scheduled_scan.as_deref(),
+            Some("2024-06-08T12:00:00Z")
+        );
     }
 
     #[test]
@@ -259,6 +303,7 @@ mod tests {
         assert_eq!(info.pending_proposals, 0);
         assert_eq!(info.accepted_skills, 0);
         assert_eq!(info.last_scan, None);
+        assert_eq!(info.next_scheduled_scan, None);
     }
 
     /// When the proposals and skills directories don't exist at all (fresh
@@ -275,6 +320,7 @@ mod tests {
         assert_eq!(info.pending_proposals, 0);
         assert_eq!(info.accepted_skills, 0);
         assert_eq!(info.last_scan, None);
+        assert_eq!(info.next_scheduled_scan, None);
     }
 
     /// `collect_status_info` must preserve the config it was given.
@@ -288,7 +334,10 @@ mod tests {
             proposal_agent: "codex".into(),
             shell: ShellType::Bash,
             notifications: NotificationPref::Terminal,
-            agents: vec![AgentEntry { name: "codex".into(), enabled: true }],
+            agents: vec![AgentEntry {
+                name: "codex".into(),
+                enabled: true,
+            }],
         };
 
         let info = collect_status_info(&config, base).unwrap();
@@ -323,17 +372,51 @@ mod tests {
         assert_eq!(info.accepted_skills, 1);
     }
 
-    /// last-scan.json content is trimmed of surrounding whitespace.
+    /// Parse the structured last-scan payload and expose only the timestamp.
     #[test]
-    fn test_collect_status_info_trims_last_scan_whitespace() {
+    fn test_collect_status_info_parses_last_scan_timestamp_field() {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path();
 
-        std::fs::write(base.join("last-scan.json"), "  2025-01-10T09:00:00Z\n").unwrap();
+        std::fs::write(
+            base.join("last-scan.json"),
+            r#"
+{
+  "timestamp": "2025-01-10T09:00:00Z",
+  "session_ids": ["s-1", "s-2"]
+}
+"#,
+        )
+        .unwrap();
 
         let config = Config::default();
         let info = collect_status_info(&config, base).unwrap();
 
         assert_eq!(info.last_scan.as_deref(), Some("2025-01-10T09:00:00Z"));
+        assert_eq!(
+            info.next_scheduled_scan.as_deref(),
+            Some("2025-01-17T09:00:00Z")
+        );
+    }
+
+    #[test]
+    fn test_collect_status_info_next_scheduled_scan_monthly_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+
+        std::fs::write(
+            base.join("last-scan.json"),
+            r#"{"timestamp":"2025-01-10T09:00:00Z","session_ids":[]}"#,
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config.scan_interval = Interval::Monthly;
+        let info = collect_status_info(&config, base).unwrap();
+
+        assert_eq!(
+            info.next_scheduled_scan.as_deref(),
+            Some("2025-02-09T09:00:00Z")
+        );
     }
 }
