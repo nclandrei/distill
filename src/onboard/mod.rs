@@ -1,8 +1,22 @@
 // Onboarding flow — interactive first-run setup.
 
-use anyhow::Result;
-use std::io::{self, Write};
+use anyhow::{Context, Result};
+use crossterm::{
+    cursor,
+    event::{self, Event, KeyCode, KeyEventKind},
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+};
+use ratatui::{
+    Frame, Terminal,
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout},
+    style::{Color, Modifier, Style},
+    widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Wrap},
+};
+use std::io::{self, IsTerminal};
 use std::path::Path;
+use std::time::Duration;
 
 use crate::agents::{AgentKind, from_kind};
 use crate::config::{AgentEntry, Config, Interval, NotificationPref, ShellType};
@@ -106,239 +120,686 @@ pub fn apply_post_onboarding_setup(
 }
 
 // ---------------------------------------------------------------------------
-// I/O helpers (used only by run_interactive)
+// Interactive TUI helpers
 // ---------------------------------------------------------------------------
 
-/// Print `prompt` without a trailing newline, flush stdout, then read one line
-/// from stdin.  Returns the trimmed line.
-fn prompt(prompt_str: &str) -> Result<String> {
-    print!("{}", prompt_str);
-    io::stdout().flush()?;
-    let mut line = String::new();
-    io::stdin().read_line(&mut line)?;
-    Ok(line.trim().to_string())
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OnboardingStep {
+    Agents,
+    Interval,
+    ProposalAgent,
+    Shell,
+    Hook,
+    Notifications,
+    Confirm,
+}
+
+#[derive(Debug, Clone)]
+struct OnboardingUiState {
+    detected_agents: Vec<(AgentKind, bool)>,
+    all_agents: Vec<AgentKind>,
+    selected_agents: Vec<AgentKind>,
+    proposal_agent: AgentKind,
+    step: OnboardingStep,
+    agent_cursor: usize,
+    interval_cursor: usize,
+    shell_cursor: usize,
+    notif_cursor: usize,
+    install_shell_hook: bool,
+    status_line: String,
+}
+
+impl OnboardingUiState {
+    fn new(detected_agents: Vec<(AgentKind, bool)>) -> Self {
+        let all_agents = AgentKind::all();
+        let installed_agents: Vec<AgentKind> = detected_agents
+            .iter()
+            .filter(|(_, installed)| *installed)
+            .map(|(kind, _)| *kind)
+            .collect();
+
+        let selected_agents = if installed_agents.is_empty() {
+            all_agents.clone()
+        } else {
+            installed_agents.clone()
+        };
+
+        let detected_shell = ShellType::detect();
+        let shell_cursor = shell_to_index(&detected_shell);
+
+        let mut state = Self {
+            proposal_agent: selected_agents
+                .first()
+                .copied()
+                .unwrap_or(AgentKind::Claude),
+            detected_agents,
+            all_agents,
+            selected_agents,
+            step: OnboardingStep::Agents,
+            agent_cursor: 0,
+            interval_cursor: 1, // weekly
+            shell_cursor,
+            notif_cursor: 2, // both
+            install_shell_hook: true,
+            status_line: "Use arrow keys to navigate. Enter continues. Backspace goes back."
+                .to_string(),
+        };
+        state.ensure_proposal_agent_valid();
+        state
+    }
+
+    fn selected_shell(&self) -> ShellType {
+        index_to_shell(self.shell_cursor)
+    }
+
+    fn selected_interval(&self) -> Interval {
+        match self.interval_cursor {
+            0 => Interval::Daily,
+            2 => Interval::Monthly,
+            _ => Interval::Weekly,
+        }
+    }
+
+    fn selected_notifications(&self) -> NotificationPref {
+        match self.notif_cursor {
+            0 => NotificationPref::Terminal,
+            1 => NotificationPref::Native,
+            3 => NotificationPref::None,
+            _ => NotificationPref::Both,
+        }
+    }
+
+    fn installed_agents(&self) -> Vec<AgentKind> {
+        self.detected_agents
+            .iter()
+            .filter(|(_, installed)| *installed)
+            .map(|(kind, _)| *kind)
+            .collect()
+    }
+
+    fn proposal_options(&self) -> Vec<AgentKind> {
+        if !self.selected_agents.is_empty() {
+            self.selected_agents.clone()
+        } else {
+            let installed = self.installed_agents();
+            if installed.is_empty() {
+                self.all_agents.clone()
+            } else {
+                installed
+            }
+        }
+    }
+
+    fn ensure_proposal_agent_valid(&mut self) {
+        let options = self.proposal_options();
+        if !options.contains(&self.proposal_agent)
+            && let Some(first) = options.first()
+        {
+            self.proposal_agent = *first;
+        }
+    }
+
+    fn progress(&self) -> (usize, usize) {
+        let hide_hook = self.selected_shell() == ShellType::Other;
+        if hide_hook {
+            let current = match self.step {
+                OnboardingStep::Agents => 1,
+                OnboardingStep::Interval => 2,
+                OnboardingStep::ProposalAgent => 3,
+                OnboardingStep::Shell => 4,
+                OnboardingStep::Hook => 4,
+                OnboardingStep::Notifications => 5,
+                OnboardingStep::Confirm => 6,
+            };
+            (current, 6)
+        } else {
+            let current = match self.step {
+                OnboardingStep::Agents => 1,
+                OnboardingStep::Interval => 2,
+                OnboardingStep::ProposalAgent => 3,
+                OnboardingStep::Shell => 4,
+                OnboardingStep::Hook => 5,
+                OnboardingStep::Notifications => 6,
+                OnboardingStep::Confirm => 7,
+            };
+            (current, 7)
+        }
+    }
+
+    fn step_title(&self) -> &'static str {
+        match self.step {
+            OnboardingStep::Agents => "Choose agents to monitor",
+            OnboardingStep::Interval => "Choose scan interval",
+            OnboardingStep::ProposalAgent => "Choose proposal agent",
+            OnboardingStep::Shell => "Confirm shell",
+            OnboardingStep::Hook => "Install terminal hook",
+            OnboardingStep::Notifications => "Choose notifications",
+            OnboardingStep::Confirm => "Review and confirm",
+        }
+    }
+
+    fn selected_agents_label(&self) -> String {
+        if self.selected_agents.is_empty() {
+            "(none)".to_string()
+        } else {
+            self.selected_agents
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    }
+
+    fn detection_label(&self) -> String {
+        self.detected_agents
+            .iter()
+            .map(|(kind, installed)| {
+                if *installed {
+                    format!("{kind}: found")
+                } else {
+                    format!("{kind}: not found")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+
+    fn install_hook_effective(&self) -> bool {
+        self.selected_shell() != ShellType::Other && self.install_shell_hook
+    }
+
+    fn next_step(&mut self) {
+        self.step = match self.step {
+            OnboardingStep::Agents => OnboardingStep::Interval,
+            OnboardingStep::Interval => OnboardingStep::ProposalAgent,
+            OnboardingStep::ProposalAgent => OnboardingStep::Shell,
+            OnboardingStep::Shell => {
+                if self.selected_shell() == ShellType::Other {
+                    OnboardingStep::Notifications
+                } else {
+                    OnboardingStep::Hook
+                }
+            }
+            OnboardingStep::Hook => OnboardingStep::Notifications,
+            OnboardingStep::Notifications => OnboardingStep::Confirm,
+            OnboardingStep::Confirm => OnboardingStep::Confirm,
+        };
+    }
+
+    fn previous_step(&mut self) {
+        self.step = match self.step {
+            OnboardingStep::Agents => OnboardingStep::Agents,
+            OnboardingStep::Interval => OnboardingStep::Agents,
+            OnboardingStep::ProposalAgent => OnboardingStep::Interval,
+            OnboardingStep::Shell => OnboardingStep::ProposalAgent,
+            OnboardingStep::Hook => OnboardingStep::Shell,
+            OnboardingStep::Notifications => {
+                if self.selected_shell() == ShellType::Other {
+                    OnboardingStep::Shell
+                } else {
+                    OnboardingStep::Hook
+                }
+            }
+            OnboardingStep::Confirm => OnboardingStep::Notifications,
+        };
+    }
+
+    fn move_up(&mut self) {
+        match self.step {
+            OnboardingStep::Agents => {
+                self.agent_cursor = cycle_prev(self.agent_cursor, self.all_agents.len())
+            }
+            OnboardingStep::Interval => self.interval_cursor = cycle_prev(self.interval_cursor, 3),
+            OnboardingStep::ProposalAgent => {
+                let options = self.proposal_options();
+                let current = options
+                    .iter()
+                    .position(|kind| *kind == self.proposal_agent)
+                    .unwrap_or(0);
+                let next = cycle_prev(current, options.len());
+                if let Some(kind) = options.get(next) {
+                    self.proposal_agent = *kind;
+                }
+            }
+            OnboardingStep::Shell => self.shell_cursor = cycle_prev(self.shell_cursor, 4),
+            OnboardingStep::Hook => self.install_shell_hook = true,
+            OnboardingStep::Notifications => self.notif_cursor = cycle_prev(self.notif_cursor, 4),
+            OnboardingStep::Confirm => {}
+        }
+    }
+
+    fn move_down(&mut self) {
+        match self.step {
+            OnboardingStep::Agents => {
+                self.agent_cursor = cycle_next(self.agent_cursor, self.all_agents.len())
+            }
+            OnboardingStep::Interval => self.interval_cursor = cycle_next(self.interval_cursor, 3),
+            OnboardingStep::ProposalAgent => {
+                let options = self.proposal_options();
+                let current = options
+                    .iter()
+                    .position(|kind| *kind == self.proposal_agent)
+                    .unwrap_or(0);
+                let next = cycle_next(current, options.len());
+                if let Some(kind) = options.get(next) {
+                    self.proposal_agent = *kind;
+                }
+            }
+            OnboardingStep::Shell => self.shell_cursor = cycle_next(self.shell_cursor, 4),
+            OnboardingStep::Hook => self.install_shell_hook = false,
+            OnboardingStep::Notifications => self.notif_cursor = cycle_next(self.notif_cursor, 4),
+            OnboardingStep::Confirm => {}
+        }
+    }
+
+    fn toggle_current(&mut self) {
+        match self.step {
+            OnboardingStep::Agents => {
+                if self.all_agents.is_empty() {
+                    return;
+                }
+                let kind = self.all_agents[self.agent_cursor];
+                if let Some(pos) = self
+                    .selected_agents
+                    .iter()
+                    .position(|selected| *selected == kind)
+                {
+                    self.selected_agents.remove(pos);
+                } else {
+                    self.selected_agents.push(kind);
+                    self.selected_agents.sort_by_key(|selected| {
+                        self.all_agents
+                            .iter()
+                            .position(|candidate| candidate == selected)
+                            .unwrap_or(usize::MAX)
+                    });
+                }
+                self.ensure_proposal_agent_valid();
+            }
+            OnboardingStep::Hook => {
+                self.install_shell_hook = !self.install_shell_hook;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn cycle_prev(index: usize, len: usize) -> usize {
+    if len == 0 {
+        0
+    } else if index == 0 {
+        len - 1
+    } else {
+        index - 1
+    }
+}
+
+fn cycle_next(index: usize, len: usize) -> usize {
+    if len == 0 { 0 } else { (index + 1) % len }
+}
+
+fn shell_to_index(shell: &ShellType) -> usize {
+    match shell {
+        ShellType::Zsh => 0,
+        ShellType::Bash => 1,
+        ShellType::Fish => 2,
+        ShellType::Other => 3,
+    }
+}
+
+fn index_to_shell(index: usize) -> ShellType {
+    match index {
+        1 => ShellType::Bash,
+        2 => ShellType::Fish,
+        3 => ShellType::Other,
+        _ => ShellType::Zsh,
+    }
+}
+
+struct TuiSession {
+    terminal: Terminal<CrosstermBackend<io::Stdout>>,
+    active: bool,
+}
+
+impl TuiSession {
+    fn enter() -> Result<Self> {
+        enable_raw_mode().context("Failed to enable raw mode")?;
+        let mut stdout = io::stdout();
+        execute!(stdout, EnterAlternateScreen, cursor::Hide)
+            .context("Failed to enter alternate screen")?;
+        let backend = CrosstermBackend::new(stdout);
+        let mut terminal = Terminal::new(backend).context("Failed to initialize terminal")?;
+        terminal.clear().context("Failed to clear terminal")?;
+        Ok(Self {
+            terminal,
+            active: true,
+        })
+    }
+
+    fn draw(&mut self, state: &OnboardingUiState) -> Result<()> {
+        self.terminal
+            .draw(|frame| draw_onboarding_ui(frame, state))
+            .context("Failed to render onboarding UI")?;
+        Ok(())
+    }
+}
+
+impl Drop for TuiSession {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = disable_raw_mode();
+            let _ = execute!(
+                self.terminal.backend_mut(),
+                LeaveAlternateScreen,
+                cursor::Show
+            );
+            self.active = false;
+        }
+    }
+}
+
+enum OnboardingExit {
+    Completed(OnboardingAnswers, bool),
+    Canceled,
+}
+
+fn draw_onboarding_ui(frame: &mut Frame<'_>, state: &OnboardingUiState) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),
+            Constraint::Min(10),
+            Constraint::Length(4),
+        ])
+        .split(frame.area());
+
+    let header_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Length(3)])
+        .split(chunks[0]);
+
+    let (step_num, step_total) = state.progress();
+    let progress = ((step_num as f64 / step_total as f64) * 100.0).round() as u16;
+
+    let header = Paragraph::new(format!(
+        "distill onboarding | Step {step_num}/{step_total}: {}\n{}",
+        state.step_title(),
+        state.detection_label()
+    ))
+    .block(Block::default().borders(Borders::ALL));
+    frame.render_widget(header, header_chunks[0]);
+
+    let gauge = Gauge::default()
+        .block(Block::default().borders(Borders::ALL).title("Progress"))
+        .gauge_style(Style::default().fg(Color::Cyan))
+        .percent(progress);
+    frame.render_widget(gauge, header_chunks[1]);
+
+    let body_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
+        .split(chunks[1]);
+
+    let (options_title, options, selected_idx): (&str, Vec<String>, Option<usize>) =
+        match state.step {
+            OnboardingStep::Agents => (
+                "Agents",
+                state
+                    .all_agents
+                    .iter()
+                    .map(|kind| {
+                        let checked = if state.selected_agents.contains(kind) {
+                            "[x]"
+                        } else {
+                            "[ ]"
+                        };
+                        let installed = state
+                            .detected_agents
+                            .iter()
+                            .find(|(detected_kind, _)| detected_kind == kind)
+                            .map(|(_, installed)| *installed)
+                            .unwrap_or(false);
+                        let suffix = if installed { "" } else { " (not detected)" };
+                        format!("{checked} {kind}{suffix}")
+                    })
+                    .collect(),
+                Some(state.agent_cursor),
+            ),
+            OnboardingStep::Interval => (
+                "Scan Interval",
+                vec![
+                    "daily".to_string(),
+                    "weekly (recommended)".to_string(),
+                    "monthly".to_string(),
+                ],
+                Some(state.interval_cursor),
+            ),
+            OnboardingStep::ProposalAgent => {
+                let options = state
+                    .proposal_options()
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>();
+                let selected = state
+                    .proposal_options()
+                    .iter()
+                    .position(|kind| *kind == state.proposal_agent)
+                    .unwrap_or(0);
+                ("Proposal Agent", options, Some(selected))
+            }
+            OnboardingStep::Shell => (
+                "Shell",
+                vec![
+                    "zsh".to_string(),
+                    "bash".to_string(),
+                    "fish".to_string(),
+                    "other".to_string(),
+                ],
+                Some(state.shell_cursor),
+            ),
+            OnboardingStep::Hook => (
+                "Terminal Hook",
+                vec![
+                    "yes - install notification hook".to_string(),
+                    "no - skip hook install".to_string(),
+                ],
+                Some(usize::from(!state.install_shell_hook)),
+            ),
+            OnboardingStep::Notifications => (
+                "Notifications",
+                vec![
+                    "terminal".to_string(),
+                    "native".to_string(),
+                    "both (recommended)".to_string(),
+                    "none".to_string(),
+                ],
+                Some(state.notif_cursor),
+            ),
+            OnboardingStep::Confirm => (
+                "Confirm",
+                vec![
+                    "Press Enter to save settings".to_string(),
+                    "Press Backspace to edit previous step".to_string(),
+                ],
+                None,
+            ),
+        };
+
+    let option_items = options
+        .iter()
+        .map(|line| ListItem::new(line.clone()))
+        .collect::<Vec<_>>();
+    let option_list = List::new(option_items)
+        .block(Block::default().borders(Borders::ALL).title(options_title))
+        .highlight_symbol("> ")
+        .highlight_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
+
+    let mut list_state = ListState::default();
+    if let Some(idx) = selected_idx {
+        list_state.select(Some(idx));
+    }
+    frame.render_stateful_widget(option_list, body_chunks[0], &mut list_state);
+
+    let fallback_note = if state.selected_agents.is_empty() {
+        "none selected (proposal agent fallback active)"
+    } else {
+        "from monitored agents"
+    };
+    let summary = format!(
+        "Selections\n\n\
+         Agents       : {}\n\
+         Interval     : {}\n\
+         Proposal     : {} ({})\n\
+         Shell        : {}\n\
+         Hook install : {}\n\
+         Notifications: {}\n\n\
+         Notes\n\n\
+         - Detected: {}\n\
+         - You can cancel any time with q.",
+        state.selected_agents_label(),
+        state.selected_interval(),
+        state.proposal_agent,
+        fallback_note,
+        state.selected_shell(),
+        if state.install_hook_effective() {
+            "yes"
+        } else {
+            "no"
+        },
+        state.selected_notifications(),
+        state.detection_label(),
+    );
+
+    let summary_pane = Paragraph::new(summary)
+        .block(Block::default().borders(Borders::ALL).title("Summary"))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(summary_pane, body_chunks[1]);
+
+    let help = match state.step {
+        OnboardingStep::Agents => {
+            "Up/Down move | Space toggle | a select all | n clear all | Enter next"
+        }
+        OnboardingStep::Hook => "Up/Down or Space toggle yes/no | Enter next",
+        OnboardingStep::Confirm => "Enter save | Backspace previous | q cancel",
+        _ => "Up/Down change selection | Enter next | Backspace previous",
+    };
+
+    let footer = Paragraph::new(format!("{help}\n{}", state.status_line))
+        .block(Block::default().borders(Borders::ALL).title("Keys"))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(footer, chunks[2]);
+}
+
+fn run_tui_flow(state: &mut OnboardingUiState) -> Result<OnboardingExit> {
+    let mut tui = TuiSession::enter()?;
+
+    loop {
+        tui.draw(state)?;
+
+        if !event::poll(Duration::from_millis(200)).context("Failed to poll terminal events")? {
+            continue;
+        }
+
+        let Event::Key(key) = event::read().context("Failed to read terminal event")? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => return Ok(OnboardingExit::Canceled),
+            KeyCode::Up | KeyCode::Char('k') => state.move_up(),
+            KeyCode::Down | KeyCode::Char('j') => state.move_down(),
+            KeyCode::Left | KeyCode::Char('h') => {
+                if state.step == OnboardingStep::Hook {
+                    state.install_shell_hook = true;
+                } else {
+                    state.previous_step();
+                }
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                if state.step == OnboardingStep::Hook {
+                    state.install_shell_hook = false;
+                } else {
+                    state.next_step();
+                }
+            }
+            KeyCode::Backspace | KeyCode::BackTab => state.previous_step(),
+            KeyCode::Tab => state.next_step(),
+            KeyCode::Char('a') if state.step == OnboardingStep::Agents => {
+                state.selected_agents = state.all_agents.clone();
+                state.ensure_proposal_agent_valid();
+                state.status_line = "Selected all agents.".to_string();
+            }
+            KeyCode::Char('n') if state.step == OnboardingStep::Agents => {
+                state.selected_agents.clear();
+                state.ensure_proposal_agent_valid();
+                state.status_line = "Cleared monitored agents.".to_string();
+            }
+            KeyCode::Char('y') if state.step == OnboardingStep::Hook => {
+                state.install_shell_hook = true;
+            }
+            KeyCode::Char('n') if state.step == OnboardingStep::Hook => {
+                state.install_shell_hook = false;
+            }
+            KeyCode::Char(' ') => state.toggle_current(),
+            KeyCode::Enter => {
+                if state.step == OnboardingStep::Confirm {
+                    let answers = OnboardingAnswers {
+                        detected_agents: state.detected_agents.clone(),
+                        enabled_agents: state.selected_agents.clone(),
+                        scan_interval: state.selected_interval(),
+                        proposal_agent: state.proposal_agent,
+                        shell: state.selected_shell(),
+                        notifications: state.selected_notifications(),
+                    };
+                    return Ok(OnboardingExit::Completed(
+                        answers,
+                        state.install_hook_effective(),
+                    ));
+                }
+                state.next_step();
+            }
+            _ => {}
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Interactive entry point
 // ---------------------------------------------------------------------------
 
-/// Run the full interactive onboarding flow, writing prompts to stdout and
-/// reading answers from stdin.  At the end, the resulting config is saved to
-/// the default location and a summary is printed.
+/// Run the full interactive onboarding flow.
 pub fn run_interactive() -> Result<()> {
     let home = std::env::var("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from("."));
 
-    println!();
-    println!("Welcome to distill! Let's set things up.");
-    println!();
-
-    // ------------------------------------------------------------------
-    // Step 1: Detect installed agents
-    // ------------------------------------------------------------------
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        println!();
+        println!("Welcome to distill! Let's set things up.");
+        println!("Run 'distill' in an interactive terminal to complete onboarding.");
+        return Ok(());
+    }
 
     let detected = detect_agents(&home);
+    let mut state = OnboardingUiState::new(detected);
 
-    println!("Detecting installed AI agents...");
-    let mut any_found = false;
-    for (kind, installed) in &detected {
-        let status = if *installed { "found" } else { "not found" };
-        println!("  {kind} — {status}");
-        if *installed {
-            any_found = true;
-        }
-    }
-    if !any_found {
-        println!("  (No agents detected. You can still configure distill manually later.)");
-    }
-    println!();
-
-    // ------------------------------------------------------------------
-    // Step 2: Ask which agents to monitor
-    // ------------------------------------------------------------------
-
-    let all_agents = AgentKind::all();
-    let installed_agents: Vec<AgentKind> = detected
-        .iter()
-        .filter(|(_, installed)| *installed)
-        .map(|(kind, _)| *kind)
-        .collect();
-
-    println!("Which agents would you like to monitor?");
-    for (i, kind) in all_agents.iter().enumerate() {
-        let installed = detected
-            .iter()
-            .find(|(k, _)| k == kind)
-            .map(|(_, v)| *v)
-            .unwrap_or(false);
-        let suffix = if installed { "" } else { " (not detected)" };
-        println!("  {}. {kind}{suffix}", i + 1);
-    }
-
-    // Default: all installed agents, or all known agents if none detected.
-    let default_agents: Vec<AgentKind> = if !installed_agents.is_empty() {
-        installed_agents.clone()
-    } else {
-        all_agents.clone()
-    };
-    let default_label: Vec<String> = default_agents.iter().map(|k| k.to_string()).collect();
-    let default_label = default_label.join(", ");
-
-    let agent_input = prompt(&format!(
-        "Enter numbers (comma-separated) or 'all' [default: {default_label}]: "
-    ))?;
-
-    let enabled_agents: Vec<AgentKind> =
-        if agent_input.is_empty() || agent_input.to_lowercase() == "all" {
-            default_agents.clone()
-        } else {
-            let mut chosen = Vec::new();
-            for part in agent_input.split(',') {
-                let part = part.trim();
-                if let Ok(n) = part.parse::<usize>()
-                    && n >= 1
-                    && n <= all_agents.len()
-                {
-                    chosen.push(all_agents[n - 1]);
-                }
-            }
-            if chosen.is_empty() {
-                default_agents.clone()
-            } else {
-                chosen
-            }
-        };
-    println!();
-
-    // ------------------------------------------------------------------
-    // Step 3: Ask scan interval
-    // ------------------------------------------------------------------
-
-    println!("How often should distill scan for new skills?");
-    println!("  1. daily");
-    println!("  2. weekly  (recommended)");
-    println!("  3. monthly");
-
-    let interval_input = prompt("Enter number [default: 2 (weekly)]: ")?;
-    let scan_interval = match interval_input.as_str() {
-        "1" => Interval::Daily,
-        "3" => Interval::Monthly,
-        _ => Interval::Weekly,
-    };
-    println!();
-
-    // ------------------------------------------------------------------
-    // Step 4: Ask which agent to use for proposals
-    // ------------------------------------------------------------------
-
-    let proposal_agent = if enabled_agents.len() <= 1 {
-        *enabled_agents.first().unwrap_or(&AgentKind::Claude)
-    } else {
-        println!("Which agent should be used to generate skill proposals?");
-        for (i, kind) in enabled_agents.iter().enumerate() {
-            println!("  {}. {kind}", i + 1);
-        }
-        let proposal_input = prompt(&format!(
-            "Enter number [default: 1 ({})]: ",
-            enabled_agents[0]
-        ))?;
-
-        if proposal_input.is_empty() {
-            enabled_agents[0]
-        } else if let Ok(n) = proposal_input.parse::<usize>() {
-            if n >= 1 && n <= enabled_agents.len() {
-                enabled_agents[n - 1]
-            } else {
-                enabled_agents[0]
-            }
-        } else {
-            enabled_agents[0]
-        }
-    };
-    println!();
-
-    // ------------------------------------------------------------------
-    // Step 5: Detect shell, confirm with user
-    // ------------------------------------------------------------------
-
-    let detected_shell = ShellType::detect();
-    println!("Detected shell: {detected_shell}");
-    println!("  1. zsh");
-    println!("  2. bash");
-    println!("  3. fish");
-    println!("  4. other");
-
-    let default_shell_num = match detected_shell {
-        ShellType::Zsh => "1",
-        ShellType::Bash => "2",
-        ShellType::Fish => "3",
-        ShellType::Other => "4",
-    };
-    let shell_input = prompt(&format!(
-        "Confirm shell [default: {default_shell_num} ({detected_shell})]: "
-    ))?;
-    let shell = match shell_input.as_str() {
-        "1" => ShellType::Zsh,
-        "2" => ShellType::Bash,
-        "3" => ShellType::Fish,
-        "4" => ShellType::Other,
-        _ => detected_shell,
-    };
-    println!();
-
-    let install_shell_hook = if shell == ShellType::Other {
-        println!("Automatic shell hook install is not available for 'other'.");
-        false
-    } else {
-        let install_hook_input = prompt("Install terminal notification hook now? [Y/n]: ")?;
-        !matches!(
-            install_hook_input.trim().to_ascii_lowercase().as_str(),
-            "n" | "no"
-        )
-    };
-    println!();
-
-    // ------------------------------------------------------------------
-    // Step 6: Ask notification preference
-    // ------------------------------------------------------------------
-
-    println!("How would you like to receive notifications?");
-    println!("  1. terminal  — print to terminal on next prompt");
-    println!("  2. native    — system notification");
-    println!("  3. both      (recommended)");
-    println!("  4. none");
-
-    let notif_input = prompt("Enter number [default: 3 (both)]: ")?;
-    let notifications = match notif_input.as_str() {
-        "1" => NotificationPref::Terminal,
-        "2" => NotificationPref::Native,
-        "4" => NotificationPref::None,
-        _ => NotificationPref::Both,
-    };
-    println!();
-
-    // ------------------------------------------------------------------
-    // Step 7: Build and save config
-    // ------------------------------------------------------------------
-
-    let answers = OnboardingAnswers {
-        detected_agents: detected,
-        enabled_agents,
-        scan_interval,
-        proposal_agent,
-        shell,
-        notifications,
+    let exit = run_tui_flow(&mut state)?;
+    let OnboardingExit::Completed(answers, install_shell_hook) = exit else {
+        println!();
+        println!("Onboarding canceled. No configuration was written.");
+        return Ok(());
     };
 
     let config = build_config(&answers);
     config.save()?;
     let post_setup = apply_post_onboarding_setup(&config, &home, install_shell_hook)?;
-
-    // ------------------------------------------------------------------
-    // Step 8: Print summary
-    // ------------------------------------------------------------------
 
     let enabled_names: Vec<&str> = config
         .agents
@@ -352,6 +813,7 @@ pub fn run_interactive() -> Result<()> {
         enabled_names.join(", ")
     };
 
+    println!();
     println!("Configuration saved to {}", Config::config_path().display());
     println!();
     println!("Summary:");
