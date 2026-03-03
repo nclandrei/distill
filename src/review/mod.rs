@@ -1,13 +1,28 @@
-// Review flow — interactive proposal review using stdin/stdout.
+// Review flow — interactive proposal review via a keyboard-driven TUI.
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use crossterm::{
+    cursor,
+    event::{self, Event, KeyCode, KeyEventKind},
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+};
+use ratatui::{
+    Frame, Terminal,
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout},
+    style::{Color, Modifier, Style},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::Path;
+use std::process::Command;
+use std::time::Duration;
 
-use crate::agents::{from_kind, AgentKind};
+use crate::agents::{AgentKind, from_kind};
 use crate::config::Config;
 use crate::proposals::Proposal;
 
@@ -120,10 +135,7 @@ pub fn log_decision(history_dir: &Path, entry: &HistoryEntry) -> Result<()> {
 /// 3. A timestamp-based fallback.
 fn skill_filename_for(proposal: &Proposal) -> String {
     if let Some(target) = &proposal.frontmatter.target_skill {
-        let slug = target
-            .to_lowercase()
-            .replace(' ', "-")
-            .replace('_', "-");
+        let slug = target.to_lowercase().replace(' ', "-").replace('_', "-");
         if slug.ends_with(".md") {
             slug
         } else {
@@ -171,9 +183,8 @@ pub fn accept_proposal(
     // Delete the proposal file.
     let proposal_path = proposals_dir.join(&proposal_filename);
     if proposal_path.exists() {
-        fs::remove_file(&proposal_path).with_context(|| {
-            format!("Failed to delete proposal: {}", proposal_path.display())
-        })?;
+        fs::remove_file(&proposal_path)
+            .with_context(|| format!("Failed to delete proposal: {}", proposal_path.display()))?;
     }
 
     Ok(())
@@ -201,9 +212,8 @@ pub fn reject_proposal(
     // Delete the proposal file.
     let proposal_path = proposals_dir.join(&proposal_filename);
     if proposal_path.exists() {
-        fs::remove_file(&proposal_path).with_context(|| {
-            format!("Failed to delete proposal: {}", proposal_path.display())
-        })?;
+        fs::remove_file(&proposal_path)
+            .with_context(|| format!("Failed to delete proposal: {}", proposal_path.display()))?;
     }
 
     Ok(())
@@ -248,72 +258,288 @@ pub fn run_review(
 }
 
 // ---------------------------------------------------------------------------
-// Interactive I/O helpers
+// Interactive TUI helpers
 // ---------------------------------------------------------------------------
 
-/// Write a prompt string to stdout (no trailing newline), flush, and read one line from stdin.
-fn prompt(prompt_str: &str) -> Result<String> {
-    print!("{}", prompt_str);
-    io::stdout().flush()?;
-    let mut line = String::new();
-    io::stdin().read_line(&mut line)?;
-    Ok(line.trim().to_string())
+struct ReviewUiState {
+    pending: Vec<Proposal>,
+    selected: usize,
+    content_scroll: u16,
+    accepted: usize,
+    rejected: usize,
+    skipped: usize,
+    status_line: String,
 }
 
-/// Print a formatted summary of a single proposal to stdout.
-fn display_proposal(index: usize, total: usize, proposal: &Proposal) {
+impl ReviewUiState {
+    fn new(proposals: Vec<Proposal>) -> Self {
+        Self {
+            pending: proposals,
+            selected: 0,
+            content_scroll: 0,
+            accepted: 0,
+            rejected: 0,
+            skipped: 0,
+            status_line: "Select a proposal and choose an action.".to_string(),
+        }
+    }
+
+    fn selected_proposal(&self) -> Option<&Proposal> {
+        self.pending.get(self.selected)
+    }
+
+    fn select_prev(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        self.selected = self.selected.saturating_sub(1);
+        self.content_scroll = 0;
+    }
+
+    fn select_next(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let max_idx = self.pending.len().saturating_sub(1);
+        self.selected = (self.selected + 1).min(max_idx);
+        self.content_scroll = 0;
+    }
+
+    fn remove_selected(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        self.pending.remove(self.selected);
+        if self.selected >= self.pending.len() && !self.pending.is_empty() {
+            self.selected = self.pending.len() - 1;
+        }
+        self.content_scroll = 0;
+    }
+}
+
+struct TuiSession {
+    terminal: Terminal<CrosstermBackend<io::Stdout>>,
+    active: bool,
+}
+
+impl TuiSession {
+    fn enter() -> Result<Self> {
+        enable_raw_mode().context("Failed to enable raw mode")?;
+        let mut stdout = io::stdout();
+        execute!(stdout, EnterAlternateScreen, cursor::Hide)
+            .context("Failed to enter alternate screen")?;
+        let backend = CrosstermBackend::new(stdout);
+        let mut terminal = Terminal::new(backend).context("Failed to initialize terminal")?;
+        terminal.clear().context("Failed to clear terminal")?;
+
+        Ok(Self {
+            terminal,
+            active: true,
+        })
+    }
+
+    fn draw(&mut self, state: &ReviewUiState) -> Result<()> {
+        self.terminal
+            .draw(|frame| draw_review_ui(frame, state))
+            .context("Failed to render review UI")?;
+        Ok(())
+    }
+
+    fn suspend(&mut self) -> Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        disable_raw_mode().context("Failed to disable raw mode")?;
+        execute!(
+            self.terminal.backend_mut(),
+            LeaveAlternateScreen,
+            cursor::Show
+        )
+        .context("Failed to suspend TUI")?;
+        self.active = false;
+        Ok(())
+    }
+
+    fn resume(&mut self) -> Result<()> {
+        if self.active {
+            return Ok(());
+        }
+        execute!(
+            self.terminal.backend_mut(),
+            EnterAlternateScreen,
+            cursor::Hide
+        )
+        .context("Failed to resume TUI")?;
+        enable_raw_mode().context("Failed to re-enable raw mode")?;
+        self.terminal.clear().context("Failed to clear terminal")?;
+        self.active = true;
+        Ok(())
+    }
+}
+
+impl Drop for TuiSession {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = disable_raw_mode();
+            let _ = execute!(
+                self.terminal.backend_mut(),
+                LeaveAlternateScreen,
+                cursor::Show
+            );
+            self.active = false;
+        }
+    }
+}
+
+fn proposal_label(proposal: &Proposal) -> String {
+    use crate::proposals::ProposalType;
+
+    let filename = proposal.filename.as_deref().unwrap_or("(unknown)");
+    let kind = match proposal.frontmatter.proposal_type {
+        ProposalType::New => "new",
+        ProposalType::Improve => "improve",
+        ProposalType::Edit => "edit",
+        ProposalType::Remove => "remove",
+    };
+    format!("{filename} [{kind}]")
+}
+
+fn proposal_details_text(proposal: &Proposal) -> String {
     use crate::proposals::{Confidence, ProposalType};
 
     let filename = proposal.filename.as_deref().unwrap_or("(unknown)");
-
     let proposal_type = match proposal.frontmatter.proposal_type {
         ProposalType::New => "new",
         ProposalType::Improve => "improve",
         ProposalType::Edit => "edit",
         ProposalType::Remove => "remove",
     };
-
     let confidence = match proposal.frontmatter.confidence {
         Confidence::High => "high",
         Confidence::Medium => "medium",
         Confidence::Low => "low",
     };
-
     let target = proposal
         .frontmatter
         .target_skill
         .as_deref()
         .unwrap_or("(new skill)");
 
-    println!();
-    println!("─────────────────────────────────────────────────────────");
-    println!("Proposal {}/{}: {}", index + 1, total, filename);
-    println!("  Type       : {proposal_type}");
-    println!("  Confidence : {confidence}");
-    println!("  Target     : {target}");
+    let mut text = format!(
+        "File: {filename}\nType: {proposal_type}\nConfidence: {confidence}\nTarget: {target}\nCreated: {}\n",
+        proposal.frontmatter.created.to_rfc3339(),
+    );
+
     if !proposal.frontmatter.evidence.is_empty() {
-        println!("  Evidence   :");
+        text.push_str("\nEvidence:\n");
         for ev in &proposal.frontmatter.evidence {
-            println!("    - {} ({})", ev.pattern, ev.session);
+            text.push_str(&format!("- {} ({})\n", ev.pattern, ev.session));
         }
     }
-    println!();
-    println!("--- Content ---");
-    println!("{}", proposal.body);
-    println!("─────────────────────────────────────────────────────────");
+
+    text.push_str("\n--- Content ---\n");
+    text.push_str(&proposal.body);
+    text
 }
 
-/// Read a `ReviewDecision` from stdin, looping until the user provides a valid input.
-fn read_decision() -> Result<ReviewDecision> {
-    loop {
-        let input = prompt("  [a]ccept / [r]eject / [s]kip? ")?;
-        match input.to_lowercase().as_str() {
-            "a" | "accept" => return Ok(ReviewDecision::Accept),
-            "r" | "reject" => return Ok(ReviewDecision::Reject),
-            "s" | "skip" | "" => return Ok(ReviewDecision::Skip),
-            _ => println!("  Please enter 'a' (accept), 'r' (reject), or 's' (skip)."),
-        }
+fn draw_review_ui(frame: &mut Frame<'_>, state: &ReviewUiState) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(10),
+            Constraint::Length(3),
+        ])
+        .split(frame.area());
+
+    let body_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
+        .split(chunks[1]);
+
+    let header = Paragraph::new(format!(
+        "Pending: {} | Accepted: {} | Rejected: {} | Snoozed: {}",
+        state.pending.len(),
+        state.accepted,
+        state.rejected,
+        state.skipped,
+    ))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("distill review"),
+    );
+    frame.render_widget(header, chunks[0]);
+
+    let items: Vec<ListItem<'_>> = state
+        .pending
+        .iter()
+        .enumerate()
+        .map(|(idx, proposal)| {
+            ListItem::new(format!("{:>2}. {}", idx + 1, proposal_label(proposal)))
+        })
+        .collect();
+    let proposals = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title("Proposals"))
+        .highlight_symbol("> ")
+        .highlight_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
+    let mut list_state = ListState::default();
+    if !state.pending.is_empty() {
+        list_state.select(Some(state.selected));
     }
+    frame.render_stateful_widget(proposals, body_chunks[0], &mut list_state);
+
+    let details = state
+        .selected_proposal()
+        .map(proposal_details_text)
+        .unwrap_or_else(|| "No pending proposals.".to_string());
+    let detail_pane = Paragraph::new(details)
+        .block(Block::default().borders(Borders::ALL).title("Details"))
+        .wrap(Wrap { trim: false })
+        .scroll((state.content_scroll, 0));
+    frame.render_widget(detail_pane, body_chunks[1]);
+
+    let footer = Paragraph::new(format!(
+        "a accept | r reject | e edit | s snooze | A accept-all | q quit | arrows move | PgUp/PgDn scroll\n{}",
+        state.status_line
+    ))
+    .block(Block::default().borders(Borders::ALL).title("Actions"))
+    .wrap(Wrap { trim: true });
+    frame.render_widget(footer, chunks[2]);
+}
+
+fn shell_quote_single(input: &str) -> String {
+    format!("'{}'", input.replace('\'', "'\"'\"'"))
+}
+
+fn edit_file(path: &Path) -> Result<()> {
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "vi".to_string());
+    let escaped = shell_quote_single(&path.to_string_lossy());
+    let command = format!("{editor} {escaped}");
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(&command)
+        .status()
+        .with_context(|| format!("Failed to launch editor command: {command}"))?;
+    if !status.success() {
+        anyhow::bail!("Editor exited with status: {status}");
+    }
+    Ok(())
+}
+
+fn reload_edited_proposal(path: &Path, filename: &str) -> Result<Proposal> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("Failed to read edited proposal: {}", path.display()))?;
+    let mut proposal = Proposal::from_markdown(&content)
+        .with_context(|| format!("Failed to parse edited proposal: {}", path.display()))?;
+    proposal.filename = Some(filename.to_string());
+    Ok(proposal)
 }
 
 /// Load config and sync all skills in `skills_dir` to all enabled agents.
@@ -341,9 +567,13 @@ fn sync_after_review(skills_dir: &Path) -> Result<crate::sync::SyncReport> {
 
 /// Run the full interactive review flow.
 ///
-/// Displays each proposal and prompts the user for a decision via stdin.
-/// On completion, prints a summary and syncs any accepted skills to all
-/// configured agents.
+/// Shows a TUI with a proposal list and details pane.
+/// Actions:
+/// - `a`: accept selected proposal
+/// - `r`: reject selected proposal
+/// - `e`: edit selected proposal in `$VISUAL`/`$EDITOR`
+/// - `s`: snooze selected proposal (skip this run)
+/// - `A`: accept all remaining proposals
 pub fn run_review_interactive(
     proposals_dir: &Path,
     skills_dir: &Path,
@@ -360,52 +590,176 @@ pub fn run_review_interactive(
         });
     }
 
-    let total = proposals.len();
-    println!();
-    println!("Found {} proposal(s) to review.", total);
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        anyhow::bail!("distill review requires an interactive terminal for the TUI");
+    }
 
-    let mut accepted = 0usize;
-    let mut rejected = 0usize;
-    let mut skipped = 0usize;
+    let mut state = ReviewUiState::new(proposals);
+    let mut tui = TuiSession::enter()?;
 
-    for (i, proposal) in proposals.iter().enumerate() {
-        display_proposal(i, total, proposal);
-        let decision = read_decision()?;
+    while !state.pending.is_empty() {
+        tui.draw(&state)?;
 
-        match decision {
-            ReviewDecision::Accept => {
-                accept_proposal(proposal, skills_dir, history_dir, proposals_dir)?;
-                accepted += 1;
-                println!("  Accepted.");
+        if !event::poll(Duration::from_millis(200)).context("Failed to poll terminal events")? {
+            continue;
+        }
+
+        let Event::Key(key) = event::read().context("Failed to read terminal event")? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => state.select_prev(),
+            KeyCode::Down | KeyCode::Char('j') => state.select_next(),
+            KeyCode::PageUp => state.content_scroll = state.content_scroll.saturating_sub(5),
+            KeyCode::PageDown => state.content_scroll = state.content_scroll.saturating_add(5),
+            KeyCode::Home => state.content_scroll = 0,
+            KeyCode::Char('a') => {
+                if let Some(proposal) = state.selected_proposal().cloned() {
+                    let name = proposal
+                        .filename
+                        .as_deref()
+                        .unwrap_or("(unknown)")
+                        .to_string();
+                    match accept_proposal(&proposal, skills_dir, history_dir, proposals_dir) {
+                        Ok(_) => {
+                            state.accepted += 1;
+                            state.remove_selected();
+                            state.status_line = format!("Accepted {name}");
+                        }
+                        Err(e) => {
+                            state.status_line = format!("Failed to accept {name}: {e:#}");
+                        }
+                    }
+                }
             }
-            ReviewDecision::Reject => {
-                reject_proposal(proposal, history_dir, proposals_dir)?;
-                rejected += 1;
-                println!("  Rejected.");
+            KeyCode::Char('r') => {
+                if let Some(proposal) = state.selected_proposal().cloned() {
+                    let name = proposal
+                        .filename
+                        .as_deref()
+                        .unwrap_or("(unknown)")
+                        .to_string();
+                    match reject_proposal(&proposal, history_dir, proposals_dir) {
+                        Ok(_) => {
+                            state.rejected += 1;
+                            state.remove_selected();
+                            state.status_line = format!("Rejected {name}");
+                        }
+                        Err(e) => {
+                            state.status_line = format!("Failed to reject {name}: {e:#}");
+                        }
+                    }
+                }
             }
-            ReviewDecision::Skip => {
-                skipped += 1;
-                println!("  Skipped.");
+            KeyCode::Char('s') => {
+                if let Some(proposal) = state.selected_proposal() {
+                    let name = proposal
+                        .filename
+                        .as_deref()
+                        .unwrap_or("(unknown)")
+                        .to_string();
+                    state.skipped += 1;
+                    state.remove_selected();
+                    state.status_line = format!("Snoozed {name}");
+                }
             }
+            KeyCode::Char('e') => {
+                let Some(proposal) = state.selected_proposal().cloned() else {
+                    continue;
+                };
+                let Some(filename) = proposal.filename.clone() else {
+                    state.status_line = "Cannot edit proposal without a filename.".to_string();
+                    continue;
+                };
+                let path = proposals_dir.join(&filename);
+                if !path.exists() {
+                    state.status_line = format!("Proposal file not found: {}", path.display());
+                    continue;
+                }
+
+                tui.suspend()?;
+                let edit_result = edit_file(&path);
+                let resume_result = tui.resume();
+                if let Err(e) = resume_result {
+                    return Err(e).context("Failed to restore terminal after editing");
+                }
+
+                match edit_result {
+                    Ok(_) => match reload_edited_proposal(&path, &filename) {
+                        Ok(updated) => {
+                            state.pending[state.selected] = updated;
+                            state.content_scroll = 0;
+                            state.status_line = format!("Edited {filename}");
+                        }
+                        Err(e) => {
+                            state.status_line =
+                                format!("Edited file but failed to parse {filename}: {e:#}");
+                        }
+                    },
+                    Err(e) => {
+                        state.status_line = format!("Edit failed for {filename}: {e:#}");
+                    }
+                }
+            }
+            KeyCode::Char('A') => {
+                let total = state.pending.len();
+                let mut failed = Vec::new();
+                let mut accepted_now = 0usize;
+
+                for proposal in state.pending.drain(..) {
+                    match accept_proposal(&proposal, skills_dir, history_dir, proposals_dir) {
+                        Ok(_) => {
+                            state.accepted += 1;
+                            accepted_now += 1;
+                        }
+                        Err(_) => failed.push(proposal),
+                    }
+                }
+
+                state.pending = failed;
+                state.selected = 0;
+                state.content_scroll = 0;
+
+                if state.pending.is_empty() {
+                    state.status_line =
+                        format!("Accepted all remaining proposals ({accepted_now}).");
+                } else {
+                    state.status_line = format!(
+                        "Accepted {accepted_now}/{total}. {} proposal(s) still pending due to errors.",
+                        state.pending.len()
+                    );
+                }
+            }
+            KeyCode::Char('q') | KeyCode::Esc => {
+                let remaining = state.pending.len();
+                state.skipped += remaining;
+                state.pending.clear();
+                state.status_line =
+                    format!("Exited review. Snoozed {remaining} remaining proposal(s).");
+            }
+            _ => {}
         }
     }
 
+    drop(tui);
+
     println!();
     println!("Review complete.");
-    println!("  Accepted : {accepted}");
-    println!("  Rejected : {rejected}");
-    println!("  Skipped  : {skipped}");
+    println!("  Accepted : {}", state.accepted);
+    println!("  Rejected : {}", state.rejected);
+    println!("  Skipped  : {}", state.skipped);
 
     // Sync accepted skills to all configured agents.
-    if accepted > 0 {
+    if state.accepted > 0 {
         println!();
         println!("Syncing skills to agents...");
         match sync_after_review(skills_dir) {
             Ok(report) => {
-                println!(
-                    "  Synced {} operation(s) across agents.",
-                    report.synced,
-                );
+                println!("  Synced {} operation(s) across agents.", report.synced,);
                 if !report.errors.is_empty() {
                     for err in &report.errors {
                         eprintln!("  Sync warning: {err}");
@@ -419,9 +773,9 @@ pub fn run_review_interactive(
     }
 
     Ok(ReviewSummary {
-        accepted,
-        rejected,
-        skipped,
+        accepted: state.accepted,
+        rejected: state.rejected,
+        skipped: state.skipped,
     })
 }
 
@@ -566,7 +920,10 @@ mod tests {
         let proposal_path = proposals_dir.join("delete-me.md");
         write_proposal_file(&proposals_dir, &proposal);
 
-        assert!(proposal_path.exists(), "proposal file should exist before accept");
+        assert!(
+            proposal_path.exists(),
+            "proposal file should exist before accept"
+        );
         accept_proposal(&proposal, &skills_dir, &history_dir, &proposals_dir).unwrap();
         assert!(
             !proposal_path.exists(),
@@ -590,8 +947,14 @@ mod tests {
         let decisions_path = history_dir.join("decisions.jsonl");
         assert!(decisions_path.exists(), "decisions.jsonl should be created");
         let content = fs::read_to_string(&decisions_path).unwrap();
-        assert!(content.contains("\"accepted\""), "should log accepted decision");
-        assert!(content.contains("logged.md"), "should include proposal filename");
+        assert!(
+            content.contains("\"accepted\""),
+            "should log accepted decision"
+        );
+        assert!(
+            content.contains("logged.md"),
+            "should include proposal filename"
+        );
     }
 
     #[test]
@@ -639,7 +1002,10 @@ mod tests {
         let proposal_path = proposals_dir.join("reject-me.md");
         write_proposal_file(&proposals_dir, &proposal);
 
-        assert!(proposal_path.exists(), "proposal file should exist before reject");
+        assert!(
+            proposal_path.exists(),
+            "proposal file should exist before reject"
+        );
         reject_proposal(&proposal, &history_dir, &proposals_dir).unwrap();
         assert!(
             !proposal_path.exists(),
@@ -662,7 +1028,10 @@ mod tests {
         let decisions_path = history_dir.join("decisions.jsonl");
         assert!(decisions_path.exists(), "decisions.jsonl should be created");
         let content = fs::read_to_string(&decisions_path).unwrap();
-        assert!(content.contains("\"rejected\""), "should log rejected decision");
+        assert!(
+            content.contains("\"rejected\""),
+            "should log rejected decision"
+        );
         assert!(
             content.contains("reject-log.md"),
             "should include proposal filename"
@@ -738,8 +1107,8 @@ mod tests {
         let path = history_dir.join("decisions.jsonl");
         let content = fs::read_to_string(&path).unwrap();
         for line in content.lines() {
-            let parsed: serde_json::Value = serde_json::from_str(line)
-                .expect("each line should be valid JSON");
+            let parsed: serde_json::Value =
+                serde_json::from_str(line).expect("each line should be valid JSON");
             assert_eq!(
                 parsed["proposal_filename"].as_str().unwrap(),
                 "valid-json.md"
@@ -775,9 +1144,14 @@ mod tests {
             ReviewDecision::Skip,
         ];
 
-        let summary =
-            run_review(&proposals, &decisions, &skills_dir, &history_dir, &proposals_dir)
-                .unwrap();
+        let summary = run_review(
+            &proposals,
+            &decisions,
+            &skills_dir,
+            &history_dir,
+            &proposals_dir,
+        )
+        .unwrap();
 
         assert_eq!(summary.accepted, 1);
         assert_eq!(summary.rejected, 1);
@@ -800,9 +1174,14 @@ mod tests {
         let proposals = vec![p1, p2];
         let decisions = vec![ReviewDecision::Accept, ReviewDecision::Accept];
 
-        let summary =
-            run_review(&proposals, &decisions, &skills_dir, &history_dir, &proposals_dir)
-                .unwrap();
+        let summary = run_review(
+            &proposals,
+            &decisions,
+            &skills_dir,
+            &history_dir,
+            &proposals_dir,
+        )
+        .unwrap();
 
         assert_eq!(summary.accepted, 2);
         assert_eq!(summary.rejected, 0);
@@ -829,9 +1208,14 @@ mod tests {
         let proposals = vec![p1, p2];
         let decisions = vec![ReviewDecision::Reject, ReviewDecision::Reject];
 
-        let summary =
-            run_review(&proposals, &decisions, &skills_dir, &history_dir, &proposals_dir)
-                .unwrap();
+        let summary = run_review(
+            &proposals,
+            &decisions,
+            &skills_dir,
+            &history_dir,
+            &proposals_dir,
+        )
+        .unwrap();
 
         assert_eq!(summary.accepted, 0);
         assert_eq!(summary.rejected, 2);
@@ -855,9 +1239,14 @@ mod tests {
         let proposals = vec![p1];
         let decisions = vec![ReviewDecision::Skip];
 
-        let summary =
-            run_review(&proposals, &decisions, &skills_dir, &history_dir, &proposals_dir)
-                .unwrap();
+        let summary = run_review(
+            &proposals,
+            &decisions,
+            &skills_dir,
+            &history_dir,
+            &proposals_dir,
+        )
+        .unwrap();
 
         assert_eq!(summary.accepted, 0);
         assert_eq!(summary.rejected, 0);
