@@ -13,7 +13,6 @@ use crate::config::Interval;
 pub enum SchedulerStatus {
     Installed,
     NotInstalled,
-    Unknown,
 }
 
 // ─── Trait ────────────────────────────────────────────────────────────────────
@@ -150,11 +149,13 @@ impl Scheduler for LaunchdScheduler {
 
 // ─── Linux systemd ────────────────────────────────────────────────────────────
 
+#[cfg(any(target_os = "linux", test))]
 pub struct SystemdScheduler {
     home: PathBuf,
     systemctl_path: PathBuf,
 }
 
+#[cfg(any(target_os = "linux", test))]
 impl SystemdScheduler {
     pub fn new(home: PathBuf) -> Self {
         Self {
@@ -208,6 +209,7 @@ impl SystemdScheduler {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 impl Scheduler for SystemdScheduler {
     /// Returns the timer unit path (the primary managed file for systemd).
     fn plist_or_unit_path(&self) -> PathBuf {

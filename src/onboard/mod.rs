@@ -4,7 +4,7 @@ use anyhow::Result;
 use std::io::{self, Write};
 use std::path::Path;
 
-use crate::agents::AgentKind;
+use crate::agents::{AgentKind, from_kind};
 use crate::config::{AgentEntry, Config, Interval, NotificationPref, ShellType};
 use crate::schedule;
 use crate::shell::{self, HookStatus};
@@ -44,10 +44,7 @@ pub fn detect_agents(home: &Path) -> Vec<(AgentKind, bool)> {
     AgentKind::all()
         .into_iter()
         .map(|kind| {
-            let installed = match kind {
-                AgentKind::Claude => home.join(".claude").exists(),
-                AgentKind::Codex => home.join(".codex").exists(),
-            };
+            let installed = from_kind(kind, home.to_path_buf()).is_installed();
             (kind, installed)
         })
         .collect()
@@ -200,10 +197,11 @@ pub fn run_interactive() -> Result<()> {
             let mut chosen = Vec::new();
             for part in agent_input.split(',') {
                 let part = part.trim();
-                if let Ok(n) = part.parse::<usize>() {
-                    if n >= 1 && n <= all_agents.len() {
-                        chosen.push(all_agents[n - 1]);
-                    }
+                if let Ok(n) = part.parse::<usize>()
+                    && n >= 1
+                    && n <= all_agents.len()
+                {
+                    chosen.push(all_agents[n - 1]);
                 }
             }
             if chosen.is_empty() {

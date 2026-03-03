@@ -4,18 +4,13 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Interval {
     Daily,
+    #[default]
     Weekly,
     Monthly,
-}
-
-impl Default for Interval {
-    fn default() -> Self {
-        Self::Weekly
-    }
 }
 
 impl fmt::Display for Interval {
@@ -28,19 +23,14 @@ impl fmt::Display for Interval {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum NotificationPref {
     Terminal,
     Native,
+    #[default]
     Both,
     None,
-}
-
-impl Default for NotificationPref {
-    fn default() -> Self {
-        Self::Both
-    }
 }
 
 impl fmt::Display for NotificationPref {
@@ -213,8 +203,7 @@ impl Config {
                 .with_context(|| format!("Failed to create directory: {}", parent.display()))?;
         }
         let yaml = serde_yaml::to_string(self).context("Failed to serialize config")?;
-        fs::write(path, yaml)
-            .with_context(|| format!("Failed to write {}", path.display()))?;
+        fs::write(path, yaml).with_context(|| format!("Failed to write {}", path.display()))?;
         Ok(())
     }
 }
@@ -318,7 +307,10 @@ notifications: terminal
         Config::ensure_dirs_at(&base).unwrap();
 
         assert!(base.is_dir(), "base dir should exist");
-        assert!(base.join("proposals").is_dir(), "proposals dir should exist");
+        assert!(
+            base.join("proposals").is_dir(),
+            "proposals dir should exist"
+        );
         assert!(base.join("skills").is_dir(), "skills dir should exist");
         assert!(base.join("history").is_dir(), "history dir should exist");
     }

@@ -32,6 +32,7 @@ use crate::proposals::Proposal;
 
 /// A user's decision for a single proposal.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub enum ReviewDecision {
     Accept,
     Reject,
@@ -135,7 +136,7 @@ pub fn log_decision(history_dir: &Path, entry: &HistoryEntry) -> Result<()> {
 /// 3. A timestamp-based fallback.
 fn skill_filename_for(proposal: &Proposal) -> String {
     if let Some(target) = &proposal.frontmatter.target_skill {
-        let slug = target.to_lowercase().replace(' ', "-").replace('_', "-");
+        let slug = target.to_lowercase().replace([' ', '_'], "-");
         if slug.ends_with(".md") {
             slug
         } else {
@@ -223,6 +224,7 @@ pub fn reject_proposal(
 ///
 /// This is the core testable logic — no stdin required.
 /// Use `run_review_interactive` for the user-facing flow.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn run_review(
     proposals: &[Proposal],
     decisions: &[ReviewDecision],
@@ -759,7 +761,10 @@ pub fn run_review_interactive(
         println!("Syncing skills to agents...");
         match sync_after_review(skills_dir) {
             Ok(report) => {
-                println!("  Synced {} operation(s) across agents.", report.synced,);
+                println!(
+                    "  Synced {} operation(s) across agents ({} skipped).",
+                    report.synced, report.skipped,
+                );
                 if !report.errors.is_empty() {
                     for err in &report.errors {
                         eprintln!("  Sync warning: {err}");

@@ -24,8 +24,10 @@ pub enum HookStatus {
     /// Hook marker was already present; no changes were made.
     AlreadyInstalled,
     /// Hook was successfully removed from the config file.
+    #[cfg_attr(not(test), allow(dead_code))]
     Removed,
     /// No hook marker was found; nothing to remove.
+    #[cfg_attr(not(test), allow(dead_code))]
     NotFound,
     /// Shell is not supported (e.g. `ShellType::Other`); no config path exists.
     Unsupported,
@@ -42,9 +44,7 @@ pub fn hook_snippet(shell: &ShellType) -> &'static str {
         ShellType::Zsh | ShellType::Bash => {
             "# distill hook\ncommand -v distill &>/dev/null && distill notify --check"
         }
-        ShellType::Fish => {
-            "# distill hook\nif command -q distill; distill notify --check; end"
-        }
+        ShellType::Fish => "# distill hook\nif command -q distill; distill notify --check; end",
         ShellType::Other => "",
     }
 }
@@ -133,6 +133,7 @@ pub fn install_hook(shell: &ShellType, home: &Path) -> Result<HookStatus> {
 /// * Returns `HookStatus::NotFound` when the config file does not exist or
 ///   does not contain the marker.
 /// * Returns `HookStatus::Removed` on success.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn uninstall_hook(shell: &ShellType, home: &Path) -> Result<HookStatus> {
     let config_path = match shell_config_path(shell, home) {
         Some(p) => p,
@@ -247,7 +248,10 @@ mod tests {
         let path = shell_config_path(&ShellType::Fish, home).unwrap();
         assert_eq!(
             path,
-            home.join(".config").join("fish").join("conf.d").join("distill.fish")
+            home.join(".config")
+                .join("fish")
+                .join("conf.d")
+                .join("distill.fish")
         );
     }
 
