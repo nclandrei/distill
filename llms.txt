@@ -1,0 +1,25 @@
+# distill
+> Distill monitors AI-agent sessions (Claude/Codex), identifies recurring patterns, and turns them into reusable skills.
+
+## Preferred for AI agents: one-shot JSON flows (non-interactive)
+- Onboarding: `distill onboard --write-json onboarding.json` then `distill onboard --apply-json onboarding.json`
+- Review: `distill review --write-json review.json` then `distill review --apply-json review.json`
+- In `review.json`, set each proposal `decision` to `accept`, `reject`, or `skip` (missing decisions default to `skip`)
+- Use `-` as path for stdio: `--write-json -` (stdout), `--apply-json -` (stdin)
+
+## Other useful commands
+- `distill scan --now` to generate proposal files immediately
+- `distill status` to inspect config, pending proposals, and last scan
+- `distill watch --install|--uninstall` to manage scheduled scans
+- `distill notify --check` for shell-hook notification checks
+
+## JSON and docs references
+- `examples/onboarding.json` and `examples/review.json` (schema examples, `format_version: 1`)
+- `README.md` for user docs
+- `AGENTS.md` for agent operating rules in this repo
+
+## Runtime data
+- `~/.distill/config.yaml`
+- `~/.distill/proposals/`
+- `~/.distill/skills/`
+- `~/.distill/history/decisions.jsonl`
