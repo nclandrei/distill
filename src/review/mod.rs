@@ -13,8 +13,8 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::Line,
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    text::{Line, Span},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap},
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -297,6 +297,8 @@ struct ReviewUiState {
     accepted: usize,
     rejected: usize,
     skipped: usize,
+    focused_action: ReviewAction,
+    confirmation_focus: ConfirmationActionFocus,
     status_line: String,
     confirmation: Option<PendingConfirmation>,
 }
@@ -308,6 +310,9 @@ enum UiIntent {
     ScrollUp,
     ScrollDown,
     ScrollHome,
+    FocusPrevAction,
+    FocusNextAction,
+    RunFocusedAction,
     Accept,
     Reject,
     Snooze,
@@ -323,10 +328,93 @@ enum PendingConfirmation {
     AcceptAllWithRemovals { remove_count: usize },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ConfirmationResolution {
-    Proceed { clear_existing: bool },
-    Await(PendingConfirmation),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewAction {
+    Accept,
+    Reject,
+    Snooze,
+    Edit,
+    AcceptAll,
+    Quit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfirmationActionFocus {
+    Confirm,
+    Back,
+    Cancel,
+}
+
+impl ReviewAction {
+    fn all() -> [Self; 6] {
+        [
+            Self::Accept,
+            Self::Reject,
+            Self::Snooze,
+            Self::Edit,
+            Self::AcceptAll,
+            Self::Quit,
+        ]
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Accept => "Accept",
+            Self::Reject => "Reject",
+            Self::Snooze => "Snooze",
+            Self::Edit => "Edit",
+            Self::AcceptAll => "Accept All",
+            Self::Quit => "Quit",
+        }
+    }
+
+    fn color(self) -> Color {
+        match self {
+            Self::Accept => Color::Green,
+            Self::Reject => Color::Red,
+            Self::Snooze => Color::Yellow,
+            Self::Edit => Color::Cyan,
+            Self::AcceptAll => Color::Blue,
+            Self::Quit => Color::Magenta,
+        }
+    }
+
+    fn intent(self) -> UiIntent {
+        match self {
+            Self::Accept => UiIntent::Accept,
+            Self::Reject => UiIntent::Reject,
+            Self::Snooze => UiIntent::Snooze,
+            Self::Edit => UiIntent::Edit,
+            Self::AcceptAll => UiIntent::AcceptAll,
+            Self::Quit => UiIntent::Quit,
+        }
+    }
+
+    fn from_intent(intent: UiIntent) -> Option<Self> {
+        match intent {
+            UiIntent::Accept => Some(Self::Accept),
+            UiIntent::Reject => Some(Self::Reject),
+            UiIntent::Snooze => Some(Self::Snooze),
+            UiIntent::Edit => Some(Self::Edit),
+            UiIntent::AcceptAll => Some(Self::AcceptAll),
+            UiIntent::Quit => Some(Self::Quit),
+            _ => None,
+        }
+    }
+}
+
+impl ConfirmationActionFocus {
+    fn all() -> [Self; 3] {
+        [Self::Confirm, Self::Back, Self::Cancel]
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Confirm => "Confirm",
+            Self::Back => "Back",
+            Self::Cancel => "Cancel",
+        }
+    }
 }
 
 impl ReviewUiState {
@@ -338,6 +426,8 @@ impl ReviewUiState {
             accepted: 0,
             rejected: 0,
             skipped: 0,
+            focused_action: ReviewAction::Accept,
+            confirmation_focus: ConfirmationActionFocus::Confirm,
             status_line: "Select a proposal and choose an action.".to_string(),
             confirmation: None,
         }
@@ -377,6 +467,64 @@ impl ReviewUiState {
 
     fn clear_confirmation(&mut self) {
         self.confirmation = None;
+        self.confirmation_focus = ConfirmationActionFocus::Confirm;
+    }
+
+    fn focus_prev_action(&mut self) {
+        let actions = ReviewAction::all();
+        let idx = actions
+            .iter()
+            .position(|action| *action == self.focused_action)
+            .unwrap_or(0);
+        let prev = if idx == 0 { actions.len() - 1 } else { idx - 1 };
+        self.focused_action = actions[prev];
+    }
+
+    fn focus_next_action(&mut self) {
+        let actions = ReviewAction::all();
+        let idx = actions
+            .iter()
+            .position(|action| *action == self.focused_action)
+            .unwrap_or(0);
+        self.focused_action = actions[(idx + 1) % actions.len()];
+    }
+
+    fn focused_intent(&self) -> UiIntent {
+        self.focused_action.intent()
+    }
+
+    fn set_focus_from_intent(&mut self, intent: UiIntent) {
+        if let Some(action) = ReviewAction::from_intent(intent) {
+            self.focused_action = action;
+        }
+    }
+
+    fn focus_prev_confirmation_action(&mut self) {
+        let actions = ConfirmationActionFocus::all();
+        let idx = actions
+            .iter()
+            .position(|action| *action == self.confirmation_focus)
+            .unwrap_or(0);
+        let prev = if idx == 0 { actions.len() - 1 } else { idx - 1 };
+        self.confirmation_focus = actions[prev];
+    }
+
+    fn focus_next_confirmation_action(&mut self) {
+        let actions = ConfirmationActionFocus::all();
+        let idx = actions
+            .iter()
+            .position(|action| *action == self.confirmation_focus)
+            .unwrap_or(0);
+        self.confirmation_focus = actions[(idx + 1) % actions.len()];
+    }
+}
+
+impl PendingConfirmation {
+    fn intent(&self) -> UiIntent {
+        match self {
+            Self::AcceptRemove { .. } => UiIntent::Accept,
+            Self::AcceptAllWithRemovals { .. } => UiIntent::AcceptAll,
+        }
     }
 }
 
@@ -384,6 +532,9 @@ fn intent_from_key(code: KeyCode) -> UiIntent {
     match code {
         KeyCode::Up | KeyCode::Char('k') => UiIntent::MoveUp,
         KeyCode::Down | KeyCode::Char('j') => UiIntent::MoveDown,
+        KeyCode::Left | KeyCode::Char('h') | KeyCode::BackTab => UiIntent::FocusPrevAction,
+        KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => UiIntent::FocusNextAction,
+        KeyCode::Enter => UiIntent::RunFocusedAction,
         KeyCode::PageUp => UiIntent::ScrollUp,
         KeyCode::PageDown => UiIntent::ScrollDown,
         KeyCode::Home => UiIntent::ScrollHome,
@@ -429,28 +580,15 @@ fn required_confirmation_for_intent(
     }
 }
 
-fn resolve_confirmation(
-    current: Option<&PendingConfirmation>,
-    required: Option<PendingConfirmation>,
-) -> ConfirmationResolution {
-    match required {
-        Some(required) if current == Some(&required) => ConfirmationResolution::Proceed {
-            clear_existing: true,
-        },
-        Some(required) => ConfirmationResolution::Await(required),
-        None => ConfirmationResolution::Proceed {
-            clear_existing: current.is_some(),
-        },
-    }
-}
-
 fn confirmation_prompt(confirmation: &PendingConfirmation) -> String {
     match confirmation {
         PendingConfirmation::AcceptRemove { proposal_filename } => {
-            format!("Confirm remove accept for {proposal_filename}: press 'a' again.")
+            format!(
+                "Accepting {proposal_filename} can delete an existing skill file. Confirm before applying."
+            )
         }
         PendingConfirmation::AcceptAllWithRemovals { remove_count } => format!(
-            "Accept-all includes {remove_count} remove proposal(s). Press 'A' again to confirm."
+            "Accept-all includes {remove_count} remove proposal(s). Confirm before applying."
         ),
     }
 }
@@ -529,17 +667,28 @@ impl Drop for TuiSession {
     }
 }
 
-fn proposal_label(proposal: &Proposal) -> String {
-    use crate::proposals::ProposalType;
+fn proposal_type_tag(proposal_type: &ProposalType) -> &'static str {
+    match proposal_type {
+        ProposalType::New => "NEW",
+        ProposalType::Improve => "IMPROVE",
+        ProposalType::Edit => "EDIT",
+        ProposalType::Remove => "REMOVE",
+    }
+}
 
+fn confidence_tag(confidence: &crate::proposals::Confidence) -> &'static str {
+    match confidence {
+        crate::proposals::Confidence::High => "HIGH",
+        crate::proposals::Confidence::Medium => "MED",
+        crate::proposals::Confidence::Low => "LOW",
+    }
+}
+
+fn proposal_label(proposal: &Proposal) -> String {
     let filename = proposal.filename.as_deref().unwrap_or("(unknown)");
-    let kind = match proposal.frontmatter.proposal_type {
-        ProposalType::New => "new",
-        ProposalType::Improve => "improve",
-        ProposalType::Edit => "edit",
-        ProposalType::Remove => "remove",
-    };
-    format!("{filename} [{kind}]")
+    let kind = proposal_type_tag(&proposal.frontmatter.proposal_type);
+    let confidence = confidence_tag(&proposal.frontmatter.confidence);
+    format!("{filename} [{kind} | {confidence}]")
 }
 
 fn proposal_details_text(proposal: &Proposal, skills_dir: &Path) -> String {
@@ -599,33 +748,69 @@ fn proposal_details_text(proposal: &Proposal, skills_dir: &Path) -> String {
 }
 
 fn draw_review_ui(frame: &mut Frame<'_>, state: &ReviewUiState, skills_dir: &Path) {
+    let accent = Color::Cyan;
+    let muted = Color::DarkGray;
+    let emphasis = Color::Yellow;
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
+            Constraint::Length(3),
             Constraint::Min(10),
-            Constraint::Length(4),
+            Constraint::Length(6),
         ])
         .split(frame.area());
 
     let body_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
-        .split(chunks[1]);
+        .split(chunks[2]);
 
-    let header = Paragraph::new(format!(
-        "Pending: {} | Accepted: {} | Rejected: {} | Snoozed: {}",
-        state.pending.len(),
-        state.accepted,
-        state.rejected,
-        state.skipped,
-    ))
+    let header = Paragraph::new(vec![
+        Line::from(Span::styled(
+            "DISTILL REVIEW   Queue, inspect, and decide",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(format!(
+            "Pending: {} | Accepted: {} | Rejected: {} | Snoozed: {}",
+            state.pending.len(),
+            state.accepted,
+            state.rejected,
+            state.skipped,
+        )),
+    ])
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title("distill review"),
+            .border_style(Style::default().fg(muted))
+            .title("OVERVIEW"),
     );
     frame.render_widget(header, chunks[0]);
+
+    let flow_index = if state.confirmation.is_some() {
+        2
+    } else if state.content_scroll > 0 {
+        1
+    } else {
+        0
+    };
+    let flow = Tabs::new(vec![
+        Line::from(format!("1. Queue ({})", state.pending.len())),
+        Line::from("2. Inspect"),
+        Line::from(format!("3. Decide ({})", state.focused_action.label())),
+    ])
+    .select(flow_index)
+    .divider(" | ")
+    .style(Style::default().fg(muted))
+    .highlight_style(Style::default().fg(accent).add_modifier(Modifier::BOLD))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(muted))
+            .title("FLOW"),
+    );
+    frame.render_widget(flow, chunks[1]);
 
     let items: Vec<ListItem<'_>> = state
         .pending
@@ -636,13 +821,14 @@ fn draw_review_ui(frame: &mut Frame<'_>, state: &ReviewUiState, skills_dir: &Pat
         })
         .collect();
     let proposals = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("Proposals"))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(muted))
+                .title("QUEUE"),
+        )
         .highlight_symbol("> ")
-        .highlight_style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        );
+        .highlight_style(Style::default().fg(accent).add_modifier(Modifier::BOLD));
     let mut list_state = ListState::default();
     if !state.pending.is_empty() {
         list_state.select(Some(state.selected));
@@ -654,32 +840,119 @@ fn draw_review_ui(frame: &mut Frame<'_>, state: &ReviewUiState, skills_dir: &Pat
         .map(|proposal| proposal_details_text(proposal, skills_dir))
         .unwrap_or_else(|| "No pending proposals.".to_string());
     let detail_pane = Paragraph::new(details)
-        .block(Block::default().borders(Borders::ALL).title("Details"))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(muted))
+                .title("INSPECT"),
+        )
         .wrap(Wrap { trim: false })
         .scroll((state.content_scroll, 0));
     frame.render_widget(detail_pane, body_chunks[1]);
 
+    let action_chip = |action: ReviewAction| -> Span<'static> {
+        let marker = if state.focused_action == action {
+            "[x]"
+        } else {
+            "[ ]"
+        };
+        let label = format!("{marker} {}", action.label());
+        if state.focused_action == action {
+            Span::styled(
+                label,
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(action.color())
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled(label, Style::default().fg(muted))
+        }
+    };
+
     let footer = Paragraph::new(vec![
-        Line::from(
-            "a accept | r reject | e edit | s snooze | A accept-all | q quit | arrows move | PgUp/PgDn scroll",
-        ),
+        Line::from(vec![
+            Span::styled("[Left/Right] ", Style::default().fg(accent)),
+            Span::raw("Focus action  "),
+            Span::styled("[Enter] ", Style::default().fg(Color::Green)),
+            Span::raw("Run focused action  "),
+            Span::styled("[a/r/s/e/A/q] ", Style::default().fg(emphasis)),
+            Span::raw("Direct hotkeys"),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            action_chip(ReviewAction::Accept),
+            Span::raw("  "),
+            action_chip(ReviewAction::Reject),
+            Span::raw("  "),
+            action_chip(ReviewAction::Snooze),
+            Span::raw("  "),
+            action_chip(ReviewAction::Edit),
+            Span::raw("  "),
+            action_chip(ReviewAction::AcceptAll),
+            Span::raw("  "),
+            action_chip(ReviewAction::Quit),
+        ]),
         Line::from(state.status_line.clone()),
     ])
-    .block(Block::default().borders(Borders::ALL).title("Actions"));
-    frame.render_widget(footer, chunks[2]);
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(muted))
+            .title("DECIDE"),
+    );
+    frame.render_widget(footer, chunks[3]);
 
     if let Some(confirmation) = state.confirmation.as_ref() {
-        let modal = centered_rect(60, 22, frame.area());
+        let modal = centered_rect(58, 24, frame.area());
+        let confirm_chip = |action: ConfirmationActionFocus| -> Span<'static> {
+            let marker = if state.confirmation_focus == action {
+                "[x]"
+            } else {
+                "[ ]"
+            };
+            let label = format!("{marker} {}", action.label());
+            if state.confirmation_focus == action {
+                Span::styled(
+                    label,
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(emphasis)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::styled(label, Style::default().fg(muted))
+            }
+        };
         let text = vec![
-            Line::from("Confirm Action"),
+            Line::from("High-impact change detected."),
             Line::from(""),
             Line::from(confirmation_prompt(confirmation)),
             Line::from(""),
-            Line::from("Press the same action key again to confirm."),
-            Line::from("Any other action key cancels this confirmation."),
+            Line::from(vec![
+                confirm_chip(ConfirmationActionFocus::Confirm),
+                Span::raw("   "),
+                confirm_chip(ConfirmationActionFocus::Back),
+                Span::raw("   "),
+                confirm_chip(ConfirmationActionFocus::Cancel),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Tip: Left/Right or Tab/Shift-Tab, then Enter.",
+                Style::default().fg(muted),
+            )),
         ];
         let widget = Paragraph::new(text)
-            .block(Block::default().borders(Borders::ALL).title("Confirmation"))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(accent))
+                    .title(Span::styled(
+                        "FINAL CHECK",
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )),
+            )
+            .alignment(ratatui::layout::Alignment::Center)
             .wrap(Wrap { trim: true });
         frame.render_widget(Clear, modal);
         frame.render_widget(widget, modal);
@@ -759,6 +1032,155 @@ fn sync_after_review(skills_dir: &Path) -> Result<crate::sync::SyncReport> {
     crate::sync::run_sync(skills_dir, &agents)
 }
 
+fn execute_intent(
+    intent: UiIntent,
+    state: &mut ReviewUiState,
+    tui: &mut TuiSession,
+    proposals_dir: &Path,
+    skills_dir: &Path,
+    history_dir: &Path,
+) -> Result<()> {
+    match intent {
+        UiIntent::MoveUp => state.select_prev(),
+        UiIntent::MoveDown => state.select_next(),
+        UiIntent::ScrollUp => state.content_scroll = state.content_scroll.saturating_sub(5),
+        UiIntent::ScrollDown => state.content_scroll = state.content_scroll.saturating_add(5),
+        UiIntent::ScrollHome => state.content_scroll = 0,
+        UiIntent::FocusPrevAction => state.focus_prev_action(),
+        UiIntent::FocusNextAction => state.focus_next_action(),
+        UiIntent::RunFocusedAction => {
+            let focused = state.focused_intent();
+            execute_intent(focused, state, tui, proposals_dir, skills_dir, history_dir)?;
+        }
+        UiIntent::Accept => {
+            if let Some(proposal) = state.selected_proposal().cloned() {
+                let name = proposal
+                    .filename
+                    .as_deref()
+                    .unwrap_or("(unknown)")
+                    .to_string();
+                match accept_proposal(&proposal, skills_dir, history_dir, proposals_dir) {
+                    Ok(_) => {
+                        state.accepted += 1;
+                        state.remove_selected();
+                        state.status_line = format!("Accepted {name}");
+                    }
+                    Err(e) => {
+                        state.status_line = format!("Failed to accept {name}: {e:#}");
+                    }
+                }
+            }
+        }
+        UiIntent::Reject => {
+            if let Some(proposal) = state.selected_proposal().cloned() {
+                let name = proposal
+                    .filename
+                    .as_deref()
+                    .unwrap_or("(unknown)")
+                    .to_string();
+                match reject_proposal(&proposal, history_dir, proposals_dir) {
+                    Ok(_) => {
+                        state.rejected += 1;
+                        state.remove_selected();
+                        state.status_line = format!("Rejected {name}");
+                    }
+                    Err(e) => {
+                        state.status_line = format!("Failed to reject {name}: {e:#}");
+                    }
+                }
+            }
+        }
+        UiIntent::Snooze => {
+            if let Some(proposal) = state.selected_proposal() {
+                let name = proposal
+                    .filename
+                    .as_deref()
+                    .unwrap_or("(unknown)")
+                    .to_string();
+                state.skipped += 1;
+                state.remove_selected();
+                state.status_line = format!("Snoozed {name}");
+            }
+        }
+        UiIntent::Edit => {
+            let Some(proposal) = state.selected_proposal().cloned() else {
+                return Ok(());
+            };
+            let Some(filename) = proposal.filename.clone() else {
+                state.status_line = "Cannot edit proposal without a filename.".to_string();
+                return Ok(());
+            };
+            let path = proposals_dir.join(&filename);
+            if !path.exists() {
+                state.status_line = format!("Proposal file not found: {}", path.display());
+                return Ok(());
+            }
+
+            tui.suspend()?;
+            let edit_result = edit_file(&path);
+            let resume_result = tui.resume();
+            if let Err(e) = resume_result {
+                return Err(e).context("Failed to restore terminal after editing");
+            }
+
+            match edit_result {
+                Ok(_) => match reload_edited_proposal(&path, &filename) {
+                    Ok(updated) => {
+                        state.pending[state.selected] = updated;
+                        state.content_scroll = 0;
+                        state.status_line = format!("Edited {filename}");
+                    }
+                    Err(e) => {
+                        state.status_line =
+                            format!("Edited file but failed to parse {filename}: {e:#}");
+                    }
+                },
+                Err(e) => {
+                    state.status_line = format!("Edit failed for {filename}: {e:#}");
+                }
+            }
+        }
+        UiIntent::AcceptAll => {
+            let total = state.pending.len();
+            let mut failed = Vec::new();
+            let mut accepted_now = 0usize;
+
+            for proposal in state.pending.drain(..) {
+                match accept_proposal(&proposal, skills_dir, history_dir, proposals_dir) {
+                    Ok(_) => {
+                        state.accepted += 1;
+                        accepted_now += 1;
+                    }
+                    Err(_) => failed.push(proposal),
+                }
+            }
+
+            state.pending = failed;
+            state.selected = 0;
+            state.content_scroll = 0;
+
+            if state.pending.is_empty() {
+                state.status_line = format!("Accepted all remaining proposals ({accepted_now}).");
+            } else {
+                state.status_line = format!(
+                    "Accepted {accepted_now}/{total}. {} proposal(s) still pending due to errors.",
+                    state.pending.len()
+                );
+            }
+        }
+        UiIntent::Quit => {
+            let remaining = state.pending.len();
+            state.skipped += remaining;
+            state.pending.clear();
+            state.status_line =
+                format!("Exited review. Snoozed {remaining} remaining proposal(s).");
+        }
+        UiIntent::Noop => {}
+    }
+
+    Ok(())
+}
+
 /// Run the full interactive review flow.
 ///
 /// Shows a TUI with a proposal list and details pane.
@@ -805,161 +1227,87 @@ pub fn run_review_interactive(
             continue;
         }
 
-        let intent = intent_from_key(key.code);
-        if intent == UiIntent::Noop {
-            continue;
-        }
-
-        let required =
-            required_confirmation_for_intent(intent, state.selected_proposal(), &state.pending);
-        match resolve_confirmation(state.confirmation.as_ref(), required) {
-            ConfirmationResolution::Await(confirmation) => {
-                state.status_line = confirmation_prompt(&confirmation);
-                state.confirmation = Some(confirmation);
-                continue;
-            }
-            ConfirmationResolution::Proceed { clear_existing } => {
-                if clear_existing {
+        if let Some(confirmation) = state.confirmation.clone() {
+            match key.code {
+                KeyCode::Left | KeyCode::Char('h') | KeyCode::BackTab => {
+                    state.focus_prev_confirmation_action();
+                }
+                KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => {
+                    state.focus_next_confirmation_action();
+                }
+                KeyCode::Enter => match state.confirmation_focus {
+                    ConfirmationActionFocus::Confirm => {
+                        state.clear_confirmation();
+                        let intent = confirmation.intent();
+                        state.set_focus_from_intent(intent);
+                        execute_intent(
+                            intent,
+                            &mut state,
+                            &mut tui,
+                            proposals_dir,
+                            skills_dir,
+                            history_dir,
+                        )?;
+                    }
+                    ConfirmationActionFocus::Back | ConfirmationActionFocus::Cancel => {
+                        state.clear_confirmation();
+                        state.status_line = "Confirmation cancelled.".to_string();
+                    }
+                },
+                KeyCode::Esc | KeyCode::Char('q') => {
                     state.clear_confirmation();
-                    if !matches!(intent, UiIntent::Accept | UiIntent::AcceptAll) {
+                    state.status_line = "Confirmation cancelled.".to_string();
+                }
+                _ => {
+                    let quick_intent = intent_from_key(key.code);
+                    if quick_intent == confirmation.intent() {
+                        state.clear_confirmation();
+                        state.set_focus_from_intent(quick_intent);
+                        execute_intent(
+                            quick_intent,
+                            &mut state,
+                            &mut tui,
+                            proposals_dir,
+                            skills_dir,
+                            history_dir,
+                        )?;
+                    } else if quick_intent != UiIntent::Noop {
+                        state.clear_confirmation();
                         state.status_line = "Confirmation cancelled.".to_string();
                     }
                 }
             }
+            continue;
         }
 
-        match intent {
-            UiIntent::MoveUp => state.select_prev(),
-            UiIntent::MoveDown => state.select_next(),
-            UiIntent::ScrollUp => state.content_scroll = state.content_scroll.saturating_sub(5),
-            UiIntent::ScrollDown => state.content_scroll = state.content_scroll.saturating_add(5),
-            UiIntent::ScrollHome => state.content_scroll = 0,
-            UiIntent::Accept => {
-                if let Some(proposal) = state.selected_proposal().cloned() {
-                    let name = proposal
-                        .filename
-                        .as_deref()
-                        .unwrap_or("(unknown)")
-                        .to_string();
-                    match accept_proposal(&proposal, skills_dir, history_dir, proposals_dir) {
-                        Ok(_) => {
-                            state.accepted += 1;
-                            state.remove_selected();
-                            state.status_line = format!("Accepted {name}");
-                        }
-                        Err(e) => {
-                            state.status_line = format!("Failed to accept {name}: {e:#}");
-                        }
-                    }
-                }
-            }
-            UiIntent::Reject => {
-                if let Some(proposal) = state.selected_proposal().cloned() {
-                    let name = proposal
-                        .filename
-                        .as_deref()
-                        .unwrap_or("(unknown)")
-                        .to_string();
-                    match reject_proposal(&proposal, history_dir, proposals_dir) {
-                        Ok(_) => {
-                            state.rejected += 1;
-                            state.remove_selected();
-                            state.status_line = format!("Rejected {name}");
-                        }
-                        Err(e) => {
-                            state.status_line = format!("Failed to reject {name}: {e:#}");
-                        }
-                    }
-                }
-            }
-            UiIntent::Snooze => {
-                if let Some(proposal) = state.selected_proposal() {
-                    let name = proposal
-                        .filename
-                        .as_deref()
-                        .unwrap_or("(unknown)")
-                        .to_string();
-                    state.skipped += 1;
-                    state.remove_selected();
-                    state.status_line = format!("Snoozed {name}");
-                }
-            }
-            UiIntent::Edit => {
-                let Some(proposal) = state.selected_proposal().cloned() else {
-                    continue;
-                };
-                let Some(filename) = proposal.filename.clone() else {
-                    state.status_line = "Cannot edit proposal without a filename.".to_string();
-                    continue;
-                };
-                let path = proposals_dir.join(&filename);
-                if !path.exists() {
-                    state.status_line = format!("Proposal file not found: {}", path.display());
-                    continue;
-                }
-
-                tui.suspend()?;
-                let edit_result = edit_file(&path);
-                let resume_result = tui.resume();
-                if let Err(e) = resume_result {
-                    return Err(e).context("Failed to restore terminal after editing");
-                }
-
-                match edit_result {
-                    Ok(_) => match reload_edited_proposal(&path, &filename) {
-                        Ok(updated) => {
-                            state.pending[state.selected] = updated;
-                            state.content_scroll = 0;
-                            state.status_line = format!("Edited {filename}");
-                        }
-                        Err(e) => {
-                            state.status_line =
-                                format!("Edited file but failed to parse {filename}: {e:#}");
-                        }
-                    },
-                    Err(e) => {
-                        state.status_line = format!("Edit failed for {filename}: {e:#}");
-                    }
-                }
-            }
-            UiIntent::AcceptAll => {
-                let total = state.pending.len();
-                let mut failed = Vec::new();
-                let mut accepted_now = 0usize;
-
-                for proposal in state.pending.drain(..) {
-                    match accept_proposal(&proposal, skills_dir, history_dir, proposals_dir) {
-                        Ok(_) => {
-                            state.accepted += 1;
-                            accepted_now += 1;
-                        }
-                        Err(_) => failed.push(proposal),
-                    }
-                }
-
-                state.pending = failed;
-                state.selected = 0;
-                state.content_scroll = 0;
-
-                if state.pending.is_empty() {
-                    state.status_line =
-                        format!("Accepted all remaining proposals ({accepted_now}).");
-                } else {
-                    state.status_line = format!(
-                        "Accepted {accepted_now}/{total}. {} proposal(s) still pending due to errors.",
-                        state.pending.len()
-                    );
-                }
-            }
-            UiIntent::Quit => {
-                let remaining = state.pending.len();
-                state.skipped += remaining;
-                state.pending.clear();
-                state.status_line =
-                    format!("Exited review. Snoozed {remaining} remaining proposal(s).");
-            }
-            UiIntent::Noop => {}
+        let mut intent = intent_from_key(key.code);
+        if intent == UiIntent::Noop {
+            continue;
         }
+
+        if intent == UiIntent::RunFocusedAction {
+            intent = state.focused_intent();
+        }
+
+        state.set_focus_from_intent(intent);
+
+        if let Some(confirmation) =
+            required_confirmation_for_intent(intent, state.selected_proposal(), &state.pending)
+        {
+            state.status_line = confirmation_prompt(&confirmation);
+            state.confirmation = Some(confirmation);
+            state.confirmation_focus = ConfirmationActionFocus::Confirm;
+            continue;
+        }
+
+        execute_intent(
+            intent,
+            &mut state,
+            &mut tui,
+            proposals_dir,
+            skills_dir,
+            history_dir,
+        )?;
     }
 
     drop(tui);
@@ -1337,8 +1685,12 @@ mod tests {
 
         let rendered = render_buffer_text(terminal.backend().buffer());
         assert!(
-            rendered.contains("a accept | r reject"),
-            "actions row must render"
+            rendered.contains("Run focused action"),
+            "focused action controls must render"
+        );
+        assert!(
+            rendered.contains("[x] Accept"),
+            "focused action marker should render"
         );
         assert!(
             rendered.contains("Accepted alpha.md"),
@@ -1381,43 +1733,25 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_confirmation_needs_first_confirmation() {
-        let required = Some(PendingConfirmation::AcceptRemove {
-            proposal_filename: "remove.md".to_string(),
-        });
-        let outcome = resolve_confirmation(None, required);
-        assert_eq!(
-            outcome,
-            ConfirmationResolution::Await(PendingConfirmation::AcceptRemove {
-                proposal_filename: "remove.md".to_string()
-            })
-        );
-    }
-
-    #[test]
-    fn test_resolve_confirmation_allows_on_second_press() {
-        let pending = PendingConfirmation::AcceptAllWithRemovals { remove_count: 2 };
-        let outcome = resolve_confirmation(Some(&pending), Some(pending.clone()));
-        assert_eq!(
-            outcome,
-            ConfirmationResolution::Proceed {
-                clear_existing: true
-            }
-        );
-    }
-
-    #[test]
-    fn test_resolve_confirmation_clears_on_other_action() {
-        let pending = PendingConfirmation::AcceptRemove {
+    fn test_pending_confirmation_maps_to_expected_intent() {
+        let remove_confirmation = PendingConfirmation::AcceptRemove {
             proposal_filename: "remove.md".to_string(),
         };
-        let outcome = resolve_confirmation(Some(&pending), None);
-        assert_eq!(
-            outcome,
-            ConfirmationResolution::Proceed {
-                clear_existing: true
-            }
-        );
+        assert_eq!(remove_confirmation.intent(), UiIntent::Accept);
+
+        let accept_all_confirmation =
+            PendingConfirmation::AcceptAllWithRemovals { remove_count: 2 };
+        assert_eq!(accept_all_confirmation.intent(), UiIntent::AcceptAll);
+    }
+
+    #[test]
+    fn test_review_ui_action_focus_cycles() {
+        let mut state = ReviewUiState::new(vec![]);
+        assert_eq!(state.focused_action, ReviewAction::Accept);
+        state.focus_prev_action();
+        assert_eq!(state.focused_action, ReviewAction::Quit);
+        state.focus_next_action();
+        assert_eq!(state.focused_action, ReviewAction::Accept);
     }
 
     #[test]
@@ -1436,9 +1770,9 @@ mod tests {
             .unwrap();
 
         let rendered = render_buffer_text(terminal.backend().buffer());
-        assert!(rendered.contains("Confirmation"));
-        assert!(rendered.contains("Confirm Action"));
-        assert!(rendered.contains("Press 'A' again"));
+        assert!(rendered.contains("FINAL CHECK"));
+        assert!(rendered.contains("High-impact change detected."));
+        assert!(rendered.contains("Confirm before applying."));
     }
 
     // -----------------------------------------------------------------------
