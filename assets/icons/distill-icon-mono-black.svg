@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" fill="none">
+  <g id="distill-mono-black" shape-rendering="geometricPrecision">
+    <path d="M160 170H864L622 630H582V720H442V630H402L160 170Z" fill="#000000"/>
+    <path d="M452 720
+             C452 698 572 698 572 720
+             C572 784 630 834 512 900
+             C394 834 452 784 452 720Z" fill="#000000"/>
+  </g>
+</svg>

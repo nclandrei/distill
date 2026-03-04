@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" fill="none">
+  <!-- distill: many inputs distilled into one insight -->
+  <g id="distill" shape-rendering="geometricPrecision">
+    <!-- Outer funnel (serves as a cyan keyline on dark backgrounds) -->
+    <path d="M160 170H864L622 630H582V720H442V630H402L160 170Z" fill="#06B6D4"/>
+
+    <!-- Inner funnel body -->
+    <path d="M194 210H830L602 616H560V686H464V616H422L194 210Z" fill="#0F172A"/>
+
+    <!-- Three input streams converging toward a single insight -->
+    <path d="M312 230L432 230L478 616L438 616Z" fill="#06B6D4"/>
+    <path d="M452 230L572 230L532 616L492 616Z" fill="#06B6D4"/>
+    <path d="M592 230L712 230L586 616L546 616Z" fill="#06B6D4"/>
+
+    <!-- Insight node -->
+    <path d="M512 612L550 650L512 688L474 650Z" fill="#F59E0B"/>
+
+    <!-- Single distilled drop (rounded top, pointed bottom for small-size clarity) -->
+    <path d="M452 720
+             C452 698 572 698 572 720
+             C572 784 630 834 512 900
+             C394 834 452 784 452 720Z" fill="#F59E0B"/>
+  </g>
+</svg>
