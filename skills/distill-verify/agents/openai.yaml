@@ -1,0 +1,4 @@
+interface:
+  display_name: "Distill Verify"
+  short_description: "Verify Distill UI in Ghostty with tmux"
+  default_prompt: "Use $distill-verify to run Distill in Ghostty, drive flows via tmux, and verify with screenshots."

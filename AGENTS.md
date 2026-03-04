@@ -15,7 +15,7 @@ Use an isolated tmux socket/config to avoid user-level tmux config side effects.
 
 Script (from the local skill):
 
-`/Users/anicolae/code/dotfiles/config/skills/distill-verify/scripts/distill_verify_session.sh`
+`/Users/anicolae/code/distill/skills/distill-verify/scripts/distill_verify_session.sh`
 
 State file (jj/git ignored):
 
@@ -24,7 +24,7 @@ State file (jj/git ignored):
 ### Start or Reuse Session (Helper)
 
 ```bash
-SCRIPT="/Users/anicolae/code/dotfiles/config/skills/distill-verify/scripts/distill_verify_session.sh"
+SCRIPT="/Users/anicolae/code/distill/skills/distill-verify/scripts/distill_verify_session.sh"
 "$SCRIPT" init \
   --repo /Users/anicolae/code/distill \
   --state-file /Users/anicolae/code/distill/.distill-runtime/verify-session.env \
@@ -49,7 +49,7 @@ open -na Ghostty --args -e tmux -L "$TMUX_SOCKET" attach -t "$SESSION"
 
 ```bash
 # helper-driven control
-SCRIPT="/Users/anicolae/code/dotfiles/config/skills/distill-verify/scripts/distill_verify_session.sh"
+SCRIPT="/Users/anicolae/code/distill/skills/distill-verify/scripts/distill_verify_session.sh"
 STATE="/Users/anicolae/code/distill/.distill-runtime/verify-session.env"
 "$SCRIPT" status --state-file "$STATE"
 "$SCRIPT" send --state-file "$STATE" j
@@ -70,7 +70,7 @@ tmux -L "$TMUX_SOCKET" capture-pane -p -t "$TARGET" | tail -200
 
 ```bash
 # helper cleanup (preferred)
-SCRIPT="/Users/anicolae/code/dotfiles/config/skills/distill-verify/scripts/distill_verify_session.sh"
+SCRIPT="/Users/anicolae/code/distill/skills/distill-verify/scripts/distill_verify_session.sh"
 "$SCRIPT" cleanup --state-file /Users/anicolae/code/distill/.distill-runtime/verify-session.env
 
 # manual fallback
