@@ -8,6 +8,9 @@ const ICON_PNG_RELATIVE: &str = "assets/icons/png/color/distill-color-256.png";
 const ICON_SVG_RELATIVE: &str = "assets/icons/distill-icon.svg";
 const ICON_SHARE_PNG_RELATIVE: &str = "share/distill/icons/distill-color-256.png";
 const ICON_SHARE_SVG_RELATIVE: &str = "share/distill/icons/distill-icon.svg";
+const EMBEDDED_ICON_FILENAME: &str = "distill-color-256.png";
+const EMBEDDED_ICON_PNG: &[u8] =
+    include_bytes!("../../assets/icons/png/color/distill-color-256.png");
 
 // ── Trait ────────────────────────────────────────────────────────────────────
 
@@ -73,7 +76,28 @@ fn default_notification_icon_path() -> Option<PathBuf> {
         candidates.push(cwd.join(ICON_SVG_RELATIVE));
     }
 
-    first_existing_path(candidates)
+    if let Some(path) = first_existing_path(candidates) {
+        return Some(path);
+    }
+
+    write_embedded_icon_to_cache()
+}
+
+fn write_embedded_icon_to_cache() -> Option<PathBuf> {
+    let cache_dir = std::env::temp_dir().join("distill");
+    std::fs::create_dir_all(&cache_dir).ok()?;
+    let path = cache_dir.join(EMBEDDED_ICON_FILENAME);
+
+    let needs_write = match std::fs::metadata(&path) {
+        Ok(metadata) => metadata.len() == 0,
+        Err(_) => true,
+    };
+
+    if needs_write {
+        std::fs::write(&path, EMBEDDED_ICON_PNG).ok()?;
+    }
+
+    Some(path)
 }
 
 fn resolve_icon_path(configured_icon: Option<&str>) -> Option<String> {
@@ -355,6 +379,14 @@ mod tests {
             Some(configured.to_str().unwrap()),
             "explicit config path should take precedence when file exists"
         );
+    }
+
+    #[test]
+    fn test_write_embedded_icon_to_cache_creates_non_empty_file() {
+        let path = write_embedded_icon_to_cache()
+            .expect("embedded icon should be written when no file candidate exists");
+        let metadata = std::fs::metadata(&path).expect("embedded icon path should exist");
+        assert!(metadata.len() > 0, "embedded icon file should not be empty");
     }
 
     // ── TerminalNotifier ──────────────────────────────────────────────────────

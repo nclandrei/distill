@@ -9,8 +9,8 @@ permissions:
   contents: write
 
 jobs:
-  dist:
-    name: Build and publish release
+  dist-local:
+    name: Build local artifacts (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
@@ -38,15 +38,172 @@ jobs:
           restore-keys: ${{ runner.os }}-${{ matrix.target }}-cargo-
 
       - name: Install cargo-dist
-        run: cargo install cargo-dist --locked
+        run: cargo install cargo-dist --version 0.31.0 --locked
 
-      - name: Build dist artifacts
-        run: cargo dist build --target ${{ matrix.target }} --output-format=json
+      - name: Build local dist artifacts
+        run: $HOME/.cargo/bin/dist build --target ${{ matrix.target }} --artifacts=local --output-format=json --allow-dirty > dist-local.json
 
-      - name: Upload artifacts to GitHub release
+      - name: Save local dist manifest
+        run: cp dist-local.json target/distrib/${{ matrix.target }}-dist-manifest.json
+
+      - name: Upload local artifacts to GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           tag="${GITHUB_REF#refs/tags/}"
           gh release create "$tag" --generate-notes --draft || true
-          gh release upload "$tag" dist/artifacts/* --clobber
+
+          mapfile -t files < <(jq -r '.upload_files[]' dist-local.json)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::No release files produced by dist-local."
+            exit 1
+          fi
+
+          gh release upload "$tag" "${files[@]}" --clobber
+
+      - name: Upload local artifacts for global packaging
+        uses: actions/upload-artifact@v4
+        with:
+          name: local-artifacts-${{ matrix.target }}
+          path: |
+            target/distrib/*.tar.xz
+            target/distrib/*.tar.xz.sha256
+            target/distrib/*-dist-manifest.json
+          if-no-files-found: error
+
+  dist-global:
+    name: Build global artifacts
+    runs-on: ubuntu-latest
+    needs: dist-local
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-dist
+        run: cargo install cargo-dist --version 0.31.0 --locked
+
+      - name: Download local artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: local-artifacts-*
+          path: target/distrib
+          merge-multiple: true
+
+      - name: Build global dist artifacts
+        run: $HOME/.cargo/bin/dist build --artifacts=global --output-format=json --allow-dirty > dist-global.json
+
+      - name: Upload global artifacts to GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          mapfile -t files < <(jq -r '.upload_files[]' dist-global.json)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::No release files produced by dist-global."
+            exit 1
+          fi
+
+          gh release upload "$tag" "${files[@]}" --clobber
+
+      - name: Upload Homebrew formula artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: homebrew-formula
+          path: target/distrib/*.rb
+          if-no-files-found: error
+
+  publish-homebrew:
+    name: Publish Homebrew formula
+    runs-on: ubuntu-latest
+    needs: dist-global
+    steps:
+      - name: Ensure Homebrew tap token is configured
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -z "${HOMEBREW_TAP_TOKEN}" ]; then
+            echo "::error::Missing HOMEBREW_TAP_TOKEN secret."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          repository: nclandrei/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      - name: Download Homebrew formula
+        uses: actions/download-artifact@v4
+        with:
+          name: homebrew-formula
+          path: Formula
+
+      - name: Commit and push formula
+        env:
+          GITHUB_USER: distill bot
+          GITHUB_EMAIL: actions@users.noreply.github.com
+        run: |
+          git config user.name "${GITHUB_USER}"
+          git config user.email "${GITHUB_EMAIL}"
+
+          git add Formula/*.rb
+          if git diff --cached --quiet; then
+            echo "No Homebrew formula changes to publish."
+            exit 0
+          fi
+
+          version="${GITHUB_REF#refs/tags/v}"
+          git commit -m "distill ${version}"
+          git push
+
+  publish-crates:
+    name: Publish crate (crates.io)
+    runs-on: ubuntu-latest
+    needs: dist-global
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-publish-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-publish-
+
+      - name: Ensure crates.io token is configured
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "${CARGO_REGISTRY_TOKEN}" ]; then
+            echo "::error::Missing CARGO_REGISTRY_TOKEN secret."
+            exit 1
+          fi
+
+      - name: Detect if crate version already exists
+        id: crate_version
+        run: |
+          crate_name="$(awk -F' *= *' '/^name = /{gsub(/"/,"",$2); print $2; exit}' Cargo.toml)"
+          crate_version="$(awk -F' *= *' '/^version = /{gsub(/"/,"",$2); print $2; exit}' Cargo.toml)"
+
+          if curl -fsS "https://crates.io/api/v1/crates/${crate_name}/${crate_version}" >/dev/null; then
+            echo "already_published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "already_published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Package crate
+        if: steps.crate_version.outputs.already_published != 'true'
+        run: cargo package --locked
+
+      - name: Publish crate
+        if: steps.crate_version.outputs.already_published != 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked
+
+      - name: Skip publish (already exists)
+        if: steps.crate_version.outputs.already_published == 'true'
+        run: echo "Crate version already published on crates.io; skipping."

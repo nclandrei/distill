@@ -1,25 +1,33 @@
 # distill
 
-CLI tool that monitors AI agent sessions (Claude Code, Codex), identifies recurring patterns, and turns them into reusable skills.
+![distill icon](assets/icons/distill-preview.png)
 
-## For Humans
+`distill` helps you turn repeated AI-agent work into reusable skills. It watches Claude/Codex sessions, proposes improvements, and lets you accept them with a quick review flow.
 
-### Install
+## Install
 
 ```bash
+# Homebrew (recommended)
 brew install nclandrei/homebrew-tap/distill
+
+# crates.io
+cargo install distill
 ```
 
-### Quick Start
+Icon assets used by notifications and docs:
+- SVG: `assets/icons/distill-icon.svg`
+- PNG: `assets/icons/png/color/distill-color-256.png`
+
+## Quick Start
 
 ```bash
 distill              # First-run onboarding (interactive TUI)
-distill scan --now   # Scan agent sessions for new proposals
-distill review       # Review proposals in TUI (accept/reject/edit/snooze/batch)
-distill status       # Show config + pending proposals + last scan
+distill scan --now   # Scan sessions for new skill proposals
+distill review       # Review proposals (accept/reject/edit/snooze/batch)
+distill status       # Check config + pending proposals + last scan
 ```
 
-### Commands
+## Commands
 
 | Command | Description |
 |---------|-------------|
@@ -32,11 +40,17 @@ distill status       # Show config + pending proposals + last scan
 | `distill watch --uninstall` | Remove scheduled scan |
 | `distill notify --check` | Check for pending proposals (used by shell hook) |
 
+## Notifications
+
+- `notifications`: `terminal|native|both|none`
+- `notification_icon`: `null` or absolute icon path
+- If `notification_icon` is `null`, distill falls back to the built-in project icon automatically.
+
 ## For AI Agents
 
 Use one-shot JSON modes to avoid TUI interaction.
 
-Reference examples are committed in:
+Reference examples:
 - `examples/onboarding.json`
 - `examples/review.json`
 
@@ -67,9 +81,9 @@ distill review --apply-json review.json
 ```
 
 `review.json` behavior:
-- Contains all pending proposals plus an editable `decision` field.
-- Missing decisions default to `skip`.
-- Applying decisions writes skills, logs history, removes processed proposals, and syncs accepted skills to configured agents.
+- Contains all pending proposals plus an editable `decision` field
+- Missing decisions default to `skip`
+- Applying decisions writes skills, logs history, removes processed proposals, and syncs accepted skills to configured agents
 
 ### 3) Stdin/stdout mode
 
