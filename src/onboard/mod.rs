@@ -13,7 +13,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Table, Tabs, Wrap},
 };
 use std::io::{self, IsTerminal};
 use std::path::Path;
@@ -186,8 +186,7 @@ impl OnboardingUiState {
             shell_cursor,
             notif_cursor: 2, // both
             install_shell_hook: true,
-            status_line: "Use arrow keys to navigate. Enter continues. Backspace goes back."
-                .to_string(),
+            status_line: "Ready.".to_string(),
         };
         state.ensure_proposal_agent_valid();
         state
@@ -244,31 +243,43 @@ impl OnboardingUiState {
         }
     }
 
-    fn progress(&self) -> (usize, usize) {
-        let hide_hook = self.selected_shell() == ShellType::Other;
-        if hide_hook {
-            let current = match self.step {
-                OnboardingStep::Agents => 1,
-                OnboardingStep::Interval => 2,
-                OnboardingStep::ProposalAgent => 3,
-                OnboardingStep::Shell => 4,
-                OnboardingStep::Hook => 4,
-                OnboardingStep::Notifications => 5,
-                OnboardingStep::Confirm => 6,
-            };
-            (current, 6)
-        } else {
-            let current = match self.step {
-                OnboardingStep::Agents => 1,
-                OnboardingStep::Interval => 2,
-                OnboardingStep::ProposalAgent => 3,
-                OnboardingStep::Shell => 4,
-                OnboardingStep::Hook => 5,
-                OnboardingStep::Notifications => 6,
-                OnboardingStep::Confirm => 7,
-            };
-            (current, 7)
+    fn step_sequence(&self) -> Vec<OnboardingStep> {
+        let mut steps = vec![
+            OnboardingStep::Agents,
+            OnboardingStep::Interval,
+            OnboardingStep::ProposalAgent,
+            OnboardingStep::Shell,
+        ];
+        if self.selected_shell() != ShellType::Other {
+            steps.push(OnboardingStep::Hook);
         }
+        steps.push(OnboardingStep::Notifications);
+        steps.push(OnboardingStep::Confirm);
+        steps
+    }
+
+    fn step_index(&self) -> usize {
+        self.step_sequence()
+            .iter()
+            .position(|step| *step == self.step)
+            .unwrap_or(0)
+    }
+
+    fn step_short_label(step: OnboardingStep) -> &'static str {
+        match step {
+            OnboardingStep::Agents => "Agents",
+            OnboardingStep::Interval => "Cadence",
+            OnboardingStep::ProposalAgent => "Generator",
+            OnboardingStep::Shell => "Shell",
+            OnboardingStep::Hook => "Hook",
+            OnboardingStep::Notifications => "Alerts",
+            OnboardingStep::Confirm => "Review",
+        }
+    }
+
+    fn progress(&self) -> (usize, usize) {
+        let total = self.step_sequence().len();
+        (self.step_index() + 1, total)
     }
 
     fn step_title(&self) -> &'static str {
@@ -295,22 +306,38 @@ impl OnboardingUiState {
         }
     }
 
-    fn detection_label(&self) -> String {
-        self.detected_agents
-            .iter()
-            .map(|(kind, installed)| {
-                if *installed {
-                    format!("{kind}: found")
-                } else {
-                    format!("{kind}: not found")
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" | ")
-    }
-
     fn install_hook_effective(&self) -> bool {
         self.selected_shell() != ShellType::Other && self.install_shell_hook
+    }
+
+    fn active_summary_row(&self) -> Option<usize> {
+        match self.step {
+            OnboardingStep::Agents => Some(0),
+            OnboardingStep::Interval => Some(1),
+            OnboardingStep::ProposalAgent => Some(2),
+            OnboardingStep::Shell => Some(3),
+            OnboardingStep::Hook => Some(4),
+            OnboardingStep::Notifications => Some(5),
+            OnboardingStep::Confirm => None,
+        }
+    }
+
+    fn jump_to_step_number(&mut self, number: usize) -> bool {
+        if number == 0 {
+            return false;
+        }
+        let steps = self.step_sequence();
+        let Some(step) = steps.get(number - 1) else {
+            return false;
+        };
+        self.step = *step;
+        true
+    }
+
+    fn normalize_step_after_shell_change(&mut self) {
+        if self.selected_shell() == ShellType::Other && self.step == OnboardingStep::Hook {
+            self.step = OnboardingStep::Notifications;
+        }
     }
 
     fn contextual_help(&self) -> Vec<String> {
@@ -321,38 +348,58 @@ impl OnboardingUiState {
                         "No monitored agents selected: scans will not collect sessions."
                             .to_string(),
                         "Proposal generation falls back to detected/default agents.".to_string(),
+                        "Tip: keep at least one agent selected so generated skills match your workflow."
+                            .to_string(),
                     ]
                 } else {
                     vec![
                         "Only checked agents are scanned for new session patterns.".to_string(),
                         "Disable an agent if you don't want its skills mixed in.".to_string(),
+                        "Tip: use [a] to select all or [n] to clear quickly.".to_string(),
                     ]
                 }
             }
             OnboardingStep::Interval => match self.selected_interval() {
-                Interval::Daily => {
-                    vec!["Fastest feedback loop with higher background activity.".to_string()]
-                }
-                Interval::Weekly => {
-                    vec!["Balanced cadence for most repos and teams.".to_string()]
-                }
-                Interval::Monthly => {
-                    vec!["Lowest noise, but proposal turnaround will be slower.".to_string()]
-                }
+                Interval::Daily => vec![
+                    "Fastest feedback loop with higher background activity.".to_string(),
+                    "Best when your skill set changes frequently across many sessions.".to_string(),
+                    "Tip: if notifications feel noisy, switch to weekly later.".to_string(),
+                ],
+                Interval::Weekly => vec![
+                    "Balanced cadence for most repos and teams.".to_string(),
+                    "Collects enough evidence while keeping proposal volume manageable."
+                        .to_string(),
+                    "Tip: weekly works well with Friday review habits.".to_string(),
+                ],
+                Interval::Monthly => vec![
+                    "Lowest noise, but proposal turnaround will be slower.".to_string(),
+                    "Good for stable projects where workflows rarely change.".to_string(),
+                    "Tip: use 'distill scan --now' whenever you want instant proposals."
+                        .to_string(),
+                ],
             },
-            OnboardingStep::ProposalAgent => vec![format!(
-                "'{}' will format and generate proposed skills from collected sessions.",
-                self.proposal_agent
-            )],
+            OnboardingStep::ProposalAgent => vec![
+                format!(
+                    "'{}' will format and generate proposed skills from collected sessions.",
+                    self.proposal_agent
+                ),
+                "Choose the agent whose outputs you trust most for writing reusable instructions."
+                    .to_string(),
+            ],
             OnboardingStep::Shell => match self.selected_shell() {
                 ShellType::Other => vec![
                     "Auto hook install is disabled for 'other' shells.".to_string(),
                     "Use 'distill notify --check' manually from your prompt flow.".to_string(),
+                    "Tip: you can still keep native notifications enabled below.".to_string(),
                 ],
-                shell => vec![format!(
-                    "Hook snippets and integration paths will target the {} shell.",
-                    shell
-                )],
+                shell => vec![
+                    format!(
+                        "Hook snippets and integration paths will target the {} shell.",
+                        shell
+                    ),
+                    "Detecting the wrong shell? Set $SHELL before rerunning onboarding."
+                        .to_string(),
+                ],
             },
             OnboardingStep::Hook => {
                 if self.install_hook_effective() {
@@ -360,70 +407,60 @@ impl OnboardingUiState {
                         "A hook will run 'distill notify --check' at prompt boundaries."
                             .to_string(),
                         "You can uninstall later via the watch/shell commands.".to_string(),
+                        "Tip: keep this on if you want immediate pending-proposal reminders."
+                            .to_string(),
                     ]
                 } else {
                     vec![
                         "No shell file changes will be made during setup.".to_string(),
                         "Notifications still work via native alerts/scheduled scans.".to_string(),
+                        "Tip: you can enable the shell hook later without rerunning onboarding."
+                            .to_string(),
                     ]
                 }
             }
             OnboardingStep::Notifications => match self.selected_notifications() {
-                NotificationPref::Terminal => {
-                    vec!["Terminal messages appear on your next prompt; no OS banners.".to_string()]
-                }
-                NotificationPref::Native => {
-                    vec!["OS notifications are shown; terminal stays clean.".to_string()]
-                }
-                NotificationPref::Both => {
-                    vec!["Terminal + native notifications for maximum visibility.".to_string()]
-                }
-                NotificationPref::None => {
-                    vec!["No runtime alerts. You'll check status/review manually.".to_string()]
-                }
+                NotificationPref::Terminal => vec![
+                    "Terminal messages appear on your next prompt; no OS banners.".to_string(),
+                    "Best for users who keep terminal focus and want low interruption.".to_string(),
+                ],
+                NotificationPref::Native => vec![
+                    "OS notifications are shown; terminal stays clean.".to_string(),
+                    "Useful when scans run in the background and terminal is closed.".to_string(),
+                ],
+                NotificationPref::Both => vec![
+                    "Terminal + native notifications for maximum visibility.".to_string(),
+                    "Recommended when you're still calibrating scan cadence.".to_string(),
+                ],
+                NotificationPref::None => vec![
+                    "No runtime alerts. You'll check status/review manually.".to_string(),
+                    "Use this when you prefer explicit review rituals over real-time nudges."
+                        .to_string(),
+                ],
             },
             OnboardingStep::Confirm => vec![
                 "Save writes ~/.distill/config.yaml and installs scheduler integration."
                     .to_string(),
                 "Cancel leaves your environment unchanged.".to_string(),
+                "You can rerun onboarding any time by removing the config file.".to_string(),
             ],
         }
     }
 
     fn next_step(&mut self) {
-        self.step = match self.step {
-            OnboardingStep::Agents => OnboardingStep::Interval,
-            OnboardingStep::Interval => OnboardingStep::ProposalAgent,
-            OnboardingStep::ProposalAgent => OnboardingStep::Shell,
-            OnboardingStep::Shell => {
-                if self.selected_shell() == ShellType::Other {
-                    OnboardingStep::Notifications
-                } else {
-                    OnboardingStep::Hook
-                }
-            }
-            OnboardingStep::Hook => OnboardingStep::Notifications,
-            OnboardingStep::Notifications => OnboardingStep::Confirm,
-            OnboardingStep::Confirm => OnboardingStep::Confirm,
-        };
+        let steps = self.step_sequence();
+        let idx = self.step_index();
+        if idx + 1 < steps.len() {
+            self.step = steps[idx + 1];
+        }
     }
 
     fn previous_step(&mut self) {
-        self.step = match self.step {
-            OnboardingStep::Agents => OnboardingStep::Agents,
-            OnboardingStep::Interval => OnboardingStep::Agents,
-            OnboardingStep::ProposalAgent => OnboardingStep::Interval,
-            OnboardingStep::Shell => OnboardingStep::ProposalAgent,
-            OnboardingStep::Hook => OnboardingStep::Shell,
-            OnboardingStep::Notifications => {
-                if self.selected_shell() == ShellType::Other {
-                    OnboardingStep::Shell
-                } else {
-                    OnboardingStep::Hook
-                }
-            }
-            OnboardingStep::Confirm => OnboardingStep::Notifications,
-        };
+        let steps = self.step_sequence();
+        let idx = self.step_index();
+        if idx > 0 {
+            self.step = steps[idx - 1];
+        }
     }
 
     fn move_up(&mut self) {
@@ -448,6 +485,7 @@ impl OnboardingUiState {
             OnboardingStep::Notifications => self.notif_cursor = cycle_prev(self.notif_cursor, 4),
             OnboardingStep::Confirm => {}
         }
+        self.normalize_step_after_shell_change();
     }
 
     fn move_down(&mut self) {
@@ -472,6 +510,7 @@ impl OnboardingUiState {
             OnboardingStep::Notifications => self.notif_cursor = cycle_next(self.notif_cursor, 4),
             OnboardingStep::Confirm => {}
         }
+        self.normalize_step_after_shell_change();
     }
 
     fn toggle_current(&mut self) {
@@ -538,6 +577,30 @@ fn index_to_shell(index: usize) -> ShellType {
     }
 }
 
+fn shell_hook_target_path(shell: ShellType) -> Option<&'static str> {
+    match shell {
+        ShellType::Zsh => Some("~/.zshrc"),
+        ShellType::Bash => Some("~/.bashrc"),
+        ShellType::Fish => Some("~/.config/fish/conf.d/distill.fish"),
+        ShellType::Other => None,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn scheduler_target_preview() -> &'static str {
+    "~/Library/LaunchAgents/com.distill.agent.plist"
+}
+
+#[cfg(target_os = "linux")]
+fn scheduler_target_preview() -> &'static str {
+    "~/.config/systemd/user/distill.service"
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn scheduler_target_preview() -> &'static str {
+    "platform-specific scheduler target"
+}
+
 struct TuiSession {
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
     active: bool,
@@ -593,54 +656,111 @@ fn draw_onboarding_ui(frame: &mut Frame<'_>, state: &OnboardingUiState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(2),
             Constraint::Length(3),
-            Constraint::Length(1),
             Constraint::Min(10),
             Constraint::Length(3),
         ])
         .split(frame.area());
 
     let (step_num, step_total) = state.progress();
-    let progress = ((step_num as f64 / step_total as f64) * 100.0).round() as u16;
 
-    let header = Paragraph::new(vec![
-        Line::from(vec![
-            Span::styled(
-                "DISTILL ONBOARDING",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                format!("Step {step_num}/{step_total}"),
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                state.step_title(),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(Span::styled(
-            state.detection_label(),
-            Style::default().fg(MUTED),
-        )),
-    ]);
+    let header = Paragraph::new(Line::from(vec![
+        Span::styled(
+            "DISTILL ONBOARDING",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("Step {step_num}/{step_total}"),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            state.step_title(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+    ]));
     frame.render_widget(header, chunks[0]);
 
-    let gauge = Gauge::default()
-        .gauge_style(Style::default().fg(ACCENT))
-        .label(format!("{progress}%"))
-        .percent(progress);
-    frame.render_widget(gauge, chunks[1]);
+    let current_idx = state.step_index();
+    let tabs = Tabs::new(
+        state
+            .step_sequence()
+            .iter()
+            .enumerate()
+            .map(|(idx, step)| {
+                let marker = if idx < current_idx { "✓ " } else { "" };
+                format!(
+                    "{marker}{}. {}",
+                    idx + 1,
+                    OnboardingUiState::step_short_label(*step)
+                )
+            })
+            .collect::<Vec<_>>(),
+    )
+    .select(current_idx)
+    .divider("│")
+    .style(Style::default().fg(MUTED))
+    .highlight_style(Style::default().fg(EMPHASIS).add_modifier(Modifier::BOLD))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(MUTED))
+            .title(Span::styled(
+                "FLOW",
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+    );
+    frame.render_widget(tabs, chunks[1]);
 
     let body_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
+        .constraints([Constraint::Percentage(44), Constraint::Percentage(56)])
         .split(chunks[2]);
 
     if state.step == OnboardingStep::Confirm {
-        let confirm = Paragraph::new(vec![
-            Line::from("Ready to apply this onboarding setup."),
+        let confirm_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(8), Constraint::Min(6)])
+            .split(body_chunks[0]);
+
+        let hook_plan = match shell_hook_target_path(state.selected_shell()) {
+            Some(path) if state.install_hook_effective() => format!("update {path}"),
+            Some(path) => format!("skip (disabled, target: {path})"),
+            None => "skip (shell=other)".to_string(),
+        };
+        let monitored_count = state.selected_agents.len();
+        let monitored_plan = if monitored_count == 0 {
+            "no direct agent scans (fallback proposal source)".to_string()
+        } else {
+            format!("{monitored_count} monitored agent(s)")
+        };
+        let impact_rows = vec![
+            Row::new(vec!["Config", "write ~/.distill/config.yaml"]),
+            Row::new(vec!["Scheduler", scheduler_target_preview()]),
+            Row::new(vec!["Shell hook", &hook_plan]),
+            Row::new(vec!["Scan source", &monitored_plan]),
+        ];
+        let impact_table = Table::new(impact_rows, [Constraint::Length(12), Constraint::Min(20)])
+            .header(
+                Row::new(vec![Cell::from("Change"), Cell::from("Result")])
+                    .style(Style::default().add_modifier(Modifier::BOLD).fg(ACCENT)),
+            )
+            .column_spacing(2)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(MUTED))
+                    .title(Span::styled(
+                        "APPLY IMPACT",
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )),
+            );
+        frame.render_widget(impact_table, confirm_chunks[0]);
+
+        let controls = Paragraph::new(vec![
+            Line::from("Review looks good? Apply now."),
             Line::from(""),
             Line::from(vec![
                 Span::styled("[Enter] ", Style::default().fg(Color::Green)),
@@ -648,23 +768,28 @@ fn draw_onboarding_ui(frame: &mut Frame<'_>, state: &OnboardingUiState) {
             ]),
             Line::from(vec![
                 Span::styled("[Backspace] ", Style::default().fg(EMPHASIS)),
-                Span::raw("Go back and edit choices"),
+                Span::raw("Go back to previous section"),
+            ]),
+            Line::from(vec![
+                Span::styled("[1-7] ", Style::default().fg(ACCENT)),
+                Span::raw("Jump directly to a section"),
             ]),
             Line::from(vec![
                 Span::styled("[q] ", Style::default().fg(Color::Red)),
-                Span::raw("Cancel without writing config"),
+                Span::raw("Cancel with no changes"),
             ]),
         ])
+        .wrap(Wrap { trim: false })
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(MUTED))
                 .title(Span::styled(
-                    "SAVE / CANCEL",
+                    "CONTROLS",
                     Style::default().add_modifier(Modifier::BOLD),
                 )),
         );
-        frame.render_widget(confirm, body_chunks[0]);
+        frame.render_widget(controls, confirm_chunks[1]);
     } else {
         let (options_title, options, selected_idx): (&str, Vec<String>, Option<usize>) =
             match state.step {
@@ -753,13 +878,13 @@ fn draw_onboarding_ui(frame: &mut Frame<'_>, state: &OnboardingUiState) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(MUTED))
+                    .border_style(Style::default().fg(ACCENT))
                     .title(Span::styled(
                         option_title,
                         Style::default().add_modifier(Modifier::BOLD),
                     )),
             )
-            .highlight_symbol("> ")
+            .highlight_symbol("▸ ")
             .highlight_style(Style::default().fg(EMPHASIS).add_modifier(Modifier::BOLD));
 
         let mut list_state = ListState::default();
@@ -769,74 +894,109 @@ fn draw_onboarding_ui(frame: &mut Frame<'_>, state: &OnboardingUiState) {
         frame.render_stateful_widget(option_list, body_chunks[0], &mut list_state);
     }
 
-    let fallback_note = if state.selected_agents.is_empty() {
-        "none selected (proposal agent fallback active)"
-    } else {
-        "from monitored agents"
-    };
-    let summary = format!(
-        "Selections\n\n\
-         Agents       : {}\n\
-         Interval     : {}\n\
-         Proposal     : {} ({})\n\
-         Shell        : {}\n\
-         Hook install : {}\n\
-         Notifications: {}\n\
-         \n\
-         Why this choice\n\n\
-         {}\n\
-         \n\
-         Notes\n\n\
-         - Detected: {}\n\
-         - You can cancel any time with q.",
-        state.selected_agents_label(),
-        state.selected_interval(),
-        state.proposal_agent,
-        fallback_note,
-        state.selected_shell(),
-        if state.install_hook_effective() {
-            "yes"
-        } else {
-            "no"
-        },
-        state.selected_notifications(),
-        state
-            .contextual_help()
-            .into_iter()
-            .map(|line| format!("- {line}"))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        state.detection_label(),
-    );
+    let details_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(11), Constraint::Min(8)])
+        .split(body_chunks[1]);
 
-    let summary_pane = Paragraph::new(summary)
+    let fallback_note = if state.selected_agents.is_empty() {
+        "fallback mode"
+    } else {
+        "from monitored"
+    };
+    let summary_rows = vec![
+        ("Agents", state.selected_agents_label()),
+        ("Interval", state.selected_interval().to_string()),
+        (
+            "Proposal",
+            format!("{} ({fallback_note})", state.proposal_agent),
+        ),
+        ("Shell", state.selected_shell().to_string()),
+        (
+            "Hook install",
+            if state.selected_shell() == ShellType::Other {
+                "n/a for shell=other".to_string()
+            } else if state.install_hook_effective() {
+                "enabled".to_string()
+            } else {
+                "disabled".to_string()
+            },
+        ),
+        ("Notifications", state.selected_notifications().to_string()),
+    ];
+
+    let summary_table_rows = summary_rows
+        .iter()
+        .enumerate()
+        .map(|(idx, (label, value))| {
+            let mut style = Style::default();
+            if Some(idx) == state.active_summary_row() {
+                style = style.fg(EMPHASIS).add_modifier(Modifier::BOLD);
+            } else if idx == 4 && state.selected_shell() == ShellType::Other {
+                style = style.fg(MUTED);
+            }
+            Row::new(vec![Cell::from(*label), Cell::from(value.clone())]).style(style)
+        })
+        .collect::<Vec<_>>();
+
+    let summary_table = Table::new(
+        summary_table_rows,
+        [Constraint::Length(14), Constraint::Min(16)],
+    )
+    .column_spacing(2)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(MUTED))
+            .title(Span::styled(
+                "CURRENT SETUP",
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+    );
+    frame.render_widget(summary_table, details_chunks[0]);
+
+    let help_lines = state
+        .contextual_help()
+        .into_iter()
+        .enumerate()
+        .map(|(idx, line)| {
+            let bullet = if idx == 0 { "→ " } else { "• " };
+            Line::from(format!("{bullet}{line}"))
+        })
+        .collect::<Vec<_>>();
+    let help = Paragraph::new(help_lines)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(Span::styled(
-                    "CURRENT SETUP",
+                    "WHY THIS CHOICE",
                     Style::default().add_modifier(Modifier::BOLD),
                 ))
                 .border_style(Style::default().fg(MUTED)),
         )
         .wrap(Wrap { trim: false });
-    frame.render_widget(summary_pane, body_chunks[1]);
+    frame.render_widget(help, details_chunks[1]);
 
-    let help = match state.step {
+    let primary_help = match state.step {
         OnboardingStep::Agents => {
-            "Up/Down move | Space toggle | a select all | n clear all | Enter next"
+            "Up/Down move | Space toggle | a all | n clear | Enter next | q cancel"
         }
-        OnboardingStep::Hook => "Up/Down or Space toggle yes/no | Enter next",
-        OnboardingStep::Confirm => "Enter save | Backspace previous | q cancel",
-        _ => "Up/Down change selection | Enter next | Backspace previous",
+        OnboardingStep::Hook => "Up/Down or Space toggle yes/no | Enter next | q cancel",
+        OnboardingStep::Confirm => "Enter save | Backspace previous | 1-7 jump | q cancel",
+        _ => "Up/Down change selection | Enter next | Backspace previous | q cancel",
+    };
+    let secondary_help = if state.status_line == "Ready." {
+        "Tip: use 1-7 to jump across sections."
+    } else {
+        state.status_line.as_str()
     };
 
     let footer = Paragraph::new(vec![
         Line::from(vec![
             Span::styled("Keys: ", Style::default().fg(ACCENT)),
-            Span::raw(help),
+            Span::raw(primary_help),
         ]),
-        Line::from(Span::styled(&state.status_line, Style::default().fg(MUTED))),
+        Line::from(Span::styled(secondary_help, Style::default().fg(MUTED))),
     ])
     .block(Block::default().borders(Borders::TOP))
     .wrap(Wrap { trim: true });
@@ -892,11 +1052,21 @@ fn run_tui_flow(state: &mut OnboardingUiState) -> Result<OnboardingExit> {
             }
             KeyCode::Char('y') if state.step == OnboardingStep::Hook => {
                 state.install_shell_hook = true;
+                state.status_line = "Shell hook enabled.".to_string();
             }
             KeyCode::Char('n') if state.step == OnboardingStep::Hook => {
                 state.install_shell_hook = false;
+                state.status_line = "Shell hook disabled.".to_string();
             }
             KeyCode::Char(' ') => state.toggle_current(),
+            KeyCode::Char(d @ '1'..='7') => {
+                let step_no = (d as u8 - b'0') as usize;
+                if state.jump_to_step_number(step_no) {
+                    state.status_line = format!("Jumped to step {step_no}.");
+                } else {
+                    state.status_line = format!("Step {step_no} is not available for this setup.");
+                }
+            }
             KeyCode::Enter => {
                 if state.step == OnboardingStep::Confirm {
                     let answers = OnboardingAnswers {
@@ -1261,6 +1431,32 @@ mod tests {
         let config = build_config(&answers);
         assert_eq!(config.proposal_agent, "codex");
         assert_eq!(config.notifications, NotificationPref::None);
+    }
+
+    #[test]
+    fn test_step_sequence_hides_hook_for_other_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        let detected = detect_agents(dir.path());
+        let mut state = OnboardingUiState::new(detected);
+        state.shell_cursor = shell_to_index(&ShellType::Other);
+
+        let steps = state.step_sequence();
+        assert!(!steps.contains(&OnboardingStep::Hook));
+        assert_eq!(state.progress(), (1, 6));
+    }
+
+    #[test]
+    fn test_jump_to_step_number_with_other_shell_skips_hook_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let detected = detect_agents(dir.path());
+        let mut state = OnboardingUiState::new(detected);
+        state.shell_cursor = shell_to_index(&ShellType::Other);
+
+        assert!(state.jump_to_step_number(5));
+        assert_eq!(state.step, OnboardingStep::Notifications);
+        assert!(state.jump_to_step_number(6));
+        assert_eq!(state.step, OnboardingStep::Confirm);
+        assert!(!state.jump_to_step_number(7));
     }
 
     // --- post-onboarding setup side effects ---
