@@ -96,6 +96,8 @@ pub struct Config {
     pub shell: ShellType,
     #[serde(default)]
     pub notifications: NotificationPref,
+    #[serde(default)]
+    pub notification_icon: Option<String>,
 }
 
 impl Default for Config {
@@ -115,6 +117,7 @@ impl Default for Config {
             proposal_agent: "claude".into(),
             shell: ShellType::Zsh,
             notifications: NotificationPref::default(),
+            notification_icon: None,
         }
     }
 }
@@ -225,6 +228,7 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.scan_interval, Interval::Weekly);
         assert_eq!(config.notifications, NotificationPref::Both);
+        assert_eq!(config.notification_icon, None);
         assert_eq!(config.proposal_agent, "claude");
         assert_eq!(config.agents.len(), 2);
     }
@@ -249,10 +253,15 @@ scan_interval: daily
 proposal_agent: claude
 shell: bash
 notifications: terminal
+notification_icon: /tmp/distill.png
 "#;
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.scan_interval, Interval::Daily);
         assert_eq!(config.notifications, NotificationPref::Terminal);
+        assert_eq!(
+            config.notification_icon.as_deref(),
+            Some("/tmp/distill.png")
+        );
         assert_eq!(config.shell, ShellType::Bash);
         assert!(!config.agents[1].enabled);
     }
@@ -384,6 +393,7 @@ shell: zsh
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.scan_interval, Interval::Weekly);
         assert_eq!(config.notifications, NotificationPref::Both);
+        assert_eq!(config.notification_icon, None);
     }
 
     #[test]
@@ -412,6 +422,7 @@ shell: zsh
             proposal_agent: "codex".into(),
             shell: ShellType::Fish,
             notifications: NotificationPref::Native,
+            notification_icon: Some("/tmp/distill-icon.png".into()),
         };
 
         config.save_to(&path).unwrap();
@@ -421,6 +432,10 @@ shell: zsh
         assert_eq!(loaded.proposal_agent, "codex");
         assert_eq!(loaded.shell, ShellType::Fish);
         assert_eq!(loaded.notifications, NotificationPref::Native);
+        assert_eq!(
+            loaded.notification_icon.as_deref(),
+            Some("/tmp/distill-icon.png")
+        );
         assert!(!loaded.agents[1].enabled);
     }
 }

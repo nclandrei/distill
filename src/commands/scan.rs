@@ -43,7 +43,11 @@ pub fn run(now: bool) -> Result<()> {
 
     // Send notification according to the user's preference.
     // notify_scan_complete is a no-op when proposal_count == 0.
-    notify_scan_complete(proposals.len(), &config.notifications)?;
+    notify_scan_complete(
+        proposals.len(),
+        &config.notifications,
+        config.notification_icon.as_deref(),
+    )?;
 
     Ok(())
 }

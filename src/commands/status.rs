@@ -41,6 +41,10 @@ pub fn format_status(info: &StatusInfo) -> String {
     out.push_str(&format!("Proposal agent: {}\n", info.config.proposal_agent));
     out.push_str(&format!("Shell:          {}\n", info.config.shell));
     out.push_str(&format!("Notifications:  {}\n", info.config.notifications));
+    out.push_str(&format!(
+        "Notification icon: {}\n",
+        info.config.notification_icon.as_deref().unwrap_or("none")
+    ));
     out.push('\n');
 
     out.push_str("Monitored agents:\n");
@@ -334,6 +338,7 @@ mod tests {
             proposal_agent: "codex".into(),
             shell: ShellType::Bash,
             notifications: NotificationPref::Terminal,
+            notification_icon: Some("/tmp/distill-icon.png".into()),
             agents: vec![AgentEntry {
                 name: "codex".into(),
                 enabled: true,
@@ -346,6 +351,10 @@ mod tests {
         assert_eq!(info.config.proposal_agent, "codex");
         assert_eq!(info.config.shell, ShellType::Bash);
         assert_eq!(info.config.notifications, NotificationPref::Terminal);
+        assert_eq!(
+            info.config.notification_icon.as_deref(),
+            Some("/tmp/distill-icon.png")
+        );
     }
 
     /// Non-.md files in proposals dir must not be counted.

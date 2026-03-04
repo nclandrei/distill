@@ -85,6 +85,7 @@ pub fn build_config(answers: &OnboardingAnswers) -> Config {
         proposal_agent: answers.proposal_agent.to_string(),
         shell: answers.shell.clone(),
         notifications: answers.notifications.clone(),
+        notification_icon: None,
     }
 }
 
@@ -970,6 +971,10 @@ pub fn run_interactive() -> Result<()> {
     println!("  Proposal agent   : {}", config.proposal_agent);
     println!("  Shell            : {}", config.shell);
     println!("  Notifications    : {}", config.notifications);
+    println!(
+        "  Notification icon: {}",
+        config.notification_icon.as_deref().unwrap_or("none")
+    );
     println!();
     println!("Setup:");
     match post_setup.hook_status {

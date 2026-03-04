@@ -7,25 +7,42 @@ use crate::config::NotificationPref;
 
 /// Core notification abstraction.
 pub trait Notifier {
-    /// Send a notification with the given title and body.
-    fn send(&self, title: &str, body: &str) -> Result<()>;
+    /// Send a notification with the given title/body and optional icon.
+    fn send(&self, title: &str, body: &str, icon_path: Option<&str>) -> Result<()>;
     /// Report whether this notifier is usable on the current platform/environment.
     fn is_available(&self) -> bool;
 }
 
+fn binary_exists(bin: &str) -> bool {
+    Command::new("which")
+        .arg(bin)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 // ── macOS notifier ───────────────────────────────────────────────────────────
+
+#[cfg(any(target_os = "macos", test))]
+fn escape_for_applescript(raw: &str) -> String {
+    raw.replace('\\', "\\\\").replace('"', "\\\"")
+}
 
 /// macOS native notifier via `osascript`.
 ///
 /// Included on macOS and in tests.
-/// `is_available()` still gates runtime use to macOS.
 #[cfg(any(target_os = "macos", test))]
-pub struct MacOsNotifier;
+pub struct MacOsScriptNotifier;
 
 #[cfg(any(target_os = "macos", test))]
-impl Notifier for MacOsNotifier {
-    fn send(&self, title: &str, body: &str) -> Result<()> {
-        let script = format!("display notification \"{}\" with title \"{}\"", body, title);
+impl Notifier for MacOsScriptNotifier {
+    fn send(&self, title: &str, body: &str, _icon_path: Option<&str>) -> Result<()> {
+        let escaped_title = escape_for_applescript(title);
+        let escaped_body = escape_for_applescript(body);
+        let script = format!(
+            "display notification \"{}\" with title \"{}\"",
+            escaped_body, escaped_title
+        );
         let status = Command::new("osascript")
             .arg("-e")
             .arg(&script)
@@ -35,6 +52,60 @@ impl Notifier for MacOsNotifier {
             anyhow::bail!("osascript exited with non-zero status: {}", status);
         }
         Ok(())
+    }
+
+    fn is_available(&self) -> bool {
+        cfg!(target_os = "macos")
+    }
+}
+
+/// macOS native notifier via `terminal-notifier`.
+///
+/// Used when an icon path is configured, because `osascript` does not support
+/// custom notification icons.
+#[cfg(any(target_os = "macos", test))]
+pub struct MacOsTerminalNotifier;
+
+#[cfg(any(target_os = "macos", test))]
+impl Notifier for MacOsTerminalNotifier {
+    fn send(&self, title: &str, body: &str, icon_path: Option<&str>) -> Result<()> {
+        let mut command = Command::new("terminal-notifier");
+        command.arg("-title").arg(title).arg("-message").arg(body);
+        if let Some(icon) = icon_path.filter(|path| !path.trim().is_empty()) {
+            command.arg("-appIcon").arg(icon);
+        }
+
+        let status = command
+            .status()
+            .context("Failed to run terminal-notifier")?;
+        if !status.success() {
+            anyhow::bail!("terminal-notifier exited with non-zero status: {}", status);
+        }
+        Ok(())
+    }
+
+    fn is_available(&self) -> bool {
+        cfg!(target_os = "macos") && binary_exists("terminal-notifier")
+    }
+}
+
+/// macOS native notifier with icon-aware backend selection.
+///
+/// If an icon is configured and `terminal-notifier` is installed, it is used.
+/// Otherwise, we fall back to `osascript`.
+#[cfg(any(target_os = "macos", test))]
+pub struct MacOsNotifier;
+
+#[cfg(any(target_os = "macos", test))]
+impl Notifier for MacOsNotifier {
+    fn send(&self, title: &str, body: &str, icon_path: Option<&str>) -> Result<()> {
+        if icon_path.is_some() {
+            let notifier = MacOsTerminalNotifier;
+            if notifier.is_available() {
+                return notifier.send(title, body, icon_path);
+            }
+        }
+        MacOsScriptNotifier.send(title, body, None)
     }
 
     fn is_available(&self) -> bool {
@@ -52,8 +123,13 @@ pub struct LinuxNotifier;
 
 #[cfg(any(target_os = "linux", test))]
 impl Notifier for LinuxNotifier {
-    fn send(&self, title: &str, body: &str) -> Result<()> {
-        let status = Command::new("notify-send")
+    fn send(&self, title: &str, body: &str, icon_path: Option<&str>) -> Result<()> {
+        let mut command = Command::new("notify-send");
+        if let Some(icon) = icon_path.filter(|path| !path.trim().is_empty()) {
+            command.arg("--icon").arg(icon);
+        }
+
+        let status = command
             .arg(title)
             .arg(body)
             .status()
@@ -65,11 +141,7 @@ impl Notifier for LinuxNotifier {
     }
 
     fn is_available(&self) -> bool {
-        Command::new("which")
-            .arg("notify-send")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+        cfg!(target_os = "linux") && binary_exists("notify-send")
     }
 }
 
@@ -79,7 +151,7 @@ impl Notifier for LinuxNotifier {
 pub struct TerminalNotifier;
 
 impl Notifier for TerminalNotifier {
-    fn send(&self, title: &str, body: &str) -> Result<()> {
+    fn send(&self, title: &str, body: &str, _icon_path: Option<&str>) -> Result<()> {
         println!("distill: {title}");
         println!("         {body}");
         Ok(())
@@ -115,23 +187,30 @@ fn platform_notifier() -> Box<dyn Notifier> {
 /// * `Terminal` — print to stdout via `TerminalNotifier`.
 /// * `Native`   — use the platform-appropriate native notifier.
 /// * `Both`     — use both terminal and native notifiers.
-pub fn send_notification(pref: &NotificationPref, title: &str, body: &str) -> Result<()> {
+///
+/// `icon_path` applies only to native backends that support custom icons.
+pub fn send_notification(
+    pref: &NotificationPref,
+    title: &str,
+    body: &str,
+    icon_path: Option<&str>,
+) -> Result<()> {
     match pref {
         NotificationPref::None => Ok(()),
-        NotificationPref::Terminal => TerminalNotifier.send(title, body),
+        NotificationPref::Terminal => TerminalNotifier.send(title, body, icon_path),
         NotificationPref::Native => {
             let native = platform_notifier();
             if native.is_available() {
-                native.send(title, body)
+                native.send(title, body, icon_path)
             } else {
-                TerminalNotifier.send(title, body)
+                TerminalNotifier.send(title, body, icon_path)
             }
         }
         NotificationPref::Both => {
-            TerminalNotifier.send(title, body)?;
+            TerminalNotifier.send(title, body, icon_path)?;
             let native = platform_notifier();
             if native.is_available() {
-                native.send(title, body)?;
+                native.send(title, body, icon_path)?;
             }
             Ok(())
         }
@@ -142,7 +221,11 @@ pub fn send_notification(pref: &NotificationPref, title: &str, body: &str) -> Re
 ///
 /// Does nothing when `proposal_count` is zero.
 /// Otherwise dispatches to `send_notification` with a formatted body.
-pub fn notify_scan_complete(proposal_count: usize, pref: &NotificationPref) -> Result<()> {
+pub fn notify_scan_complete(
+    proposal_count: usize,
+    pref: &NotificationPref,
+    icon_path: Option<&str>,
+) -> Result<()> {
     if proposal_count == 0 {
         return Ok(());
     }
@@ -150,7 +233,7 @@ pub fn notify_scan_complete(proposal_count: usize, pref: &NotificationPref) -> R
         "{} new proposal(s) ready. Run 'distill review'.",
         proposal_count
     );
-    send_notification(pref, "distill", &body)
+    send_notification(pref, "distill", &body, icon_path)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -173,7 +256,7 @@ mod tests {
     #[test]
     fn test_terminal_notifier_send() {
         let notifier = TerminalNotifier;
-        let result = notifier.send("Test Title", "Test body text");
+        let result = notifier.send("Test Title", "Test body text", Some("/tmp/icon.png"));
         assert!(result.is_ok(), "TerminalNotifier::send should never error");
     }
 
@@ -208,7 +291,7 @@ mod tests {
     #[test]
     fn test_send_notification_none_pref() {
         // None pref must silently succeed without invoking any notifier.
-        let result = send_notification(&NotificationPref::None, "distill", "any body");
+        let result = send_notification(&NotificationPref::None, "distill", "any body", None);
         assert!(result.is_ok());
     }
 
@@ -219,6 +302,7 @@ mod tests {
             &NotificationPref::Terminal,
             "distill",
             "3 new proposal(s) ready. Run 'distill review'.",
+            Some("/tmp/icon.png"),
         );
         assert!(result.is_ok());
     }
@@ -229,7 +313,7 @@ mod tests {
     fn test_notify_scan_complete_zero_proposals() {
         // Zero proposals must be a silent no-op regardless of pref.
         for pref in [NotificationPref::None, NotificationPref::Terminal] {
-            let result = notify_scan_complete(0, &pref);
+            let result = notify_scan_complete(0, &pref, Some("/tmp/icon.png"));
             assert!(
                 result.is_ok(),
                 "notify_scan_complete(0, ..) must not error (pref: {})",
@@ -241,7 +325,7 @@ mod tests {
     #[test]
     fn test_notify_scan_complete_with_proposals() {
         // Any non-zero count should succeed when using Terminal pref.
-        let result = notify_scan_complete(2, &NotificationPref::Terminal);
+        let result = notify_scan_complete(2, &NotificationPref::Terminal, None);
         assert!(result.is_ok());
     }
 
@@ -261,7 +345,7 @@ mod tests {
         );
 
         // Also verify the public function succeeds end-to-end with Terminal pref.
-        let result = notify_scan_complete(count, &NotificationPref::Terminal);
+        let result = notify_scan_complete(count, &NotificationPref::Terminal, None);
         assert!(result.is_ok());
     }
 }
