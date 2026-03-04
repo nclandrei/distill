@@ -1,0 +1,19 @@
+{
+  "format_version": 1,
+  "agents": [
+    {
+      "name": "claude",
+      "enabled": true
+    },
+    {
+      "name": "codex",
+      "enabled": true
+    }
+  ],
+  "scan_interval": "weekly",
+  "proposal_agent": "claude",
+  "shell": "zsh",
+  "notifications": "both",
+  "notification_icon": null,
+  "install_shell_hook": true
+}

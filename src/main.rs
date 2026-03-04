@@ -11,12 +11,69 @@ mod shell;
 mod sync;
 
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
+
+const CLI_AFTER_HELP: &str = "\
+AI-friendly one-shot flow:
+  1) distill onboard --write-json onboarding.json
+  2) Edit onboarding.json
+  3) distill onboard --apply-json onboarding.json
+  4) distill review --write-json review.json
+  5) Fill review.json decisions (accept/reject/skip)
+  6) distill review --apply-json review.json
+";
+
+const ONBOARD_LONG_ABOUT: &str = "\
+Configure distill onboarding.
+
+Default behavior is the interactive TUI. For agent automation, use JSON mode:
+  distill onboard --write-json onboarding.json
+  distill onboard --apply-json onboarding.json
+
+The JSON includes all configuration values and install_shell_hook.
+Use '-' as the path to read from stdin or write to stdout.
+";
+
+const ONBOARD_AFTER_HELP: &str = "\
+Example onboarding JSON:
+{
+  \"format_version\": 1,
+  \"agents\": [{\"name\": \"claude\", \"enabled\": true}, {\"name\": \"codex\", \"enabled\": false}],
+  \"scan_interval\": \"weekly\",
+  \"proposal_agent\": \"claude\",
+  \"shell\": \"zsh\",
+  \"notifications\": \"both\",
+  \"notification_icon\": null,
+  \"install_shell_hook\": true
+}
+";
+
+const REVIEW_LONG_ABOUT: &str = "\
+Review pending proposals.
+
+Default behavior is the interactive TUI. For agent automation, use JSON mode:
+  distill review --write-json review.json
+  distill review --apply-json review.json
+
+Each proposal entry may include a 'decision' field:
+  accept | reject | skip
+Missing decisions default to skip.
+Use '-' as the path to read from stdin or write to stdout.
+";
+
+const REVIEW_AFTER_HELP: &str = "\
+One-shot AI review workflow:
+  1) distill review --write-json review.json
+  2) Set each proposal decision: accept | reject | skip
+  3) distill review --apply-json review.json
+";
 
 #[derive(Parser)]
 #[command(
     name = "distill",
     version,
-    about = "Monitor AI agent sessions and distill them into reusable skills"
+    about = "Monitor AI agent sessions and distill them into reusable skills",
+    after_long_help = CLI_AFTER_HELP
 )]
 struct Cli {
     #[command(subcommand)]
@@ -25,14 +82,32 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Run onboarding (interactive by default, JSON-driven when flags are used)
+    #[command(long_about = ONBOARD_LONG_ABOUT, after_long_help = ONBOARD_AFTER_HELP)]
+    Onboard {
+        /// Write onboarding JSON template to PATH (`-` for stdout)
+        #[arg(long, value_name = "PATH", conflicts_with = "apply_json")]
+        write_json: Option<PathBuf>,
+        /// Apply onboarding JSON from PATH (`-` for stdin)
+        #[arg(long, value_name = "PATH", conflicts_with = "write_json")]
+        apply_json: Option<PathBuf>,
+    },
     /// Run a scan for new skill proposals
     Scan {
         /// Run immediately, bypassing schedule
         #[arg(long)]
         now: bool,
     },
-    /// Interactively review pending proposals
-    Review,
+    /// Review proposals (interactive by default, JSON-driven when flags are used)
+    #[command(long_about = REVIEW_LONG_ABOUT, after_long_help = REVIEW_AFTER_HELP)]
+    Review {
+        /// Write pending proposals as JSON to PATH (`-` for stdout)
+        #[arg(long, value_name = "PATH", conflicts_with = "apply_json")]
+        write_json: Option<PathBuf>,
+        /// Apply review decisions from JSON at PATH (`-` for stdin)
+        #[arg(long, value_name = "PATH", conflicts_with = "write_json")]
+        apply_json: Option<PathBuf>,
+    },
     /// Show current config, last scan, and pending proposals
     Status,
     /// Manage the scheduled scan watcher
@@ -69,8 +144,17 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::Scan { now }) => {
             commands::scan::run(now)?;
         }
-        Some(Commands::Review) => {
-            commands::review::run()?;
+        Some(Commands::Onboard {
+            write_json,
+            apply_json,
+        }) => {
+            commands::onboard::run(write_json.as_deref(), apply_json.as_deref())?;
+        }
+        Some(Commands::Review {
+            write_json,
+            apply_json,
+        }) => {
+            commands::review::run(write_json.as_deref(), apply_json.as_deref())?;
         }
         Some(Commands::Status) => {
             commands::status::run()?;

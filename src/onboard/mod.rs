@@ -1232,6 +1232,9 @@ pub fn run_interactive() -> Result<()> {
         println!();
         println!("Welcome to distill! Let's set things up.");
         println!("Run 'distill' in an interactive terminal to complete onboarding.");
+        println!("For one-shot automation, run:");
+        println!("  distill onboard --write-json onboarding.json");
+        println!("  distill onboard --apply-json onboarding.json");
         return Ok(());
     }
 
