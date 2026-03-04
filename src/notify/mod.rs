@@ -1,7 +1,13 @@
 use anyhow::{Context, Result};
+use std::path::PathBuf;
 use std::process::Command;
 
 use crate::config::NotificationPref;
+
+const ICON_PNG_RELATIVE: &str = "assets/icons/png/color/distill-color-256.png";
+const ICON_SVG_RELATIVE: &str = "assets/icons/distill-icon.svg";
+const ICON_SHARE_PNG_RELATIVE: &str = "share/distill/icons/distill-color-256.png";
+const ICON_SHARE_SVG_RELATIVE: &str = "share/distill/icons/distill-icon.svg";
 
 // ── Trait ────────────────────────────────────────────────────────────────────
 
@@ -19,6 +25,69 @@ fn binary_exists(bin: &str) -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+fn first_existing_path(candidates: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    candidates.into_iter().find_map(|path| {
+        if path.exists() {
+            Some(path.canonicalize().unwrap_or(path))
+        } else {
+            None
+        }
+    })
+}
+
+fn default_notification_icon_path() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+
+    // Optional override for local testing / packaging quirks.
+    if let Ok(raw_override) = std::env::var("DISTILL_ICON_PATH") {
+        let trimmed = raw_override.trim();
+        if !trimmed.is_empty() {
+            let override_path = PathBuf::from(trimmed);
+            if override_path.is_absolute() {
+                candidates.push(override_path);
+            } else if let Ok(cwd) = std::env::current_dir() {
+                candidates.push(cwd.join(override_path));
+            } else {
+                candidates.push(override_path);
+            }
+        }
+    }
+
+    // Cargo run/build (repo-root ancestor) and installed layouts (share/distill/icons).
+    if let Ok(exe) = std::env::current_exe() {
+        for ancestor in exe.ancestors().take(8) {
+            candidates.push(ancestor.join(ICON_PNG_RELATIVE));
+            candidates.push(ancestor.join(ICON_SVG_RELATIVE));
+            candidates.push(ancestor.join(ICON_SHARE_PNG_RELATIVE));
+            candidates.push(ancestor.join(ICON_SHARE_SVG_RELATIVE));
+            candidates.push(ancestor.join("..").join(ICON_SHARE_PNG_RELATIVE));
+            candidates.push(ancestor.join("..").join(ICON_SHARE_SVG_RELATIVE));
+        }
+    }
+
+    // Direct repo execution from current directory.
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join(ICON_PNG_RELATIVE));
+        candidates.push(cwd.join(ICON_SVG_RELATIVE));
+    }
+
+    first_existing_path(candidates)
+}
+
+fn resolve_icon_path(configured_icon: Option<&str>) -> Option<String> {
+    if let Some(raw) = configured_icon
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
+        let configured = PathBuf::from(raw);
+        if configured.exists() {
+            return Some(configured.to_string_lossy().into_owned());
+        }
+    }
+
+    default_notification_icon_path().map(|path| path.to_string_lossy().into_owned())
 }
 
 // ── macOS notifier ───────────────────────────────────────────────────────────
@@ -195,22 +264,25 @@ pub fn send_notification(
     body: &str,
     icon_path: Option<&str>,
 ) -> Result<()> {
+    let resolved_icon = resolve_icon_path(icon_path);
+    let icon_arg = resolved_icon.as_deref();
+
     match pref {
         NotificationPref::None => Ok(()),
-        NotificationPref::Terminal => TerminalNotifier.send(title, body, icon_path),
+        NotificationPref::Terminal => TerminalNotifier.send(title, body, icon_arg),
         NotificationPref::Native => {
             let native = platform_notifier();
             if native.is_available() {
-                native.send(title, body, icon_path)
+                native.send(title, body, icon_arg)
             } else {
-                TerminalNotifier.send(title, body, icon_path)
+                TerminalNotifier.send(title, body, icon_arg)
             }
         }
         NotificationPref::Both => {
-            TerminalNotifier.send(title, body, icon_path)?;
+            TerminalNotifier.send(title, body, icon_arg)?;
             let native = platform_notifier();
             if native.is_available() {
-                native.send(title, body, icon_path)?;
+                native.send(title, body, icon_arg)?;
             }
             Ok(())
         }
@@ -241,6 +313,49 @@ pub fn notify_scan_complete(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_first_existing_path_returns_none_when_all_missing() {
+        let dir = tempdir().unwrap();
+        let missing_a = dir.path().join("missing-a.png");
+        let missing_b = dir.path().join("missing-b.png");
+
+        let found = first_existing_path(vec![missing_a, missing_b]);
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn test_first_existing_path_picks_first_existing_candidate() {
+        let dir = tempdir().unwrap();
+        let first_existing = dir.path().join("first.png");
+        let second_existing = dir.path().join("second.png");
+        std::fs::write(&first_existing, b"png").unwrap();
+        std::fs::write(&second_existing, b"png").unwrap();
+
+        let found = first_existing_path(vec![
+            dir.path().join("missing.png"),
+            first_existing.clone(),
+            second_existing,
+        ])
+        .unwrap();
+
+        assert_eq!(found, first_existing.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn test_resolve_icon_path_prefers_valid_configured_path() {
+        let dir = tempdir().unwrap();
+        let configured = dir.path().join("configured.png");
+        std::fs::write(&configured, b"png").unwrap();
+
+        let resolved = resolve_icon_path(Some(configured.to_str().unwrap()));
+        assert_eq!(
+            resolved.as_deref(),
+            Some(configured.to_str().unwrap()),
+            "explicit config path should take precedence when file exists"
+        );
+    }
 
     // ── TerminalNotifier ──────────────────────────────────────────────────────
 
