@@ -353,7 +353,13 @@ case "$subcommand" in
       state_file="$(default_state_file_for_repo "$(default_repo_root)")"
     fi
     load_state_file "$state_file"
-    tmux -L "$VERIFY_TMUX_SOCKET" capture-pane -a -p -t "$VERIFY_TMUX_TARGET" | tail -n "$lines"
+    pane_output=""
+    if pane_output="$(tmux -L "$VERIFY_TMUX_SOCKET" capture-pane -a -p -t "$VERIFY_TMUX_TARGET" 2>/dev/null)"; then
+      :
+    else
+      pane_output="$(tmux -L "$VERIFY_TMUX_SOCKET" capture-pane -p -t "$VERIFY_TMUX_TARGET")"
+    fi
+    printf '%s\n' "$pane_output" | tail -n "$lines"
     ;;
 
   screenshot)

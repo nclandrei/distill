@@ -529,7 +529,9 @@ fn invoke_agent(command: &str, args: &[String], prompt: &str) -> Result<String> 
         .args(&effective_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit()) // let agent progress output show in real time
+        // Some agents (notably Codex) stream full conversation logs on stderr.
+        // Capture it so scans stay readable, then surface it only on failures.
+        .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("Failed to execute agent command: {command}"))?;
 
@@ -569,12 +571,19 @@ fn invoke_agent(command: &str, args: &[String], prompt: &str) -> Result<String> 
     let _ = heartbeat.join();
 
     if !output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let details = match (stderr.is_empty(), stdout.is_empty()) {
+            (true, true) => String::new(),
+            (false, true) => format!(":\n{stderr}"),
+            (true, false) => format!(":\n{stdout}"),
+            (false, false) => format!(":\n{stderr}\n{stdout}"),
+        };
         cleanup_temp_files(&temp_files);
         bail!(
-            "Agent command `{command}` failed with status {}:\n{}",
+            "Agent command `{command}` failed with status {}{}",
             output.status,
-            stdout.trim()
+            details
         );
     }
 
@@ -1111,6 +1120,29 @@ printf '%s' 'not-json-on-stdout'
         )
         .unwrap();
         assert_eq!(raw.trim(), r#"{"proposals":[]}"#);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_invoke_agent_failure_includes_stderr() {
+        let dir = tempfile::tempdir().unwrap();
+        let failing = dir.path().join("failing-agent.sh");
+        let script = r#"#!/bin/sh
+cat > /dev/null
+echo "simulated stderr failure" 1>&2
+exit 42
+"#;
+        std::fs::write(&failing, script).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&failing, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let err = invoke_agent(failing.to_str().unwrap(), &[], "ignored prompt")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("status"));
+        assert!(err.contains("simulated stderr failure"));
     }
 
     #[test]
