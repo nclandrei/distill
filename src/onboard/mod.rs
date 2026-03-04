@@ -10,10 +10,12 @@ use crossterm::{
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Table, Tabs, Wrap},
+    widgets::{
+        Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, Tabs, Wrap,
+    },
 };
 use std::io::{self, IsTerminal};
 use std::path::Path;
@@ -139,6 +141,13 @@ enum OnboardingStep {
     Confirm,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfirmAction {
+    Save,
+    Back,
+    Cancel,
+}
+
 #[derive(Debug, Clone)]
 struct OnboardingUiState {
     detected_agents: Vec<(AgentKind, bool)>,
@@ -151,6 +160,7 @@ struct OnboardingUiState {
     shell_cursor: usize,
     notif_cursor: usize,
     install_shell_hook: bool,
+    confirm_action: ConfirmAction,
     status_line: String,
 }
 
@@ -186,6 +196,7 @@ impl OnboardingUiState {
             shell_cursor,
             notif_cursor: 2, // both
             install_shell_hook: true,
+            confirm_action: ConfirmAction::Save,
             status_line: "Ready.".to_string(),
         };
         state.ensure_proposal_agent_valid();
@@ -331,6 +342,7 @@ impl OnboardingUiState {
             return false;
         };
         self.step = *step;
+        self.on_step_changed();
         true
     }
 
@@ -452,6 +464,7 @@ impl OnboardingUiState {
         let idx = self.step_index();
         if idx + 1 < steps.len() {
             self.step = steps[idx + 1];
+            self.on_step_changed();
         }
     }
 
@@ -460,7 +473,30 @@ impl OnboardingUiState {
         let idx = self.step_index();
         if idx > 0 {
             self.step = steps[idx - 1];
+            self.on_step_changed();
         }
+    }
+
+    fn on_step_changed(&mut self) {
+        if self.step == OnboardingStep::Confirm {
+            self.confirm_action = ConfirmAction::Save;
+        }
+    }
+
+    fn cycle_confirm_action_prev(&mut self) {
+        self.confirm_action = match self.confirm_action {
+            ConfirmAction::Save => ConfirmAction::Cancel,
+            ConfirmAction::Back => ConfirmAction::Save,
+            ConfirmAction::Cancel => ConfirmAction::Back,
+        };
+    }
+
+    fn cycle_confirm_action_next(&mut self) {
+        self.confirm_action = match self.confirm_action {
+            ConfirmAction::Save => ConfirmAction::Back,
+            ConfirmAction::Back => ConfirmAction::Cancel,
+            ConfirmAction::Cancel => ConfirmAction::Save,
+        };
     }
 
     fn move_up(&mut self) {
@@ -599,6 +635,19 @@ fn scheduler_target_preview() -> &'static str {
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn scheduler_target_preview() -> &'static str {
     "platform-specific scheduler target"
+}
+
+fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let popup_width = width.min(area.width.saturating_sub(2)).max(10);
+    let popup_height = height.min(area.height.saturating_sub(2)).max(6);
+    let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
+    let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
+    Rect {
+        x,
+        y,
+        width: popup_width,
+        height: popup_height,
+    }
 }
 
 struct TuiSession {
@@ -763,12 +812,12 @@ fn draw_onboarding_ui(frame: &mut Frame<'_>, state: &OnboardingUiState) {
             Line::from("Review looks good? Apply now."),
             Line::from(""),
             Line::from(vec![
-                Span::styled("[Enter] ", Style::default().fg(Color::Green)),
-                Span::raw("Save and finish setup"),
+                Span::styled("[Left/Right] ", Style::default().fg(ACCENT)),
+                Span::raw("Change focused action"),
             ]),
             Line::from(vec![
-                Span::styled("[Backspace] ", Style::default().fg(EMPHASIS)),
-                Span::raw("Go back to previous section"),
+                Span::styled("[Enter] ", Style::default().fg(Color::Green)),
+                Span::raw("Run focused action"),
             ]),
             Line::from(vec![
                 Span::styled("[1-7] ", Style::default().fg(ACCENT)),
@@ -904,7 +953,7 @@ fn draw_onboarding_ui(frame: &mut Frame<'_>, state: &OnboardingUiState) {
     } else {
         "from monitored"
     };
-    let summary_rows = vec![
+    let summary_rows = [
         ("Agents", state.selected_agents_label()),
         ("Interval", state.selected_interval().to_string()),
         (
@@ -982,7 +1031,7 @@ fn draw_onboarding_ui(frame: &mut Frame<'_>, state: &OnboardingUiState) {
             "Up/Down move | Space toggle | a all | n clear | Enter next | q cancel"
         }
         OnboardingStep::Hook => "Up/Down or Space toggle yes/no | Enter next | q cancel",
-        OnboardingStep::Confirm => "Enter save | Backspace previous | 1-7 jump | q cancel",
+        OnboardingStep::Confirm => "Left/Right choose action | Enter apply | 1-7 jump | q cancel",
         _ => "Up/Down change selection | Enter next | Backspace previous | q cancel",
     };
     let secondary_help = if state.status_line == "Ready." {
@@ -1001,6 +1050,59 @@ fn draw_onboarding_ui(frame: &mut Frame<'_>, state: &OnboardingUiState) {
     .block(Block::default().borders(Borders::TOP))
     .wrap(Wrap { trim: true });
     frame.render_widget(footer, chunks[3]);
+
+    if state.step == OnboardingStep::Confirm {
+        let popup_area = centered_rect(frame.area(), 64, 9);
+        frame.render_widget(Clear, popup_area);
+
+        let button = |action: ConfirmAction, label: &str| -> Span<'static> {
+            let marker = if state.confirm_action == action {
+                "[x]"
+            } else {
+                "[ ]"
+            };
+            if state.confirm_action == action {
+                Span::styled(
+                    format!("{marker} {label}"),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(EMPHASIS)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::styled(format!("{marker} {label}"), Style::default().fg(MUTED))
+            }
+        };
+
+        let modal = Paragraph::new(vec![
+            Line::from("Final confirmation"),
+            Line::from("Choose an action, then press Enter."),
+            Line::from(""),
+            Line::from(vec![
+                button(ConfirmAction::Save, "Save"),
+                Span::raw("   "),
+                button(ConfirmAction::Back, "Back"),
+                Span::raw("   "),
+                button(ConfirmAction::Cancel, "Cancel"),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Tip: Tab/Shift-Tab also cycles the focused action.",
+                Style::default().fg(MUTED),
+            )),
+        ])
+        .alignment(ratatui::layout::Alignment::Center)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(ACCENT))
+                .title(Span::styled(
+                    "FINAL CHECK",
+                    Style::default().add_modifier(Modifier::BOLD),
+                )),
+        );
+        frame.render_widget(modal, popup_area);
+    }
 }
 
 fn run_tui_flow(state: &mut OnboardingUiState) -> Result<OnboardingExit> {
@@ -1025,21 +1127,38 @@ fn run_tui_flow(state: &mut OnboardingUiState) -> Result<OnboardingExit> {
             KeyCode::Up | KeyCode::Char('k') => state.move_up(),
             KeyCode::Down | KeyCode::Char('j') => state.move_down(),
             KeyCode::Left | KeyCode::Char('h') => {
-                if state.step == OnboardingStep::Hook {
+                if state.step == OnboardingStep::Confirm {
+                    state.cycle_confirm_action_prev();
+                } else if state.step == OnboardingStep::Hook {
                     state.install_shell_hook = true;
                 } else {
                     state.previous_step();
                 }
             }
             KeyCode::Right | KeyCode::Char('l') => {
-                if state.step == OnboardingStep::Hook {
+                if state.step == OnboardingStep::Confirm {
+                    state.cycle_confirm_action_next();
+                } else if state.step == OnboardingStep::Hook {
                     state.install_shell_hook = false;
                 } else {
                     state.next_step();
                 }
             }
-            KeyCode::Backspace | KeyCode::BackTab => state.previous_step(),
-            KeyCode::Tab => state.next_step(),
+            KeyCode::Backspace => state.previous_step(),
+            KeyCode::BackTab => {
+                if state.step == OnboardingStep::Confirm {
+                    state.cycle_confirm_action_prev();
+                } else {
+                    state.previous_step();
+                }
+            }
+            KeyCode::Tab => {
+                if state.step == OnboardingStep::Confirm {
+                    state.cycle_confirm_action_next();
+                } else {
+                    state.next_step();
+                }
+            }
             KeyCode::Char('a') if state.step == OnboardingStep::Agents => {
                 state.selected_agents = state.all_agents.clone();
                 state.ensure_proposal_agent_valid();
@@ -1069,20 +1188,30 @@ fn run_tui_flow(state: &mut OnboardingUiState) -> Result<OnboardingExit> {
             }
             KeyCode::Enter => {
                 if state.step == OnboardingStep::Confirm {
-                    let answers = OnboardingAnswers {
-                        detected_agents: state.detected_agents.clone(),
-                        enabled_agents: state.selected_agents.clone(),
-                        scan_interval: state.selected_interval(),
-                        proposal_agent: state.proposal_agent,
-                        shell: state.selected_shell(),
-                        notifications: state.selected_notifications(),
-                    };
-                    return Ok(OnboardingExit::Completed(
-                        answers,
-                        state.install_hook_effective(),
-                    ));
+                    match state.confirm_action {
+                        ConfirmAction::Save => {
+                            let answers = OnboardingAnswers {
+                                detected_agents: state.detected_agents.clone(),
+                                enabled_agents: state.selected_agents.clone(),
+                                scan_interval: state.selected_interval(),
+                                proposal_agent: state.proposal_agent,
+                                shell: state.selected_shell(),
+                                notifications: state.selected_notifications(),
+                            };
+                            return Ok(OnboardingExit::Completed(
+                                answers,
+                                state.install_hook_effective(),
+                            ));
+                        }
+                        ConfirmAction::Back => {
+                            state.previous_step();
+                            state.status_line = "Returned from final check.".to_string();
+                        }
+                        ConfirmAction::Cancel => return Ok(OnboardingExit::Canceled),
+                    }
+                } else {
+                    state.next_step();
                 }
-                state.next_step();
             }
             _ => {}
         }
@@ -1457,6 +1586,34 @@ mod tests {
         assert!(state.jump_to_step_number(6));
         assert_eq!(state.step, OnboardingStep::Confirm);
         assert!(!state.jump_to_step_number(7));
+    }
+
+    #[test]
+    fn test_confirm_action_cycles_in_expected_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let detected = detect_agents(dir.path());
+        let mut state = OnboardingUiState::new(detected);
+
+        state.step = OnboardingStep::Confirm;
+        state.confirm_action = ConfirmAction::Save;
+        state.cycle_confirm_action_next();
+        assert_eq!(state.confirm_action, ConfirmAction::Back);
+        state.cycle_confirm_action_next();
+        assert_eq!(state.confirm_action, ConfirmAction::Cancel);
+        state.cycle_confirm_action_next();
+        assert_eq!(state.confirm_action, ConfirmAction::Save);
+    }
+
+    #[test]
+    fn test_jump_to_confirm_resets_action_to_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let detected = detect_agents(dir.path());
+        let mut state = OnboardingUiState::new(detected);
+
+        state.confirm_action = ConfirmAction::Cancel;
+        assert!(state.jump_to_step_number(state.step_sequence().len()));
+        assert_eq!(state.step, OnboardingStep::Confirm);
+        assert_eq!(state.confirm_action, ConfirmAction::Save);
     }
 
     // --- post-onboarding setup side effects ---
