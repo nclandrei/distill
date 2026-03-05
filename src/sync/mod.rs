@@ -192,19 +192,21 @@ mod tests {
         assert_eq!(report.synced, 4);
         assert!(report.errors.is_empty());
 
-        // Verify Claude's file
-        let claude_file = std::fs::read_to_string(home.join(".claude/CLAUDE.md")).unwrap();
-        assert!(claude_file.contains("<!-- distill:skill:testing -->"));
-        assert!(claude_file.contains("# Testing\nWrite tests first."));
-        assert!(claude_file.contains("<!-- distill:skill:debugging -->"));
-        assert!(claude_file.contains("# Debugging\nRead the error message."));
+        // Verify Claude's per-skill files
+        let claude_testing =
+            std::fs::read_to_string(home.join(".claude/skills/testing/SKILL.md")).unwrap();
+        let claude_debugging =
+            std::fs::read_to_string(home.join(".claude/skills/debugging/SKILL.md")).unwrap();
+        assert_eq!(claude_testing, "# Testing\nWrite tests first.");
+        assert_eq!(claude_debugging, "# Debugging\nRead the error message.");
 
-        // Verify Codex's file
-        let codex_file = std::fs::read_to_string(home.join(".codex/instructions.md")).unwrap();
-        assert!(codex_file.contains("<!-- distill:skill:testing -->"));
-        assert!(codex_file.contains("# Testing\nWrite tests first."));
-        assert!(codex_file.contains("<!-- distill:skill:debugging -->"));
-        assert!(codex_file.contains("# Debugging\nRead the error message."));
+        // Verify Codex's per-skill files
+        let codex_testing =
+            std::fs::read_to_string(home.join(".codex/skills/testing/SKILL.md")).unwrap();
+        let codex_debugging =
+            std::fs::read_to_string(home.join(".codex/skills/debugging/SKILL.md")).unwrap();
+        assert_eq!(codex_testing, "# Testing\nWrite tests first.");
+        assert_eq!(codex_debugging, "# Debugging\nRead the error message.");
     }
 
     #[test]
@@ -221,21 +223,18 @@ mod tests {
             vec![Box::new(ClaudeAdapter::with_home(home.clone()))];
         sync_skills(&skills, &agents_first).unwrap();
 
-        let after_first = std::fs::read_to_string(home.join(".claude/CLAUDE.md")).unwrap();
+        let after_first =
+            std::fs::read_to_string(home.join(".claude/skills/my-skill/SKILL.md")).unwrap();
 
         let agents_second: Vec<Box<dyn Agent>> =
             vec![Box::new(ClaudeAdapter::with_home(home.clone()))];
         sync_skills(&skills, &agents_second).unwrap();
 
-        let after_second = std::fs::read_to_string(home.join(".claude/CLAUDE.md")).unwrap();
+        let after_second =
+            std::fs::read_to_string(home.join(".claude/skills/my-skill/SKILL.md")).unwrap();
 
-        // Content must not grow on the second sync
+        // Content should remain stable on repeated sync.
         assert_eq!(after_first, after_second);
-
-        // Marker appears exactly once
-        let marker = "<!-- distill:skill:my-skill -->";
-        let count = after_second.matches(marker).count();
-        assert_eq!(count, 1, "marker should appear exactly once, found {count}");
     }
 
     #[test]
@@ -292,17 +291,16 @@ mod tests {
         assert_eq!(report.synced, 4);
         assert!(report.errors.is_empty());
 
-        let claude_content = std::fs::read_to_string(home.join(".claude/CLAUDE.md")).unwrap();
-        assert!(claude_content.contains("<!-- distill:skill:tdd -->"));
-        assert!(claude_content.contains("Red, green, refactor."));
-        assert!(claude_content.contains("<!-- distill:skill:docs -->"));
-        assert!(claude_content.contains("Write docs as you go."));
+        let claude_tdd = std::fs::read_to_string(home.join(".claude/skills/tdd/SKILL.md")).unwrap();
+        let claude_docs =
+            std::fs::read_to_string(home.join(".claude/skills/docs/SKILL.md")).unwrap();
+        assert_eq!(claude_tdd, "# TDD\nRed, green, refactor.");
+        assert_eq!(claude_docs, "# Docs\nWrite docs as you go.");
 
-        let codex_content = std::fs::read_to_string(home.join(".codex/instructions.md")).unwrap();
-        assert!(codex_content.contains("<!-- distill:skill:tdd -->"));
-        assert!(codex_content.contains("Red, green, refactor."));
-        assert!(codex_content.contains("<!-- distill:skill:docs -->"));
-        assert!(codex_content.contains("Write docs as you go."));
+        let codex_tdd = std::fs::read_to_string(home.join(".codex/skills/tdd/SKILL.md")).unwrap();
+        let codex_docs = std::fs::read_to_string(home.join(".codex/skills/docs/SKILL.md")).unwrap();
+        assert_eq!(codex_tdd, "# TDD\nRed, green, refactor.");
+        assert_eq!(codex_docs, "# Docs\nWrite docs as you go.");
     }
 
     #[test]

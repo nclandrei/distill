@@ -137,7 +137,8 @@ fn read_jsonl_session(path: &std::path::Path, kind: AgentKind) -> Result<Session
 // ClaudeAdapter
 // ---------------------------------------------------------------------------
 
-/// Claude Code adapter — reads from ~/.claude/, writes skills to ~/.claude/CLAUDE.md
+/// Claude Code adapter — reads from ~/.claude/, writes skills to
+/// ~/.claude/skills/<skill-name>/SKILL.md
 pub struct ClaudeAdapter {
     pub home: PathBuf,
 }
@@ -176,19 +177,22 @@ impl Agent for ClaudeAdapter {
     }
 
     fn write_skill(&self, skill: &Skill) -> Result<()> {
-        let target = self.home.join(".claude").join("CLAUDE.md");
+        let target = self
+            .home
+            .join(".claude")
+            .join("skills")
+            .join(&skill.name)
+            .join("SKILL.md");
         // Ensure the parent directory exists
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let existing = std::fs::read_to_string(&target).unwrap_or_default();
-        let marker = format!("<!-- distill:skill:{} -->", skill.name);
-        if existing.contains(&marker) {
-            // Skill already synced — skip (idempotent)
+        if existing == skill.content {
+            // Skill already synced — skip unnecessary rewrite
             return Ok(());
         }
-        let new_content = format!("{existing}\n{marker}\n{}\n", skill.content);
-        std::fs::write(&target, new_content)?;
+        std::fs::write(&target, &skill.content)?;
         Ok(())
     }
 
@@ -201,7 +205,8 @@ impl Agent for ClaudeAdapter {
 // CodexAdapter
 // ---------------------------------------------------------------------------
 
-/// Codex adapter — reads from ~/.codex/, writes skills to ~/.codex/instructions.md
+/// Codex adapter — reads from ~/.codex/, writes skills to
+/// ~/.codex/skills/<skill-name>/SKILL.md
 pub struct CodexAdapter {
     pub home: PathBuf,
 }
@@ -240,18 +245,21 @@ impl Agent for CodexAdapter {
     }
 
     fn write_skill(&self, skill: &Skill) -> Result<()> {
-        let target = self.home.join(".codex").join("instructions.md");
+        let target = self
+            .home
+            .join(".codex")
+            .join("skills")
+            .join(&skill.name)
+            .join("SKILL.md");
         // Ensure the parent directory exists
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let existing = std::fs::read_to_string(&target).unwrap_or_default();
-        let marker = format!("<!-- distill:skill:{} -->", skill.name);
-        if existing.contains(&marker) {
+        if existing == skill.content {
             return Ok(());
         }
-        let new_content = format!("{existing}\n{marker}\n{}\n", skill.content);
-        std::fs::write(&target, new_content)?;
+        std::fs::write(&target, &skill.content)?;
         Ok(())
     }
 
@@ -325,10 +333,12 @@ mod tests {
         };
 
         adapter.write_skill(&skill).unwrap();
-        let first = std::fs::read_to_string(home.join(".claude/CLAUDE.md")).unwrap();
+        let first =
+            std::fs::read_to_string(home.join(".claude/skills/test-skill/SKILL.md")).unwrap();
 
         adapter.write_skill(&skill).unwrap();
-        let second = std::fs::read_to_string(home.join(".claude/CLAUDE.md")).unwrap();
+        let second =
+            std::fs::read_to_string(home.join(".claude/skills/test-skill/SKILL.md")).unwrap();
 
         // Idempotent: second write should not duplicate
         assert_eq!(first, second);
@@ -347,10 +357,12 @@ mod tests {
         };
 
         adapter.write_skill(&skill).unwrap();
-        let first = std::fs::read_to_string(home.join(".codex/instructions.md")).unwrap();
+        let first =
+            std::fs::read_to_string(home.join(".codex/skills/test-skill/SKILL.md")).unwrap();
 
         adapter.write_skill(&skill).unwrap();
-        let second = std::fs::read_to_string(home.join(".codex/instructions.md")).unwrap();
+        let second =
+            std::fs::read_to_string(home.join(".codex/skills/test-skill/SKILL.md")).unwrap();
 
         assert_eq!(first, second);
     }
@@ -569,8 +581,9 @@ mod tests {
             content: "created automatically".into(),
         };
         adapter.write_skill(&skill).unwrap();
-        let written = std::fs::read_to_string(home.join(".claude/CLAUDE.md")).unwrap();
-        assert!(written.contains("<!-- distill:skill:auto-dir -->"));
+        let written =
+            std::fs::read_to_string(home.join(".claude/skills/auto-dir/SKILL.md")).unwrap();
+        assert_eq!(written, "created automatically");
     }
 
     #[test]
@@ -584,11 +597,12 @@ mod tests {
             content: "created automatically".into(),
         };
         adapter.write_skill(&skill).unwrap();
-        let written = std::fs::read_to_string(home.join(".codex/instructions.md")).unwrap();
-        assert!(written.contains("<!-- distill:skill:auto-dir -->"));
+        let written =
+            std::fs::read_to_string(home.join(".codex/skills/auto-dir/SKILL.md")).unwrap();
+        assert_eq!(written, "created automatically");
     }
 
-    // --- write_skill: multiple distinct skills are all appended ---
+    // --- write_skill: multiple distinct skills are all written ---
 
     #[test]
     fn test_write_multiple_distinct_skills_appends_all() {
@@ -608,11 +622,12 @@ mod tests {
         adapter.write_skill(&skill_a).unwrap();
         adapter.write_skill(&skill_b).unwrap();
 
-        let written = std::fs::read_to_string(home.join(".claude/CLAUDE.md")).unwrap();
-        assert!(written.contains("<!-- distill:skill:skill-a -->"));
-        assert!(written.contains("Content A"));
-        assert!(written.contains("<!-- distill:skill:skill-b -->"));
-        assert!(written.contains("Content B"));
+        let written_a =
+            std::fs::read_to_string(home.join(".claude/skills/skill-a/SKILL.md")).unwrap();
+        let written_b =
+            std::fs::read_to_string(home.join(".claude/skills/skill-b/SKILL.md")).unwrap();
+        assert_eq!(written_a, "Content A");
+        assert_eq!(written_b, "Content B");
     }
 
     #[test]
@@ -633,11 +648,10 @@ mod tests {
         adapter.write_skill(&skill_a).unwrap();
         adapter.write_skill(&skill_b).unwrap();
 
-        let written = std::fs::read_to_string(home.join(".codex/instructions.md")).unwrap();
-        assert!(written.contains("<!-- distill:skill:alpha -->"));
-        assert!(written.contains("Alpha content"));
-        assert!(written.contains("<!-- distill:skill:beta -->"));
-        assert!(written.contains("Beta content"));
+        let written_a = std::fs::read_to_string(home.join(".codex/skills/alpha/SKILL.md")).unwrap();
+        let written_b = std::fs::read_to_string(home.join(".codex/skills/beta/SKILL.md")).unwrap();
+        assert_eq!(written_a, "Alpha content");
+        assert_eq!(written_b, "Beta content");
     }
 
     // --- session content is not read (agent reads files itself) ---
