@@ -294,23 +294,33 @@ pub fn send_notification(
     match pref {
         NotificationPref::None => Ok(()),
         NotificationPref::Terminal => TerminalNotifier.send(title, body, icon_arg),
-        NotificationPref::Native => {
-            let native = platform_notifier();
-            if native.is_available() {
-                native.send(title, body, icon_arg)
-            } else {
-                TerminalNotifier.send(title, body, icon_arg)
-            }
-        }
+        NotificationPref::Native => send_native_notification(title, body, icon_arg, true),
         NotificationPref::Both => {
             TerminalNotifier.send(title, body, icon_arg)?;
-            let native = platform_notifier();
-            if native.is_available() {
-                native.send(title, body, icon_arg)?;
-            }
+            send_native_notification(title, body, icon_arg, false)?;
             Ok(())
         }
     }
+}
+
+fn send_native_notification(
+    title: &str,
+    body: &str,
+    icon_path: Option<&str>,
+    fallback_to_terminal: bool,
+) -> Result<()> {
+    let native = platform_notifier();
+    if !native.is_available() {
+        if fallback_to_terminal {
+            TerminalNotifier.send(title, body, icon_path)?;
+        }
+        return Ok(());
+    }
+
+    if let Err(err) = native.send(title, body, icon_path) {
+        eprintln!("Warning: native notification failed: {err}");
+    }
+    Ok(())
 }
 
 /// Convenience function called at the end of `distill scan`.
@@ -451,6 +461,18 @@ mod tests {
             "3 new proposal(s) ready. Run 'distill review'.",
             Some("/tmp/icon.png"),
         );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_send_native_notification_is_best_effort_without_terminal_fallback() {
+        let result = send_native_notification("distill", "message", None, false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_send_native_notification_is_best_effort_with_terminal_fallback() {
+        let result = send_native_notification("distill", "message", None, true);
         assert!(result.is_ok());
     }
 
