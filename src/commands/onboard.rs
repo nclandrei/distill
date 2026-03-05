@@ -6,7 +6,7 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use crate::agents::AgentKind;
-use crate::config::{AgentEntry, Config, Interval, NotificationPref, ShellType};
+use crate::config::{AgentEntry, Config, Interval, NotificationPref, ShellType, SyncAgentsConfig};
 use crate::onboard;
 use crate::shell::{self, HookStatus};
 
@@ -191,6 +191,7 @@ fn default_config_from_detected(detected: &[(AgentKind, bool)]) -> Config {
         shell: ShellType::detect(),
         notifications: NotificationPref::Both,
         notification_icon: None,
+        sync_agents: SyncAgentsConfig::default(),
     }
 }
 
@@ -202,6 +203,7 @@ fn config_from_spec(spec: &OnboardingSpec) -> Config {
         shell: spec.shell.clone(),
         notifications: spec.notifications.clone(),
         notification_icon: spec.notification_icon.clone(),
+        sync_agents: SyncAgentsConfig::default(),
     }
 }
 
@@ -473,6 +475,7 @@ mod tests {
             shell: ShellType::Zsh,
             notifications: NotificationPref::Both,
             notification_icon: None,
+            sync_agents: SyncAgentsConfig::default(),
         };
         config.save_to(&config_path).unwrap();
 
@@ -498,6 +501,7 @@ mod tests {
             shell: ShellType::Zsh,
             notifications: NotificationPref::Both,
             notification_icon: None,
+            sync_agents: SyncAgentsConfig::default(),
         };
         config.save_to(&config_path).unwrap();
 

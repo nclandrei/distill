@@ -4,5 +4,7 @@ pub mod notify;
 pub mod onboard;
 pub mod review;
 pub mod scan;
+pub mod scheduled_run;
 pub mod status;
+pub mod sync_agents;
 pub mod watch;

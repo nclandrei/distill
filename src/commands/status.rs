@@ -129,7 +129,9 @@ pub fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AgentEntry, Config, Interval, NotificationPref, ShellType};
+    use crate::config::{
+        AgentEntry, Config, Interval, NotificationPref, ShellType, SyncAgentsConfig,
+    };
 
     // ── helpers ──────────────────────────────────────────────────────────────
 
@@ -343,6 +345,7 @@ mod tests {
                 name: "codex".into(),
                 enabled: true,
             }],
+            sync_agents: SyncAgentsConfig::default(),
         };
 
         let info = collect_status_info(&config, base).unwrap();

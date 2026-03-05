@@ -24,6 +24,13 @@ pub struct Evidence {
     pub pattern: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum ProposalTarget {
+    Skill { name: String },
+    File { path: String },
+}
+
 /// YAML frontmatter of a proposal
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProposalFrontmatter {
@@ -31,9 +38,25 @@ pub struct ProposalFrontmatter {
     pub proposal_type: ProposalType,
     pub confidence: Confidence,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<ProposalTarget>,
+    // Backward-compatible legacy field. New proposals should populate `target`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_skill: Option<String>,
+    #[serde(default)]
     pub evidence: Vec<Evidence>,
     pub created: DateTime<Utc>,
+}
+
+impl ProposalFrontmatter {
+    /// Return a normalized proposal target with backward compatibility for
+    /// legacy `target_skill` frontmatter.
+    pub fn resolved_target(&self) -> Option<ProposalTarget> {
+        self.target.clone().or_else(|| {
+            self.target_skill
+                .as_ref()
+                .map(|name| ProposalTarget::Skill { name: name.clone() })
+        })
+    }
 }
 
 /// A full proposal: frontmatter + markdown body
@@ -90,6 +113,7 @@ mod tests {
             frontmatter: ProposalFrontmatter {
                 proposal_type: ProposalType::New,
                 confidence: Confidence::High,
+                target: None,
                 target_skill: None,
                 evidence: vec![Evidence {
                     session: "~/.claude/sessions/abc123.jsonl".into(),
@@ -153,5 +177,54 @@ mod tests {
         let yaml = serde_yaml::to_string(&fm).unwrap();
         let parsed: ProposalFrontmatter = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(fm, parsed);
+    }
+
+    #[test]
+    fn test_frontmatter_roundtrip_with_file_target() {
+        let proposal = Proposal {
+            frontmatter: ProposalFrontmatter {
+                proposal_type: ProposalType::Edit,
+                confidence: Confidence::Medium,
+                target: Some(ProposalTarget::File {
+                    path: "/tmp/project/AGENTS.md".to_string(),
+                }),
+                target_skill: None,
+                evidence: vec![],
+                created: DateTime::parse_from_rfc3339("2026-03-05T10:00:00Z")
+                    .unwrap()
+                    .to_utc(),
+            },
+            body: "# AGENTS\n\nupdated".to_string(),
+            filename: None,
+        };
+
+        let md = proposal.to_markdown().unwrap();
+        let parsed = Proposal::from_markdown(&md).unwrap();
+        assert_eq!(parsed.frontmatter.target, proposal.frontmatter.target);
+        assert_eq!(parsed.frontmatter.target_skill, None);
+    }
+
+    #[test]
+    fn test_legacy_target_skill_resolves_to_skill_target() {
+        let proposal = Proposal {
+            frontmatter: ProposalFrontmatter {
+                proposal_type: ProposalType::Improve,
+                confidence: Confidence::High,
+                target: None,
+                target_skill: Some("git-workflow".to_string()),
+                evidence: vec![],
+                created: DateTime::parse_from_rfc3339("2026-03-05T10:00:00Z")
+                    .unwrap()
+                    .to_utc(),
+            },
+            body: "# Git Workflow".to_string(),
+            filename: None,
+        };
+        assert_eq!(
+            proposal.frontmatter.resolved_target(),
+            Some(ProposalTarget::Skill {
+                name: "git-workflow".to_string()
+            })
+        );
     }
 }

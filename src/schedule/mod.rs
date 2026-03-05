@@ -113,7 +113,7 @@ impl Scheduler for LaunchdScheduler {
     <key>ProgramArguments</key>
     <array>
         <string>{exe}</string>
-        <string>scan</string>
+        <string>scheduled-run</string>
     </array>
     <key>StartInterval</key>
     <integer>{start_interval}</integer>
@@ -251,7 +251,7 @@ impl Scheduler for SystemdScheduler {
              \n\
              [Service]\n\
              Type=oneshot\n\
-             ExecStart={exe} scan\n\
+             ExecStart={exe} scheduled-run\n\
              \n\
              [Install]\n\
              WantedBy=default.target\n"
@@ -569,8 +569,8 @@ mod tests {
             "service missing ExecStart directive"
         );
         assert!(
-            content.contains("scan"),
-            "service ExecStart missing 'scan' subcommand"
+            content.contains("scheduled-run"),
+            "service ExecStart missing 'scheduled-run' subcommand"
         );
         assert!(
             content.contains("[Service]"),

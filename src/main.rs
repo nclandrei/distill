@@ -10,6 +10,7 @@ mod scanner;
 mod schedule;
 mod shell;
 mod sync;
+mod sync_agents;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -89,6 +90,17 @@ For non-interactive automation, use:
 You can pass one or more --config <path> values to include extra MCP config files.
 ";
 
+const SYNC_AGENTS_LONG_ABOUT: &str = "\
+Propose AGENTS.md drift updates from git + session evidence.
+
+Examples:
+  distill sync-agents --projects /abs/repo --dry-run
+  distill sync-agents --projects /abs/repo1,/abs/repo2 --save-projects
+  distill sync-agents --all-configured
+  distill sync-agents --list-configured
+
+`--since` accepts YYYY-MM-DD or RFC3339.
+";
 #[derive(Parser)]
 #[command(
     name = "distill",
@@ -175,6 +187,40 @@ enum Commands {
         #[arg(long)]
         check: bool,
     },
+    /// Propose AGENTS.md updates for selected projects
+    #[command(long_about = SYNC_AGENTS_LONG_ABOUT)]
+    SyncAgents {
+        /// Comma-separated absolute project paths
+        #[arg(
+            long,
+            value_name = "PATHS",
+            value_delimiter = ',',
+            num_args = 1..,
+            conflicts_with = "all_configured"
+        )]
+        projects: Vec<String>,
+        /// Use projects saved in config sync_agents.projects
+        #[arg(long, conflicts_with = "projects")]
+        all_configured: bool,
+        /// Persist --projects into config sync_agents.projects
+        #[arg(long, requires = "projects")]
+        save_projects: bool,
+        /// Print configured sync-agents project allowlist and exit
+        #[arg(
+            long,
+            conflicts_with_all = ["projects", "all_configured", "save_projects", "dry_run", "since"]
+        )]
+        list_configured: bool,
+        /// Preview proposals without writing files or watermark
+        #[arg(long)]
+        dry_run: bool,
+        /// Evidence window start timestamp (YYYY-MM-DD or RFC3339)
+        #[arg(long, value_name = "DATE_OR_RFC3339")]
+        since: Option<String>,
+    },
+    /// Internal: run scheduled scan then sync-agents for configured projects
+    #[command(hide = true)]
+    ScheduledRun,
 }
 
 #[derive(Subcommand)]
@@ -348,6 +394,26 @@ fn main() -> anyhow::Result<()> {
         }
         Some(Commands::Notify { check }) => {
             commands::notify::run(check)?;
+        }
+        Some(Commands::SyncAgents {
+            projects,
+            all_configured,
+            save_projects,
+            list_configured,
+            dry_run,
+            since,
+        }) => {
+            commands::sync_agents::run(
+                &projects,
+                all_configured,
+                save_projects,
+                list_configured,
+                dry_run,
+                since.as_deref(),
+            )?;
+        }
+        Some(Commands::ScheduledRun) => {
+            commands::scheduled_run::run()?;
         }
     }
 

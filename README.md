@@ -70,10 +70,17 @@ Notes:
 | `distill convert apply <server> [--mode auto|hybrid|replace] [--yes] [--json]` | Generate a clean skill (and optionally update MCP config for replace mode) |
 | `distill convert verify <server> [--json] [--config <path>]` | Verify generated skill coverage against live MCP tools |
 | `distill dedupe [--dry-run]` | Detect duplicate global skills and propose removals |
+| `distill sync-agents ...` | Propose `AGENTS.md` updates from project evidence |
 | `distill status` | Show config, pending proposals, accepted skills |
 | `distill watch --install` | Install scheduled scan (launchd/systemd) |
 | `distill watch --uninstall` | Remove scheduled scan |
 | `distill notify --check` | Check for pending proposals (used by shell hook) |
+
+`sync-agents` examples:
+- `distill sync-agents --projects /abs/repo --dry-run`
+- `distill sync-agents --projects /abs/repo1,/abs/repo2 --save-projects`
+- `distill sync-agents --all-configured`
+- `distill sync-agents --list-configured`
 
 ## Notifications
 

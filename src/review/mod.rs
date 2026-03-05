@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use crate::agents::{AgentKind, from_kind};
 use crate::config::Config;
-use crate::proposals::{Proposal, ProposalType};
+use crate::proposals::{Proposal, ProposalTarget, ProposalType};
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -54,6 +54,7 @@ pub struct ReviewSummary {
     pub accepted: usize,
     pub rejected: usize,
     pub skipped: usize,
+    pub accepted_skill_targets: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -151,13 +152,33 @@ fn normalize_target_skill_filename(target: &str) -> String {
 }
 
 fn skill_filename_for(proposal: &Proposal) -> String {
-    if let Some(target) = &proposal.frontmatter.target_skill {
-        normalize_target_skill_filename(target)
+    if let Some(ProposalTarget::Skill { name }) = proposal.frontmatter.resolved_target() {
+        normalize_target_skill_filename(&name)
     } else if let Some(filename) = &proposal.filename {
         filename.clone()
     } else {
         format!("skill-{}.md", Utc::now().timestamp())
     }
+}
+
+fn validate_file_target_path(path: &Path) -> Result<()> {
+    if !path.is_absolute() {
+        anyhow::bail!("File target path must be absolute: {}", path.display());
+    }
+    if path.file_name().and_then(|s| s.to_str()) != Some("AGENTS.md") {
+        anyhow::bail!(
+            "File target basename must be AGENTS.md (got: {})",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn proposal_affects_skill(proposal: &Proposal) -> bool {
+    !matches!(
+        proposal.frontmatter.resolved_target(),
+        Some(ProposalTarget::File { .. })
+    )
 }
 
 /// Accept a proposal: write its body as a skill, log the decision, and delete the proposal file.
@@ -174,29 +195,59 @@ pub fn accept_proposal(
 
     match proposal.frontmatter.proposal_type {
         ProposalType::Remove => {
-            let target_skill = proposal
+            match proposal
                 .frontmatter
-                .target_skill
-                .as_deref()
-                .context("Remove proposal is missing target_skill")?;
-            let skill_file = normalize_target_skill_filename(target_skill);
-            let skill_path = skills_dir.join(&skill_file);
-            if skill_path.exists() {
-                fs::remove_file(&skill_path)
-                    .with_context(|| format!("Failed to remove skill {}", skill_path.display()))?;
+                .resolved_target()
+                .context("Remove proposal is missing target information")?
+            {
+                ProposalTarget::Skill { name } => {
+                    let skill_file = normalize_target_skill_filename(&name);
+                    let skill_path = skills_dir.join(&skill_file);
+                    if skill_path.exists() {
+                        fs::remove_file(&skill_path).with_context(|| {
+                            format!("Failed to remove skill {}", skill_path.display())
+                        })?;
+                    }
+                }
+                ProposalTarget::File { path } => {
+                    let target_path = Path::new(&path);
+                    validate_file_target_path(target_path)?;
+                    if target_path.exists() {
+                        fs::remove_file(target_path).with_context(|| {
+                            format!("Failed to remove target file {}", target_path.display())
+                        })?;
+                    }
+                }
             }
         }
         ProposalType::New | ProposalType::Improve | ProposalType::Edit => {
-            let skill_file = skill_filename_for(proposal);
-            fs::create_dir_all(skills_dir).with_context(|| {
-                format!(
-                    "Failed to create skills directory: {}",
-                    skills_dir.display()
-                )
-            })?;
-            let skill_path = skills_dir.join(&skill_file);
-            fs::write(&skill_path, &proposal.body)
-                .with_context(|| format!("Failed to write skill to {}", skill_path.display()))?;
+            if let Some(ProposalTarget::File { path }) = proposal.frontmatter.resolved_target() {
+                let target_path = Path::new(&path);
+                validate_file_target_path(target_path)?;
+                if let Some(parent) = target_path.parent() {
+                    fs::create_dir_all(parent).with_context(|| {
+                        format!(
+                            "Failed to create target parent directory: {}",
+                            parent.display()
+                        )
+                    })?;
+                }
+                fs::write(target_path, &proposal.body).with_context(|| {
+                    format!("Failed to write target file {}", target_path.display())
+                })?;
+            } else {
+                let skill_file = skill_filename_for(proposal);
+                fs::create_dir_all(skills_dir).with_context(|| {
+                    format!(
+                        "Failed to create skills directory: {}",
+                        skills_dir.display()
+                    )
+                })?;
+                let skill_path = skills_dir.join(&skill_file);
+                fs::write(&skill_path, &proposal.body).with_context(|| {
+                    format!("Failed to write skill to {}", skill_path.display())
+                })?;
+            }
         }
     }
 
@@ -262,12 +313,16 @@ pub fn run_review(
     let mut accepted = 0usize;
     let mut rejected = 0usize;
     let mut skipped = 0usize;
+    let mut accepted_skill_targets = 0usize;
 
     for (proposal, decision) in proposals.iter().zip(decisions.iter()) {
         match decision {
             ReviewDecision::Accept => {
                 accept_proposal(proposal, skills_dir, history_dir, proposals_dir)?;
                 accepted += 1;
+                if proposal_affects_skill(proposal) {
+                    accepted_skill_targets += 1;
+                }
             }
             ReviewDecision::Reject => {
                 reject_proposal(proposal, history_dir, proposals_dir)?;
@@ -283,6 +338,7 @@ pub fn run_review(
         accepted,
         rejected,
         skipped,
+        accepted_skill_targets,
     })
 }
 
@@ -297,6 +353,7 @@ struct ReviewUiState {
     accepted: usize,
     rejected: usize,
     skipped: usize,
+    accepted_skill_targets: usize,
     focused_action: ReviewAction,
     confirmation_focus: ConfirmationActionFocus,
     status_line: String,
@@ -426,6 +483,7 @@ impl ReviewUiState {
             accepted: 0,
             rejected: 0,
             skipped: 0,
+            accepted_skill_targets: 0,
             focused_action: ReviewAction::Accept,
             confirmation_focus: ConfirmationActionFocus::Confirm,
             status_line: "Select a proposal and choose an action.".to_string(),
@@ -706,11 +764,11 @@ fn proposal_details_text(proposal: &Proposal, skills_dir: &Path) -> String {
         Confidence::Medium => "medium",
         Confidence::Low => "low",
     };
-    let target = proposal
-        .frontmatter
-        .target_skill
-        .as_deref()
-        .unwrap_or("(new skill)");
+    let target = match proposal.frontmatter.resolved_target() {
+        Some(ProposalTarget::Skill { name }) => format!("skill:{name}"),
+        Some(ProposalTarget::File { path }) => format!("file:{path}"),
+        None => "(new skill)".to_string(),
+    };
 
     let mut text = format!(
         "File: {filename}\nType: {proposal_type}\nConfidence: {confidence}\nTarget: {target}\nCreated: {}\n",
@@ -726,19 +784,33 @@ fn proposal_details_text(proposal: &Proposal, skills_dir: &Path) -> String {
 
     if proposal.frontmatter.proposal_type == ProposalType::Remove {
         text.push_str("\nWarning:\n");
-        if let Some(target_skill) = proposal.frontmatter.target_skill.as_deref() {
-            let skill_file = normalize_target_skill_filename(target_skill);
-            let skill_path = skills_dir.join(&skill_file);
-            if !skill_path.exists() {
-                text.push_str(&format!(
-                    "- Target skill file not found: {}\n",
-                    skill_path.display()
-                ));
-            } else {
-                text.push_str("- This will permanently delete the target skill file.\n");
+        match proposal.frontmatter.resolved_target() {
+            Some(ProposalTarget::Skill { name }) => {
+                let skill_file = normalize_target_skill_filename(&name);
+                let skill_path = skills_dir.join(&skill_file);
+                if !skill_path.exists() {
+                    text.push_str(&format!(
+                        "- Target skill file not found: {}\n",
+                        skill_path.display()
+                    ));
+                } else {
+                    text.push_str("- This will permanently delete the target skill file.\n");
+                }
             }
-        } else {
-            text.push_str("- Remove proposal is missing target_skill and will fail.\n");
+            Some(ProposalTarget::File { path }) => {
+                let target_path = Path::new(&path);
+                if !target_path.exists() {
+                    text.push_str(&format!(
+                        "- Target file not found: {}\n",
+                        target_path.display()
+                    ));
+                } else {
+                    text.push_str("- This will permanently delete the target file.\n");
+                }
+            }
+            None => {
+                text.push_str("- Remove proposal is missing target and will fail.\n");
+            }
         }
     }
 
@@ -1062,6 +1134,9 @@ fn execute_intent(
                 match accept_proposal(&proposal, skills_dir, history_dir, proposals_dir) {
                     Ok(_) => {
                         state.accepted += 1;
+                        if proposal_affects_skill(&proposal) {
+                            state.accepted_skill_targets += 1;
+                        }
                         state.remove_selected();
                         state.status_line = format!("Accepted {name}");
                     }
@@ -1149,6 +1224,9 @@ fn execute_intent(
                 match accept_proposal(&proposal, skills_dir, history_dir, proposals_dir) {
                     Ok(_) => {
                         state.accepted += 1;
+                        if proposal_affects_skill(&proposal) {
+                            state.accepted_skill_targets += 1;
+                        }
                         accepted_now += 1;
                     }
                     Err(_) => failed.push(proposal),
@@ -1203,6 +1281,7 @@ pub fn run_review_interactive(
             accepted: 0,
             rejected: 0,
             skipped: 0,
+            accepted_skill_targets: 0,
         });
     }
 
@@ -1319,7 +1398,7 @@ pub fn run_review_interactive(
     println!("  Skipped  : {}", state.skipped);
 
     // Sync accepted skills to all configured agents.
-    if state.accepted > 0 {
+    if state.accepted_skill_targets > 0 {
         println!();
         println!("Syncing skills to agents...");
         match sync_after_review(skills_dir) {
@@ -1344,6 +1423,7 @@ pub fn run_review_interactive(
         accepted: state.accepted,
         rejected: state.rejected,
         skipped: state.skipped,
+        accepted_skill_targets: state.accepted_skill_targets,
     })
 }
 
@@ -1354,7 +1434,9 @@ pub fn run_review_interactive(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proposals::{Confidence, Evidence, ProposalFrontmatter, ProposalType};
+    use crate::proposals::{
+        Confidence, Evidence, ProposalFrontmatter, ProposalTarget, ProposalType,
+    };
 
     // -----------------------------------------------------------------------
     // Helpers
@@ -1366,6 +1448,9 @@ mod tests {
             frontmatter: ProposalFrontmatter {
                 proposal_type: ProposalType::New,
                 confidence: Confidence::High,
+                target: target_skill.map(|s| ProposalTarget::Skill {
+                    name: s.to_string(),
+                }),
                 target_skill: target_skill.map(|s| s.to_string()),
                 evidence: vec![Evidence {
                     session: "test-session.jsonl".into(),

@@ -4,7 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
-use crate::proposals::{Confidence, Evidence, Proposal, ProposalFrontmatter, ProposalType};
+use crate::proposals::{
+    Confidence, Evidence, Proposal, ProposalFrontmatter, ProposalTarget, ProposalType,
+};
 
 #[derive(Debug, Clone)]
 struct SkillFile {
@@ -236,8 +238,8 @@ fn pending_remove_targets(proposals_dir: &Path) -> Result<BTreeSet<String>> {
         if proposal.frontmatter.proposal_type != ProposalType::Remove {
             continue;
         }
-        if let Some(target) = proposal.frontmatter.target_skill.as_deref() {
-            targets.insert(normalize_target_key(target));
+        if let Some(ProposalTarget::Skill { name }) = proposal.frontmatter.resolved_target() {
+            targets.insert(normalize_target_key(&name));
         }
     }
     Ok(targets)
@@ -279,7 +281,10 @@ fn build_remove_proposal(duplicate: &SkillFile, canonical: &SkillFile) -> Propos
         frontmatter: ProposalFrontmatter {
             proposal_type: ProposalType::Remove,
             confidence: Confidence::High,
-            target_skill: Some(duplicate.filename.clone()),
+            target: Some(ProposalTarget::Skill {
+                name: duplicate.filename.clone(),
+            }),
+            target_skill: None,
             evidence: vec![Evidence {
                 session: "internal://distill-dedupe".to_string(),
                 pattern: format!(
@@ -373,7 +378,8 @@ mod tests {
         assert_eq!(files.len(), 1);
         let proposal_content = std::fs::read_to_string(files[0].path()).unwrap();
         assert!(proposal_content.contains("type: remove"));
-        assert!(proposal_content.contains("target_skill: dup.md"));
+        assert!(proposal_content.contains("kind: skill"));
+        assert!(proposal_content.contains("name: dup.md"));
     }
 
     #[test]
@@ -390,7 +396,10 @@ mod tests {
             frontmatter: ProposalFrontmatter {
                 proposal_type: ProposalType::Remove,
                 confidence: Confidence::High,
-                target_skill: Some("dup.md".to_string()),
+                target: Some(ProposalTarget::Skill {
+                    name: "dup.md".to_string(),
+                }),
+                target_skill: None,
                 evidence: vec![],
                 created: Utc::now(),
             },
@@ -431,7 +440,12 @@ mod tests {
 
         let proposal = build_remove_proposal(&duplicate, &canonical);
         assert_eq!(proposal.frontmatter.proposal_type, ProposalType::Remove);
-        assert_eq!(proposal.frontmatter.target_skill.as_deref(), Some("dup.md"));
+        assert_eq!(
+            proposal.frontmatter.resolved_target(),
+            Some(ProposalTarget::Skill {
+                name: "dup.md".to_string()
+            })
+        );
         assert!(proposal.body.contains("canonical.md"));
     }
 

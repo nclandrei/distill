@@ -8,7 +8,7 @@ use std::path::Path;
 
 use crate::agents::{Agent, AgentKind, from_kind};
 use crate::config::Config;
-use crate::proposals::{Confidence, Evidence, Proposal, ProposalType};
+use crate::proposals::{Confidence, Evidence, Proposal, ProposalTarget, ProposalType};
 use crate::review::{self, ReviewDecision};
 
 const JSON_STDIO_SENTINEL: &str = "-";
@@ -28,7 +28,9 @@ struct ReviewProposalSpec {
     #[serde(rename = "type")]
     proposal_type: ProposalType,
     confidence: Confidence,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target: Option<ProposalTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     target_skill: Option<String>,
     created: DateTime<Utc>,
     #[serde(default)]
@@ -165,7 +167,7 @@ fn apply_review_json(
         );
     }
 
-    if summary.accepted > 0 {
+    if summary.accepted_skill_targets > 0 {
         println!();
         println!("Syncing skills to agents...");
         match sync_after_review(skills_dir) {
@@ -217,7 +219,8 @@ fn proposal_to_spec(proposal: &Proposal) -> ReviewProposalSpec {
             .unwrap_or_else(|| "(unknown)".to_string()),
         proposal_type: proposal.frontmatter.proposal_type.clone(),
         confidence: proposal.frontmatter.confidence.clone(),
-        target_skill: proposal.frontmatter.target_skill.clone(),
+        target: proposal.frontmatter.resolved_target(),
+        target_skill: None,
         created: proposal.frontmatter.created,
         evidence: proposal.frontmatter.evidence.clone(),
         body: proposal.body.clone(),
@@ -295,7 +298,7 @@ fn display_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proposals::{ProposalFrontmatter, ProposalType};
+    use crate::proposals::{ProposalFrontmatter, ProposalTarget, ProposalType};
 
     #[test]
     fn test_decision_to_review() {
@@ -316,6 +319,7 @@ mod tests {
             filename: "same.md".to_string(),
             proposal_type: ProposalType::New,
             confidence: Confidence::High,
+            target: None,
             target_skill: None,
             created: Utc::now(),
             evidence: vec![],
@@ -336,7 +340,10 @@ mod tests {
             frontmatter: ProposalFrontmatter {
                 proposal_type: ProposalType::Improve,
                 confidence: Confidence::Medium,
-                target_skill: Some("git-workflow".to_string()),
+                target: Some(ProposalTarget::Skill {
+                    name: "git-workflow".to_string(),
+                }),
+                target_skill: None,
                 evidence: vec![],
                 created: Utc::now(),
             },
@@ -347,6 +354,12 @@ mod tests {
         assert_eq!(spec.filename, "skill.md");
         assert_eq!(spec.proposal_type, ProposalType::Improve);
         assert_eq!(spec.confidence, Confidence::Medium);
-        assert_eq!(spec.target_skill.as_deref(), Some("git-workflow"));
+        assert_eq!(
+            spec.target,
+            Some(ProposalTarget::Skill {
+                name: "git-workflow".to_string()
+            })
+        );
+        assert_eq!(spec.target_skill, None);
     }
 }

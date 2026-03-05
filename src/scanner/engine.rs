@@ -7,7 +7,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::agents::{Agent, Session, Skill};
 use crate::config::Config;
-use crate::proposals::{Confidence, Evidence, Proposal, ProposalFrontmatter, ProposalType};
+use crate::proposals::{
+    Confidence, Evidence, Proposal, ProposalFrontmatter, ProposalTarget, ProposalType,
+};
 use crate::scanner::reader::{self, LastScan};
 
 /// JSON Schema for the proposal response.  Passed to agents via
@@ -727,7 +729,8 @@ pub fn parse_response(raw: &str) -> Result<Vec<Proposal>> {
             frontmatter: ProposalFrontmatter {
                 proposal_type,
                 confidence,
-                target_skill: rp.target_skill,
+                target: rp.target_skill.map(|name| ProposalTarget::Skill { name }),
+                target_skill: None,
                 evidence,
                 created: Utc::now(),
             },
@@ -774,7 +777,7 @@ mod tests {
         assert_eq!(proposals.len(), 1);
         assert_eq!(proposals[0].frontmatter.proposal_type, ProposalType::New);
         assert_eq!(proposals[0].frontmatter.confidence, Confidence::High);
-        assert!(proposals[0].frontmatter.target_skill.is_none());
+        assert!(proposals[0].frontmatter.resolved_target().is_none());
         assert_eq!(proposals[0].frontmatter.evidence.len(), 1);
         assert!(proposals[0].body.contains("Git Rebase Workflow"));
     }
@@ -821,8 +824,10 @@ mod tests {
             ProposalType::Improve
         );
         assert_eq!(
-            proposals[1].frontmatter.target_skill.as_deref(),
-            Some("existing-skill.md")
+            proposals[1].frontmatter.resolved_target(),
+            Some(ProposalTarget::Skill {
+                name: "existing-skill.md".to_string()
+            })
         );
         assert_eq!(proposals[2].frontmatter.proposal_type, ProposalType::Remove);
     }
@@ -1039,6 +1044,7 @@ mod tests {
             frontmatter: ProposalFrontmatter {
                 proposal_type: ProposalType::New,
                 confidence: Confidence::High,
+                target: None,
                 target_skill: None,
                 evidence: vec![],
                 created: Utc::now(),

@@ -87,6 +87,12 @@ pub struct AgentEntry {
     pub enabled: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct SyncAgentsConfig {
+    #[serde(default)]
+    pub projects: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Config {
     pub agents: Vec<AgentEntry>,
@@ -98,6 +104,8 @@ pub struct Config {
     pub notifications: NotificationPref,
     #[serde(default)]
     pub notification_icon: Option<String>,
+    #[serde(default)]
+    pub sync_agents: SyncAgentsConfig,
 }
 
 impl Default for Config {
@@ -118,6 +126,7 @@ impl Default for Config {
             shell: ShellType::Zsh,
             notifications: NotificationPref::default(),
             notification_icon: None,
+            sync_agents: SyncAgentsConfig::default(),
         }
     }
 }
@@ -151,6 +160,11 @@ impl Config {
     /// Returns the last-scan.json path
     pub fn last_scan_path() -> PathBuf {
         Self::base_dir().join("last-scan.json")
+    }
+
+    /// Returns the last-sync-agents.json path
+    pub fn last_sync_agents_path() -> PathBuf {
+        Self::base_dir().join("last-sync-agents.json")
     }
 
     /// Check if config file exists
@@ -229,6 +243,7 @@ mod tests {
         assert_eq!(config.scan_interval, Interval::Weekly);
         assert_eq!(config.notifications, NotificationPref::Both);
         assert_eq!(config.notification_icon, None);
+        assert!(config.sync_agents.projects.is_empty());
         assert_eq!(config.proposal_agent, "claude");
         assert_eq!(config.agents.len(), 2);
     }
@@ -254,6 +269,9 @@ proposal_agent: claude
 shell: bash
 notifications: terminal
 notification_icon: /tmp/distill.png
+sync_agents:
+  projects:
+    - /tmp/project-a
 "#;
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.scan_interval, Interval::Daily);
@@ -261,6 +279,10 @@ notification_icon: /tmp/distill.png
         assert_eq!(
             config.notification_icon.as_deref(),
             Some("/tmp/distill.png")
+        );
+        assert_eq!(
+            config.sync_agents.projects,
+            vec!["/tmp/project-a".to_string()]
         );
         assert_eq!(config.shell, ShellType::Bash);
         assert!(!config.agents[1].enabled);
@@ -278,6 +300,21 @@ notification_icon: /tmp/distill.png
         let contents = fs::read_to_string(&config_path).unwrap();
         let loaded: Config = serde_yaml::from_str(&contents).unwrap();
         assert_eq!(config, loaded);
+    }
+
+    #[test]
+    fn test_config_deserialize_without_sync_agents_defaults_empty() {
+        let yaml = r#"
+agents:
+  - name: claude
+    enabled: true
+scan_interval: weekly
+proposal_agent: claude
+shell: zsh
+notifications: both
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.sync_agents.projects.is_empty());
     }
 
     // ── new tests ─────────────────────────────────────────────────────────────
@@ -423,6 +460,9 @@ shell: zsh
             shell: ShellType::Fish,
             notifications: NotificationPref::Native,
             notification_icon: Some("/tmp/distill-icon.png".into()),
+            sync_agents: SyncAgentsConfig {
+                projects: vec!["/tmp/project-a".into(), "/tmp/project-b".into()],
+            },
         };
 
         config.save_to(&path).unwrap();
@@ -435,6 +475,10 @@ shell: zsh
         assert_eq!(
             loaded.notification_icon.as_deref(),
             Some("/tmp/distill-icon.png")
+        );
+        assert_eq!(
+            loaded.sync_agents.projects,
+            vec!["/tmp/project-a".to_string(), "/tmp/project-b".to_string()]
         );
         assert!(!loaded.agents[1].enabled);
     }

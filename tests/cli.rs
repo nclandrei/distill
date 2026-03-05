@@ -1,6 +1,7 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
+use std::path::PathBuf;
 
 /// Build a distill command with HOME set to a temp dir so tests
 /// don't interact with the real ~/.distill config.
@@ -10,6 +11,39 @@ fn distill_cmd(home: &std::path::Path) -> Command {
     cmd.env("DISTILL_SYSTEMCTL_PATH", "true");
     cmd.env("DISTILL_LAUNCHCTL_PATH", "true");
     cmd
+}
+
+fn write_minimal_config(home: &std::path::Path, proposal_agent: &str) {
+    let distill_dir = home.join(".distill");
+    std::fs::create_dir_all(&distill_dir).unwrap();
+    std::fs::write(
+        distill_dir.join("config.yaml"),
+        format!(
+            "agents:\n  - name: claude\n    enabled: false\n  - name: codex\n    enabled: false\nscan_interval: weekly\nproposal_agent: {proposal_agent}\nshell: zsh\nnotifications: both\n"
+        ),
+    )
+    .unwrap();
+}
+
+fn init_git_repo(path: &std::path::Path) {
+    std::fs::create_dir_all(path).unwrap();
+    let status = std::process::Command::new("git")
+        .arg("init")
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(status.success(), "failed to init git repo");
+}
+
+fn write_agent_script(path: &std::path::Path, body: &str) {
+    std::fs::write(path, body).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms).unwrap();
+    }
 }
 
 #[test]
@@ -470,7 +504,122 @@ fn test_dedupe_writes_remove_proposal() {
 
     let content = std::fs::read_to_string(proposals[0].path()).unwrap();
     assert!(content.contains("type: remove"));
-    assert!(content.contains("target_skill: beta.md"));
+    assert!(content.contains("kind: skill"));
+    assert!(content.contains("name: beta.md"));
+}
+
+#[test]
+fn test_sync_agents_list_configured_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    write_minimal_config(dir.path(), "true");
+
+    distill_cmd(dir.path())
+        .args(["sync-agents", "--list-configured"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "No configured sync-agents projects",
+        ));
+}
+
+#[test]
+fn test_sync_agents_all_configured_errors_when_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    write_minimal_config(dir.path(), "true");
+
+    distill_cmd(dir.path())
+        .args(["sync-agents", "--all-configured"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "No configured sync-agents projects",
+        ));
+}
+
+#[test]
+fn test_sync_agents_save_projects_persists_allowlist() {
+    let dir = tempfile::tempdir().unwrap();
+    let script_path = dir.path().join("fake-agent.sh");
+    write_agent_script(
+        &script_path,
+        "#!/bin/sh\ncat > /dev/null\nprintf '%s' '{\"proposals\":[]}'\n",
+    );
+    write_minimal_config(dir.path(), script_path.to_string_lossy().as_ref());
+
+    let project = dir.path().join("repo-one");
+    init_git_repo(&project);
+
+    distill_cmd(dir.path())
+        .args(["sync-agents", "--projects"])
+        .arg(project.display().to_string())
+        .arg("--save-projects")
+        .arg("--dry-run")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Saved 1 project(s)"));
+
+    let config = std::fs::read_to_string(dir.path().join(".distill").join("config.yaml")).unwrap();
+    assert!(config.contains("sync_agents:"));
+    assert!(config.contains(project.display().to_string().as_str()));
+}
+
+#[test]
+fn test_sync_agents_dry_run_does_not_write_proposals() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("repo-two");
+    init_git_repo(&project);
+
+    let agents_path = project.join("AGENTS.md");
+    let script_path = dir.path().join("fake-agent-proposal.sh");
+    write_agent_script(
+        &script_path,
+        &format!(
+            "#!/bin/sh\ncat > /dev/null\nprintf '%s' '{{\"proposals\":[{{\"type\":\"edit\",\"confidence\":\"high\",\"target\":{{\"kind\":\"file\",\"path\":\"{}\"}},\"evidence\":[{{\"session\":\"s1\",\"pattern\":\"p1\"}}],\"body\":\"# AGENTS\\\\n\\\\nUpdated\"}}]}}'\n",
+            agents_path.display()
+        ),
+    );
+    write_minimal_config(dir.path(), script_path.to_string_lossy().as_ref());
+
+    distill_cmd(dir.path())
+        .args(["sync-agents", "--projects"])
+        .arg(project.display().to_string())
+        .arg("--dry-run")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Dry run"));
+
+    let proposals_dir = dir.path().join(".distill").join("proposals");
+    assert!(!proposals_dir.exists() || std::fs::read_dir(proposals_dir).unwrap().next().is_none());
+}
+
+#[test]
+fn test_watch_install_writes_scheduled_run_command() {
+    let dir = tempfile::tempdir().unwrap();
+    write_minimal_config(dir.path(), "true");
+
+    distill_cmd(dir.path())
+        .args(["watch", "--install"])
+        .assert()
+        .success();
+
+    let scheduler_path: PathBuf = if cfg!(target_os = "linux") {
+        dir.path()
+            .join(".config")
+            .join("systemd")
+            .join("user")
+            .join("distill.service")
+    } else {
+        dir.path()
+            .join("Library")
+            .join("LaunchAgents")
+            .join("com.distill.agent.plist")
+    };
+
+    let content = std::fs::read_to_string(&scheduler_path).unwrap();
+    assert!(
+        content.contains("scheduled-run"),
+        "scheduler should run scheduled-run command"
+    );
 }
 
 #[test]

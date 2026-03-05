@@ -22,7 +22,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::agents::{AgentKind, from_kind};
-use crate::config::{AgentEntry, Config, Interval, NotificationPref, ShellType};
+use crate::config::{AgentEntry, Config, Interval, NotificationPref, ShellType, SyncAgentsConfig};
 use crate::schedule;
 use crate::shell::{self, HookStatus};
 
@@ -88,6 +88,7 @@ pub fn build_config(answers: &OnboardingAnswers) -> Config {
         shell: answers.shell.clone(),
         notifications: answers.notifications.clone(),
         notification_icon: None,
+        sync_agents: SyncAgentsConfig::default(),
     }
 }
 
