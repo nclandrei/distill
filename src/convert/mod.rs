@@ -295,6 +295,14 @@ pub fn apply(
     })
 }
 
+#[derive(Debug, Clone)]
+struct CapabilityPlaybook {
+    title: String,
+    goal: String,
+    tool_hints: Vec<String>,
+    steps: Vec<String>,
+}
+
 fn render_skill_markdown(plan: &ConvertPlan) -> String {
     let mut out = String::new();
     out.push_str(&format!("# MCP Workflow: {}\n\n", plan.server.name.trim()));
@@ -335,16 +343,24 @@ fn render_skill_markdown(plan: &ConvertPlan) -> String {
         plan.server.recommendation
     ));
 
-    out.push_str("## Workflow\n\n");
-    out.push_str("1. Start by confirming the MCP server is available in your runtime.\n");
-    out.push_str(
-        "2. Use the MCP server for concrete execution and side effects, not this markdown alone.\n",
-    );
-    out.push_str("3. Follow the plan actions below as the default orchestration sequence:\n");
-    for action in &plan.actions {
-        out.push_str(&format!("   - {}\n", action));
+    out.push_str("## Capability Playbooks\n\n");
+    let playbooks = capability_playbooks(&plan.server, &plan.actions);
+    for (idx, playbook) in playbooks.iter().enumerate() {
+        out.push_str(&format!("### {}. {}\n\n", idx + 1, playbook.title));
+        out.push_str(&format!("Goal: {}\n\n", playbook.goal));
+        if !playbook.tool_hints.is_empty() {
+            out.push_str("Tool hints:\n");
+            for hint in &playbook.tool_hints {
+                out.push_str(&format!("- `{}`\n", hint));
+            }
+            out.push('\n');
+        }
+        out.push_str("Steps:\n");
+        for (step_idx, step) in playbook.steps.iter().enumerate() {
+            out.push_str(&format!("{}. {}\n", step_idx + 1, step));
+        }
+        out.push('\n');
     }
-    out.push('\n');
 
     out.push_str("## Guardrails\n\n");
     out.push_str(
@@ -358,15 +374,137 @@ fn render_skill_markdown(plan: &ConvertPlan) -> String {
             out.push_str(&format!("- {}\n", warning));
         }
     }
-    out.push('\n');
-
-    out.push_str("## Mode\n\n");
-    out.push_str(&format!(
-        "This skill was generated from `distill convert plan` with effective mode `{}`.\n",
-        plan.effective_mode
-    ));
 
     out
+}
+
+fn capability_playbooks(
+    server: &MCPServerProfile,
+    fallback_actions: &[String],
+) -> Vec<CapabilityPlaybook> {
+    let name = server.name.to_lowercase();
+    let purpose = server.purpose.clone();
+
+    if name.contains("xcodebuildmcp") || name.contains("xcode") {
+        return vec![
+            CapabilityPlaybook {
+                title: "Build and launch in simulator".to_string(),
+                goal: "Compile and run iOS code paths quickly during iteration.".to_string(),
+                tool_hints: vec![
+                    "mcp__XcodeBuildMCP__build_run_sim".to_string(),
+                    "mcp__XcodeBuildMCP__launch_app_sim".to_string(),
+                    "mcp__XcodeBuildMCP__list_sims".to_string(),
+                ],
+                steps: vec![
+                    "List available simulators and choose target device/OS.".to_string(),
+                    "Build and run in simulator with project defaults.".to_string(),
+                    "Capture immediate app behavior and regressions before deeper debugging."
+                        .to_string(),
+                ],
+            },
+            CapabilityPlaybook {
+                title: "UI interaction and visual checks".to_string(),
+                goal: "Drive screens deterministically and confirm UI state.".to_string(),
+                tool_hints: vec![
+                    "mcp__XcodeBuildMCP__snapshot_ui".to_string(),
+                    "mcp__XcodeBuildMCP__tap".to_string(),
+                    "mcp__XcodeBuildMCP__type_text".to_string(),
+                    "mcp__XcodeBuildMCP__screenshot".to_string(),
+                ],
+                steps: vec![
+                    "Take a UI snapshot to identify accessible targets.".to_string(),
+                    "Trigger interactions by accessibility id/label first, coordinates last."
+                        .to_string(),
+                    "Capture screenshots for before/after evidence of state transitions."
+                        .to_string(),
+                ],
+            },
+            CapabilityPlaybook {
+                title: "Attach debugger and inspect failures".to_string(),
+                goal: "Investigate crashes, stuck flows, and state mismatches.".to_string(),
+                tool_hints: vec![
+                    "mcp__XcodeBuildMCP__debug_attach_sim".to_string(),
+                    "mcp__XcodeBuildMCP__debug_stack".to_string(),
+                    "mcp__XcodeBuildMCP__debug_variables".to_string(),
+                    "mcp__XcodeBuildMCP__debug_lldb_command".to_string(),
+                ],
+                steps: vec![
+                    "Attach debugger to running app process.".to_string(),
+                    "Collect backtrace and inspect frame variables at failure point.".to_string(),
+                    "Apply fix and rerun the same flow to confirm closure.".to_string(),
+                ],
+            },
+        ];
+    }
+
+    if name.contains("chrome-devtools") || name.contains("devtools") || name.contains("chrome") {
+        return vec![
+            CapabilityPlaybook {
+                title: "Navigate and inspect page state".to_string(),
+                goal: "Understand DOM/accessibility state before automation actions.".to_string(),
+                tool_hints: vec![
+                    "mcp__chrome-devtools__navigate_page".to_string(),
+                    "mcp__chrome-devtools__take_snapshot".to_string(),
+                    "mcp__chrome-devtools__click".to_string(),
+                    "mcp__chrome-devtools__fill".to_string(),
+                ],
+                steps: vec![
+                    "Open target URL and wait for primary content.".to_string(),
+                    "Capture a text snapshot and locate stable element identifiers.".to_string(),
+                    "Perform interactions and re-snapshot to validate results.".to_string(),
+                ],
+            },
+            CapabilityPlaybook {
+                title: "Trace network and console failures".to_string(),
+                goal: "Root-cause runtime errors and bad responses.".to_string(),
+                tool_hints: vec![
+                    "mcp__chrome-devtools__list_network_requests".to_string(),
+                    "mcp__chrome-devtools__get_network_request".to_string(),
+                    "mcp__chrome-devtools__list_console_messages".to_string(),
+                    "mcp__chrome-devtools__get_console_message".to_string(),
+                ],
+                steps: vec![
+                    "List recent network requests and inspect failing responses.".to_string(),
+                    "Collect console errors and correlate them with failing endpoints.".to_string(),
+                    "Re-run interaction after fix to verify errors disappear.".to_string(),
+                ],
+            },
+            CapabilityPlaybook {
+                title: "Run performance diagnostics".to_string(),
+                goal: "Capture page performance issues and actionable insights.".to_string(),
+                tool_hints: vec![
+                    "mcp__chrome-devtools__performance_start_trace".to_string(),
+                    "mcp__chrome-devtools__performance_stop_trace".to_string(),
+                    "mcp__chrome-devtools__performance_analyze_insight".to_string(),
+                ],
+                steps: vec![
+                    "Start trace recording for the target journey.".to_string(),
+                    "Stop trace and inspect key insights (latency, LCP breakdown, etc.)."
+                        .to_string(),
+                    "Prioritize fixes and rerun trace to measure impact.".to_string(),
+                ],
+            },
+        ];
+    }
+
+    let mut steps = vec![
+        "Confirm MCP server availability and auth prerequisites.".to_string(),
+        format!(
+            "Use MCP tools to execute {} tasks with explicit checks.",
+            purpose
+        ),
+    ];
+    steps.extend(fallback_actions.iter().cloned());
+
+    vec![CapabilityPlaybook {
+        title: "General orchestration".to_string(),
+        goal: format!(
+            "Perform {} with reproducible sequencing.",
+            purpose.to_lowercase()
+        ),
+        tool_hints: vec![],
+        steps,
+    }]
 }
 
 fn remove_server_from_config(path: &Path, server_name: &str) -> Result<(Option<PathBuf>, bool)> {
@@ -1190,6 +1328,10 @@ args = ["-y", "chrome-devtools-mcp@latest"]
 
         let updated = std::fs::read_to_string(&config_path).unwrap();
         assert!(!updated.contains("playwright"));
+
+        let skill = std::fs::read_to_string(&result.skill_path).unwrap();
+        assert!(skill.contains("## Capability Playbooks"));
+        assert!(!skill.contains("## Mode"));
     }
 
     #[test]
