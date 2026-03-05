@@ -1,6 +1,6 @@
 // Onboarding flow — interactive first-run setup.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use crossterm::{
     cursor,
     event::{self, Event, KeyCode, KeyEventKind},
@@ -1285,7 +1285,7 @@ pub fn run_interactive() -> Result<()> {
         println!("For one-shot automation, run:");
         println!("  distill onboard --write-json onboarding.json");
         println!("  distill onboard --apply-json onboarding.json");
-        return Ok(());
+        bail!("Onboarding requires an interactive terminal (or JSON mode).");
     }
 
     let detected = detect_agents(&home);

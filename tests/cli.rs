@@ -17,8 +17,9 @@ fn test_no_args_without_config() {
     let dir = tempfile::tempdir().unwrap();
     distill_cmd(dir.path())
         .assert()
-        .success()
-        .stdout(predicate::str::contains("Welcome to distill"));
+        .failure()
+        .stdout(predicate::str::contains("Welcome to distill"))
+        .stderr(predicate::str::contains("interactive terminal"));
 }
 
 #[test]
