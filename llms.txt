@@ -5,6 +5,7 @@
 - Onboarding: `distill onboard --write-json onboarding.json` then `distill onboard --apply-json onboarding.json`
 - Review: `distill review --write-json review.json` then `distill review --apply-json review.json`
 - MCP convert discovery/plan:
+  - `distill convert apply <server-id|server-name> --mode auto|hybrid|replace [--yes] --json [--config <path>]`
   - `distill convert list --json`
   - `distill convert inspect <server-id|server-name> --json [--config <path>]`
   - `distill convert plan <server-id|server-name> --mode auto|hybrid|replace --json [--config <path>]`
@@ -13,7 +14,7 @@
 
 ## Other useful commands
 - `distill scan --now` to generate proposal files immediately
-- `distill convert list|inspect|plan` to analyze MCP servers before conversion
+- `distill convert list|inspect|plan|apply` to analyze and convert MCP servers
 - `distill status` to inspect config, pending proposals, and last scan
 - `distill watch --install|--uninstall` to manage scheduled scans
 - `distill notify --check` for shell-hook notification checks

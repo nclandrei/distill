@@ -543,3 +543,125 @@ fn test_convert_inspect_and_plan_json() {
         .stdout(predicate::str::contains("\"blocked\": true"))
         .stdout(predicate::str::contains("\"effective_mode\": \"replace\""));
 }
+
+#[test]
+fn test_convert_list_detects_claude_settings_by_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let claude_dir = dir.path().join(".claude");
+    std::fs::create_dir_all(&claude_dir).unwrap();
+    std::fs::write(
+        claude_dir.join("settings.json"),
+        r#"{
+  "mcpServers": {
+    "XcodeBuildMCP": {
+      "command": "npx",
+      "args": ["-y", "xcodebuildmcp@latest", "mcp"]
+    }
+  }
+}"#,
+    )
+    .unwrap();
+
+    distill_cmd(dir.path())
+        .args(["convert", "list", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"name\": \"XcodeBuildMCP\""));
+}
+
+#[test]
+fn test_convert_apply_hybrid_writes_skill_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("mcp.json");
+    std::fs::write(
+        &config_path,
+        r#"{
+  "mcpServers": {
+    "XcodeBuildMCP": {
+      "command": "npx",
+      "args": ["-y", "xcodebuildmcp@latest", "mcp"]
+    }
+  }
+}"#,
+    )
+    .unwrap();
+
+    distill_cmd(dir.path())
+        .args([
+            "convert",
+            "apply",
+            "XcodeBuildMCP",
+            "--mode",
+            "auto",
+            "--json",
+            "--config",
+        ])
+        .arg(&config_path)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"effective_mode\": \"hybrid\""))
+        .stdout(predicate::str::contains("\"mcp_config_updated\": false"));
+
+    assert!(
+        dir.path()
+            .join(".distill")
+            .join("skills")
+            .join("mcp-xcodebuildmcp.md")
+            .exists(),
+        "hybrid apply should write a generated skill file"
+    );
+}
+
+#[test]
+fn test_convert_apply_replace_removes_server_and_creates_backup() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("settings.json");
+    std::fs::write(
+        &config_path,
+        r#"{
+  "mcpServers": {
+    "playwright": {
+      "command": "npx",
+      "description": "Read-only browser helpers",
+      "readOnly": true
+    }
+  }
+}"#,
+    )
+    .unwrap();
+
+    distill_cmd(dir.path())
+        .args([
+            "convert",
+            "apply",
+            "playwright",
+            "--mode",
+            "replace",
+            "--yes",
+            "--json",
+            "--config",
+        ])
+        .arg(&config_path)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"mcp_config_updated\": true"))
+        .stdout(predicate::str::contains("\"effective_mode\": \"replace\""));
+
+    let updated = std::fs::read_to_string(&config_path).unwrap();
+    assert!(
+        !updated.contains("playwright"),
+        "replace mode should remove the server from MCP config"
+    );
+
+    let backup_count = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("settings.json.bak-")
+        })
+        .count();
+    assert_eq!(backup_count, 1, "replace mode should create one backup");
+}

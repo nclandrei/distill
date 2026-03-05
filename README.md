@@ -66,6 +66,7 @@ Notes:
 | `distill convert list [--json] [--config <path>]` | Discover MCP servers from known config locations |
 | `distill convert inspect <server> [--json] [--config <path>]` | Inspect one MCP server profile and recommendation |
 | `distill convert plan <server> [--mode auto|hybrid|replace] [--json]` | Generate a conversion plan with safety gates |
+| `distill convert apply <server> [--mode auto|hybrid|replace] [--yes] [--json]` | Generate a skill from MCP metadata (and optionally update MCP config for replace mode) |
 | `distill dedupe [--dry-run]` | Detect duplicate global skills and propose removals |
 | `distill status` | Show config, pending proposals, accepted skills |
 | `distill watch --install` | Install scheduled scan (launchd/systemd) |
@@ -145,10 +146,12 @@ Both onboarding and review JSON flags accept `-` as path:
 distill convert list --json
 distill convert inspect custom-1:playwright --json --config /path/to/mcp.json
 distill convert plan custom-1:playwright --mode auto --json --config /path/to/mcp.json
+distill convert apply custom-1:playwright --mode auto --json --config /path/to/mcp.json
 ```
 
 Behavior notes:
-- Discovery reads default MCP locations (`~/.claude/mcp.json`, `~/.codex/mcp.json`, project-level variants, and shared config path) plus any `--config` paths.
+- Discovery reads default MCP locations (`~/.claude/mcp.json`, `~/.claude/settings.json`, `~/.codex/mcp.json`, `~/.codex/config.toml`, project-level variants, and shared config paths) plus any `--config` paths.
 - `inspect` accepts either a full server id (`source:name`) or a unique server name.
 - `plan --mode replace` is blocked automatically when the server is not a safe replacement candidate.
-- This phase is planning-only; no MCP config is modified yet.
+- `apply` writes generated skills into `~/.distill/skills/` by default.
+- `apply --mode replace` requires `--yes`, creates a backup of the MCP config, and removes the target server entry when safe.

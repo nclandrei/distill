@@ -1,7 +1,9 @@
 use anyhow::{Result, bail};
 use std::path::PathBuf;
 
-use crate::convert::{self, ConvertInventory, ConvertPlan, MCPServerProfile, PlanMode};
+use crate::convert::{
+    self, ConvertApplyResult, ConvertInventory, ConvertPlan, MCPServerProfile, PlanMode,
+};
 
 pub fn parse_mode(raw: &str) -> Result<PlanMode> {
     match raw.trim().to_ascii_lowercase().as_str() {
@@ -53,6 +55,26 @@ pub fn run_plan(
     Ok(())
 }
 
+pub fn run_apply(
+    selector: &str,
+    mode_raw: &str,
+    yes: bool,
+    json: bool,
+    config_paths: &[PathBuf],
+    output_dir: Option<PathBuf>,
+) -> Result<()> {
+    let mode = parse_mode(mode_raw)?;
+    let result = convert::apply(selector, mode, yes, config_paths, output_dir)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+
+    print_apply_result(&result);
+    Ok(())
+}
+
 pub fn run_overview(config_paths: &[PathBuf]) -> Result<()> {
     let inventory = convert::discover(config_paths)?;
     print_inventory(&inventory);
@@ -60,6 +82,7 @@ pub fn run_overview(config_paths: &[PathBuf]) -> Result<()> {
     println!("Next steps:");
     println!("  distill convert inspect <server-id|server-name>");
     println!("  distill convert plan <server-id|server-name> --mode auto|hybrid|replace");
+    println!("  distill convert apply <server-id|server-name> --mode auto|hybrid|replace");
     println!("Use --json for one-shot agent automation.");
     Ok(())
 }
@@ -156,6 +179,24 @@ fn print_plan(plan: &ConvertPlan, dry_run: bool) {
         println!(
             "Apply step is blocked for this plan. Use hybrid mode or adjust server scope before replace."
         );
+    }
+}
+
+fn print_apply_result(result: &ConvertApplyResult) {
+    println!("Applied conversion for {}", result.server.id);
+    println!("  requested_mode    : {}", result.requested_mode);
+    println!("  effective_mode    : {}", result.effective_mode);
+    println!("  skill_path        : {}", result.skill_path.display());
+    println!("  mcp_config_updated: {}", result.mcp_config_updated);
+    if let Some(backup) = &result.mcp_config_backup {
+        println!("  mcp_config_backup : {}", backup.display());
+    }
+
+    if !result.notes.is_empty() {
+        println!("Notes:");
+        for note in &result.notes {
+            println!("  - {note}");
+        }
     }
 }
 

@@ -5,6 +5,8 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use crate::config::Config;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum PermissionLevel {
@@ -96,6 +98,18 @@ pub struct ConvertPlan {
     pub blocked: bool,
     pub actions: Vec<String>,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ConvertApplyResult {
+    pub generated_at: DateTime<Utc>,
+    pub server: MCPServerProfile,
+    pub requested_mode: PlanMode,
+    pub effective_mode: PlanMode,
+    pub skill_path: PathBuf,
+    pub mcp_config_backup: Option<PathBuf>,
+    pub mcp_config_updated: bool,
+    pub notes: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -208,6 +222,295 @@ pub fn plan(
     })
 }
 
+pub fn apply(
+    server_selector: &str,
+    requested_mode: PlanMode,
+    confirm_replace: bool,
+    additional_paths: &[PathBuf],
+    output_dir: Option<PathBuf>,
+) -> Result<ConvertApplyResult> {
+    let conversion_plan = plan(server_selector, requested_mode, additional_paths)?;
+
+    if conversion_plan.blocked {
+        bail!(
+            "Conversion plan is blocked for '{}': {}",
+            conversion_plan.server.id,
+            conversion_plan.warnings.join(" | ")
+        );
+    }
+
+    if conversion_plan.effective_mode == PlanMode::Replace && !confirm_replace {
+        bail!("Replace mode requires explicit confirmation via --yes.");
+    }
+
+    let skills_dir = output_dir.unwrap_or_else(Config::skills_dir);
+    std::fs::create_dir_all(&skills_dir)
+        .with_context(|| format!("Failed to create skills directory {}", skills_dir.display()))?;
+
+    let skill_filename = format!("mcp-{}.md", sanitize_slug(&conversion_plan.server.name));
+    let skill_path = skills_dir.join(skill_filename);
+    std::fs::write(&skill_path, render_skill_markdown(&conversion_plan)).with_context(|| {
+        format!(
+            "Failed to write converted skill file {}",
+            skill_path.display()
+        )
+    })?;
+
+    let mut notes =
+        vec!["Generated a workflow skill from MCP metadata and conversion policy.".to_string()];
+    let mut mcp_config_backup = None;
+    let mut mcp_config_updated = false;
+
+    match conversion_plan.effective_mode {
+        PlanMode::Hybrid => {
+            notes.push("MCP config left unchanged (hybrid mode).".to_string());
+        }
+        PlanMode::Replace => {
+            let (backup, updated) = remove_server_from_config(
+                &conversion_plan.server.source_path,
+                &conversion_plan.server.name,
+            )?;
+            mcp_config_backup = backup;
+            mcp_config_updated = updated;
+            if updated {
+                notes.push("Removed MCP server entry from config (replace mode).".to_string());
+            } else {
+                notes.push(
+                    "No MCP server entry was removed (server key not found in config).".to_string(),
+                );
+            }
+        }
+        PlanMode::Auto => unreachable!("effective mode resolves away from auto"),
+    }
+
+    Ok(ConvertApplyResult {
+        generated_at: Utc::now(),
+        server: conversion_plan.server,
+        requested_mode,
+        effective_mode: conversion_plan.effective_mode,
+        skill_path,
+        mcp_config_backup,
+        mcp_config_updated,
+        notes,
+    })
+}
+
+fn render_skill_markdown(plan: &ConvertPlan) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("# MCP Workflow: {}\n\n", plan.server.name.trim()));
+    out.push_str("## Purpose\n\n");
+    out.push_str(&format!("{}\n\n", plan.server.purpose));
+
+    out.push_str("## Server Metadata\n\n");
+    out.push_str(&format!(
+        "- Source: `{}`\n",
+        plan.server.source_path.display()
+    ));
+    out.push_str(&format!(
+        "- Command: `{}`\n",
+        plan.server
+            .command
+            .clone()
+            .unwrap_or_else(|| "(none)".to_string())
+    ));
+    if plan.server.args.is_empty() {
+        out.push_str("- Args: `(none)`\n");
+    } else {
+        out.push_str(&format!("- Args: `{}`\n", plan.server.args.join(" ")));
+    }
+    if plan.server.env_keys.is_empty() {
+        out.push_str("- Required env keys: `(none)`\n");
+    } else {
+        out.push_str(&format!(
+            "- Required env keys: `{}`\n",
+            plan.server.env_keys.join(", ")
+        ));
+    }
+    out.push_str(&format!(
+        "- Inferred permission: `{}`\n",
+        plan.server.inferred_permission
+    ));
+    out.push_str(&format!(
+        "- Conversion recommendation: `{}`\n\n",
+        plan.server.recommendation
+    ));
+
+    out.push_str("## Workflow\n\n");
+    out.push_str("1. Start by confirming the MCP server is available in your runtime.\n");
+    out.push_str(
+        "2. Use the MCP server for concrete execution and side effects, not this markdown alone.\n",
+    );
+    out.push_str("3. Follow the plan actions below as the default orchestration sequence:\n");
+    for action in &plan.actions {
+        out.push_str(&format!("   - {}\n", action));
+    }
+    out.push('\n');
+
+    out.push_str("## Guardrails\n\n");
+    out.push_str(
+        "- Keep explicit user confirmation before destructive or production-impacting steps.\n",
+    );
+    out.push_str(
+        "- When behavior is unclear, inspect tool schemas or run a dry-run/check command first.\n",
+    );
+    if !plan.warnings.is_empty() {
+        for warning in &plan.warnings {
+            out.push_str(&format!("- {}\n", warning));
+        }
+    }
+    out.push('\n');
+
+    out.push_str("## Mode\n\n");
+    out.push_str(&format!(
+        "This skill was generated from `distill convert plan` with effective mode `{}`.\n",
+        plan.effective_mode
+    ));
+
+    out
+}
+
+fn remove_server_from_config(path: &Path, server_name: &str) -> Result<(Option<PathBuf>, bool)> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read config {}", path.display()))?;
+
+    if let Ok(mut root) = serde_json::from_str::<Value>(&raw) {
+        let removed = remove_server_from_json(&mut root, server_name);
+        if !removed {
+            return Ok((None, false));
+        }
+
+        let backup = backup_file(path)?;
+        let body = serde_json::to_string_pretty(&root)
+            .context("Failed to serialize updated JSON MCP config")?;
+        std::fs::write(path, format!("{body}\n"))
+            .with_context(|| format!("Failed to write config {}", path.display()))?;
+        return Ok((Some(backup), true));
+    }
+
+    if let Ok(mut root) = toml::from_str::<toml::Value>(&raw) {
+        let removed = remove_server_from_toml(&mut root, server_name);
+        if !removed {
+            return Ok((None, false));
+        }
+
+        let backup = backup_file(path)?;
+        let body =
+            toml::to_string_pretty(&root).context("Failed to serialize updated TOML MCP config")?;
+        std::fs::write(path, body)
+            .with_context(|| format!("Failed to write config {}", path.display()))?;
+        return Ok((Some(backup), true));
+    }
+
+    bail!(
+        "Failed to parse {} as JSON or TOML for replace mode update.",
+        path.display()
+    )
+}
+
+fn remove_server_from_json(root: &mut Value, server_name: &str) -> bool {
+    let mut removed = false;
+
+    if let Some(obj) = root.get_mut("mcpServers").and_then(Value::as_object_mut) {
+        removed |= obj.remove(server_name).is_some();
+    }
+    if let Some(obj) = root.get_mut("mcp_servers").and_then(Value::as_object_mut) {
+        removed |= obj.remove(server_name).is_some();
+    }
+    if let Some(obj) = root.get_mut("servers").and_then(Value::as_object_mut) {
+        removed |= obj.remove(server_name).is_some();
+    }
+    if let Some(obj) = root
+        .get_mut("amp.mcpServers")
+        .and_then(Value::as_object_mut)
+    {
+        removed |= obj.remove(server_name).is_some();
+    }
+
+    if let Some(amp) = root.get_mut("amp").and_then(Value::as_object_mut)
+        && let Some(obj) = amp.get_mut("mcpServers").and_then(Value::as_object_mut)
+    {
+        removed |= obj.remove(server_name).is_some();
+    }
+
+    if let Some(obj) = root.as_object_mut() {
+        let should_remove = obj.get(server_name).is_some_and(likely_server_object);
+        if should_remove {
+            removed |= obj.remove(server_name).is_some();
+        }
+    }
+
+    removed
+}
+
+fn remove_server_from_toml(root: &mut toml::Value, server_name: &str) -> bool {
+    let mut removed = false;
+
+    if let Some(table) = root.as_table_mut() {
+        if let Some(mcp_servers) = table
+            .get_mut("mcp_servers")
+            .and_then(toml::Value::as_table_mut)
+        {
+            removed |= mcp_servers.remove(server_name).is_some();
+        }
+
+        if let Some(amp_mcp) = table
+            .get_mut("amp.mcpServers")
+            .and_then(toml::Value::as_table_mut)
+        {
+            removed |= amp_mcp.remove(server_name).is_some();
+        }
+
+        if let Some(amp) = table.get_mut("amp").and_then(toml::Value::as_table_mut)
+            && let Some(mcp) = amp
+                .get_mut("mcpServers")
+                .and_then(toml::Value::as_table_mut)
+        {
+            removed |= mcp.remove(server_name).is_some();
+        }
+    }
+
+    removed
+}
+
+fn backup_file(path: &Path) -> Result<PathBuf> {
+    let filename = path
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or("mcp-config")
+        .to_string();
+    let backup_name = format!("{}.bak-{}", filename, Utc::now().format("%Y%m%d-%H%M%S"));
+    let backup_path = path.with_file_name(backup_name);
+    std::fs::copy(path, &backup_path).with_context(|| {
+        format!(
+            "Failed to create backup from {} to {}",
+            path.display(),
+            backup_path.display()
+        )
+    })?;
+    Ok(backup_path)
+}
+
+fn sanitize_slug(input: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = false;
+    for ch in input.chars() {
+        let lower = ch.to_ascii_lowercase();
+        if lower.is_ascii_alphanumeric() {
+            out.push(lower);
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    let trimmed = out.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        "mcp-server".to_string()
+    } else {
+        trimmed
+    }
+}
+
 fn resolve_server(servers: &[MCPServerProfile], server_selector: &str) -> Result<MCPServerProfile> {
     let selector = server_selector.trim();
     if selector.is_empty() {
@@ -263,8 +566,7 @@ fn discover_from_sources(sources: &[ConfigSource]) -> Result<ConvertInventory> {
 
         let raw = std::fs::read_to_string(&source.path)
             .with_context(|| format!("Failed to read {}", source.path.display()))?;
-        let root: Value = serde_json::from_str(&raw)
-            .with_context(|| format!("Failed to parse JSON in {}", source.path.display()))?;
+        let root = parse_source_root(&raw, &source.path)?;
 
         for (name, entry) in extract_server_entries(&root) {
             let Some(obj) = entry.as_object() else {
@@ -368,27 +670,63 @@ fn discover_from_sources(sources: &[ConfigSource]) -> Result<ConvertInventory> {
     })
 }
 
+fn parse_source_root(raw: &str, path: &Path) -> Result<Value> {
+    if let Ok(root) = serde_json::from_str::<Value>(raw) {
+        return Ok(root);
+    }
+
+    if let Ok(toml_root) = toml::from_str::<toml::Value>(raw) {
+        return serde_json::to_value(toml_root)
+            .with_context(|| format!("Failed to convert TOML in {}", path.display()));
+    }
+
+    bail!(
+        "Failed to parse {} as JSON or TOML MCP config.",
+        path.display()
+    )
+}
+
 fn default_sources(home: &Path, cwd: &Path, additional_paths: &[PathBuf]) -> Vec<ConfigSource> {
     let mut sources = vec![
         ConfigSource {
-            label: "claude-global".to_string(),
+            label: "claude-global-json".to_string(),
             path: home.join(".claude").join("mcp.json"),
         },
         ConfigSource {
-            label: "claude-project".to_string(),
+            label: "claude-global-settings".to_string(),
+            path: home.join(".claude").join("settings.json"),
+        },
+        ConfigSource {
+            label: "claude-project-json".to_string(),
             path: cwd.join(".claude").join("mcp.json"),
         },
         ConfigSource {
-            label: "codex-global".to_string(),
+            label: "claude-project-settings".to_string(),
+            path: cwd.join(".claude").join("settings.json"),
+        },
+        ConfigSource {
+            label: "codex-global-json".to_string(),
             path: home.join(".codex").join("mcp.json"),
         },
         ConfigSource {
-            label: "codex-project".to_string(),
+            label: "codex-global-toml".to_string(),
+            path: home.join(".codex").join("config.toml"),
+        },
+        ConfigSource {
+            label: "codex-project-json".to_string(),
             path: cwd.join(".codex").join("mcp.json"),
+        },
+        ConfigSource {
+            label: "codex-project-toml".to_string(),
+            path: cwd.join(".codex").join("config.toml"),
         },
         ConfigSource {
             label: "shared-global".to_string(),
             path: home.join(".config").join("mcp").join("servers.json"),
+        },
+        ConfigSource {
+            label: "amp-settings".to_string(),
+            path: home.join(".config").join("amp").join("settings.json"),
         },
     ];
 
@@ -418,9 +756,21 @@ fn extract_server_entries(root: &Value) -> Vec<(String, Value)> {
     if let Some(obj) = root.get("mcpServers").and_then(Value::as_object) {
         return obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     }
+    if let Some(obj) = root.get("mcp_servers").and_then(Value::as_object) {
+        return obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    }
     if let Some(obj) = root.get("servers").and_then(Value::as_object) {
         return obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     }
+    if let Some(obj) = root.get("amp.mcpServers").and_then(Value::as_object) {
+        return obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    }
+    if let Some(amp_obj) = root.get("amp").and_then(Value::as_object)
+        && let Some(obj) = amp_obj.get("mcpServers").and_then(Value::as_object)
+    {
+        return obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    }
+
     if let Some(obj) = root.as_object() {
         return obj
             .iter()
@@ -428,6 +778,7 @@ fn extract_server_entries(root: &Value) -> Vec<(String, Value)> {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
     }
+
     Vec::new()
 }
 
@@ -529,6 +880,12 @@ fn infer_purpose(
     if contains_any(&corpus, &["playwright", "browser", "puppeteer", "selenium"]) {
         return "Browser automation and interactive web workflows".to_string();
     }
+    if contains_any(&corpus, &["xcode", "simulator", "ios", "xcodebuildmcp"]) {
+        return "Xcode build, simulator, and iOS debug workflows".to_string();
+    }
+    if contains_any(&corpus, &["chrome-devtools", "devtools", "chrome"]) {
+        return "Browser inspection and debugging workflows".to_string();
+    }
     if contains_any(
         &corpus,
         &["jira", "linear", "github", "gitlab", "issue", "pr"],
@@ -580,8 +937,25 @@ fn infer_permission(
         "shutdown",
     ];
     let write = [
-        "write", "create", "update", "insert", "upsert", "apply", "deploy", "commit", "push",
-        "exec", "execute", "mutation", "admin",
+        "write",
+        "create",
+        "update",
+        "insert",
+        "upsert",
+        "apply",
+        "deploy",
+        "commit",
+        "push",
+        "exec",
+        "execute",
+        "mutation",
+        "admin",
+        "xcodebuildmcp",
+        "xcode",
+        "simulator",
+        "debug",
+        "chrome-devtools",
+        "devtools",
     ];
     let read = [
         "read", "list", "get", "search", "query", "fetch", "inspect", "browse",
@@ -690,6 +1064,19 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_source_root_supports_toml() {
+        let raw = r#"
+[mcp_servers.chrome-devtools]
+command = "npx"
+args = ["-y", "chrome-devtools-mcp@latest"]
+"#;
+        let root = parse_source_root(raw, Path::new("config.toml")).unwrap();
+        let entries = extract_server_entries(&root);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "chrome-devtools");
+    }
+
+    #[test]
     fn test_recommend_conversion_keeps_remote_url_servers() {
         let (recommendation, reason) = recommend_conversion(
             PermissionLevel::ReadOnly,
@@ -767,5 +1154,71 @@ mod tests {
         let err = inspect("shared", &[one, two]).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("ambiguous"));
+    }
+
+    #[test]
+    fn test_apply_replace_writes_skill_and_updates_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("settings.json");
+        let skills_dir = dir.path().join("skills");
+        std::fs::write(
+            &config_path,
+            r#"{
+  "mcpServers": {
+    "playwright": {
+      "command": "npx",
+      "description": "Read list",
+      "readOnly": true
+    }
+  }
+}"#,
+        )
+        .unwrap();
+
+        let result = apply(
+            "playwright",
+            PlanMode::Replace,
+            true,
+            &[config_path.clone()],
+            Some(skills_dir.clone()),
+        )
+        .unwrap();
+
+        assert!(result.skill_path.exists());
+        assert!(result.mcp_config_updated);
+        assert!(result.mcp_config_backup.is_some());
+
+        let updated = std::fs::read_to_string(&config_path).unwrap();
+        assert!(!updated.contains("playwright"));
+    }
+
+    #[test]
+    fn test_apply_replace_requires_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("settings.json");
+        std::fs::write(
+            &config_path,
+            r#"{
+  "mcpServers": {
+    "playwright": {
+      "command": "npx",
+      "description": "Read list",
+      "readOnly": true
+    }
+  }
+}"#,
+        )
+        .unwrap();
+
+        let err = apply(
+            "playwright",
+            PlanMode::Replace,
+            false,
+            &[config_path],
+            Some(dir.path().join("skills")),
+        )
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains("--yes"));
     }
 }

@@ -76,6 +76,7 @@ For non-interactive automation, use:
   distill convert list --json
   distill convert inspect <server> --json
   distill convert plan <server> --mode auto|hybrid|replace --json
+  distill convert apply <server> --mode auto|hybrid|replace --yes --json
 
 You can pass one or more --config <path> values to include extra MCP config files.
 ";
@@ -190,6 +191,26 @@ enum ConvertCommands {
         #[arg(long = "config", value_name = "PATH")]
         config: Vec<PathBuf>,
     },
+    /// Apply a conversion plan and generate a skill file
+    Apply {
+        /// Server id (source:name) or unique server name
+        server: String,
+        /// Conversion mode (auto resolves from recommendation)
+        #[arg(long, default_value = "auto", value_parser = ["auto", "hybrid", "replace"])]
+        mode: String,
+        /// Required confirmation for replace mode
+        #[arg(long)]
+        yes: bool,
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+        /// Additional MCP config file paths to inspect
+        #[arg(long = "config", value_name = "PATH")]
+        config: Vec<PathBuf>,
+        /// Override output directory for generated skills
+        #[arg(long = "skills-dir", value_name = "PATH")]
+        skills_dir: Option<PathBuf>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -240,6 +261,16 @@ fn main() -> anyhow::Result<()> {
                 config,
             }) => {
                 commands::convert::run_plan(&server, &mode, dry_run, json, &config)?;
+            }
+            Some(ConvertCommands::Apply {
+                server,
+                mode,
+                yes,
+                json,
+                config,
+                skills_dir,
+            }) => {
+                commands::convert::run_apply(&server, &mode, yes, json, &config, skills_dir)?;
             }
             None => {
                 commands::convert::run_overview(&[])?;
