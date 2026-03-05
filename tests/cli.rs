@@ -573,16 +573,30 @@ fn test_convert_list_detects_claude_settings_by_default() {
 fn test_convert_apply_hybrid_writes_skill_file() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("mcp.json");
+    let mock_mcp = dir.path().join("mock-mcp.sh");
+    std::fs::write(
+        &mock_mcp,
+        "#!/bin/sh\nread _\nread _\nprintf '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{}}}\\n'\nprintf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"build_run_sim\"},{\"name\":\"launch_app_sim\"},{\"name\":\"list_sims\"}]}}\\n'\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&mock_mcp, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
     std::fs::write(
         &config_path,
-        r#"{
-  "mcpServers": {
-    "XcodeBuildMCP": {
-      "command": "npx",
+        &format!(
+            r#"{{
+  "mcpServers": {{
+    "XcodeBuildMCP": {{
+      "command": "{}",
       "args": ["-y", "xcodebuildmcp@latest", "mcp"]
-    }
-  }
-}"#,
+    }}
+  }}
+}}"#,
+            mock_mcp.display()
+        ),
     )
     .unwrap();
 
@@ -616,17 +630,31 @@ fn test_convert_apply_hybrid_writes_skill_file() {
 fn test_convert_apply_replace_removes_server_and_creates_backup() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("settings.json");
+    let mock_mcp = dir.path().join("mock-mcp.sh");
+    std::fs::write(
+        &mock_mcp,
+        "#!/bin/sh\nread _\nread _\nprintf '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{}}}\\n'\nprintf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"navigate\"},{\"name\":\"click\"}]}}\\n'\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&mock_mcp, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
     std::fs::write(
         &config_path,
-        r#"{
-  "mcpServers": {
-    "playwright": {
-      "command": "npx",
+        &format!(
+            r#"{{
+  "mcpServers": {{
+    "playwright": {{
+      "command": "{}",
       "description": "Read-only browser helpers",
       "readOnly": true
-    }
-  }
-}"#,
+    }}
+  }}
+}}"#,
+            mock_mcp.display()
+        ),
     )
     .unwrap();
 
@@ -664,4 +692,64 @@ fn test_convert_apply_replace_removes_server_and_creates_backup() {
         })
         .count();
     assert_eq!(backup_count, 1, "replace mode should create one backup");
+}
+
+#[test]
+fn test_convert_verify_reports_passed_for_generated_skill() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("settings.json");
+    let skills_dir = dir.path().join("skills");
+    let mock_mcp = dir.path().join("mock-mcp.sh");
+    std::fs::write(
+        &mock_mcp,
+        "#!/bin/sh\nread _\nread _\nprintf '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{}}}\\n'\nprintf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"navigate\"},{\"name\":\"click\"}]}}\\n'\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&mock_mcp, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::fs::write(
+        &config_path,
+        &format!(
+            r#"{{
+  "mcpServers": {{
+    "playwright": {{
+      "command": "{}",
+      "description": "Read-only browser helpers",
+      "readOnly": true
+    }}
+  }}
+}}"#,
+            mock_mcp.display()
+        ),
+    )
+    .unwrap();
+
+    distill_cmd(dir.path())
+        .args([
+            "convert",
+            "apply",
+            "playwright",
+            "--mode",
+            "hybrid",
+            "--json",
+            "--config",
+        ])
+        .arg(&config_path)
+        .args(["--skills-dir"])
+        .arg(&skills_dir)
+        .assert()
+        .success();
+
+    distill_cmd(dir.path())
+        .args(["convert", "verify", "playwright", "--json", "--config"])
+        .arg(&config_path)
+        .args(["--skills-dir"])
+        .arg(&skills_dir)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"passed\": true"))
+        .stdout(predicate::str::contains("\"introspection_ok\": true"));
 }

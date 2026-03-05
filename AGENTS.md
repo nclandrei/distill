@@ -136,6 +136,7 @@ screencapture -x -i /absolute/path/selection.png
   - `distill convert inspect <server> --config "$TMPDIR/distill-mcp.json"`
   - `distill convert plan <server> --mode auto --config "$TMPDIR/distill-mcp.json"`
   - `distill convert apply <server> --mode auto --config "$TMPDIR/distill-mcp.json"`
+  - `distill convert verify <server> --config "$TMPDIR/distill-mcp.json"`
 - For replace-mode verification, require explicit `--yes` and assert both:
   - generated skill file exists under `~/.distill/skills/`
   - MCP config backup file (`*.bak-<timestamp>`) is created before config mutation

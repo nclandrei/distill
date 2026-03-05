@@ -77,6 +77,7 @@ For non-interactive automation, use:
   distill convert inspect <server> --json
   distill convert plan <server> --mode auto|hybrid|replace --json
   distill convert apply <server> --mode auto|hybrid|replace --yes --json
+  distill convert verify <server> --json
 
 You can pass one or more --config <path> values to include extra MCP config files.
 ";
@@ -211,6 +212,20 @@ enum ConvertCommands {
         #[arg(long = "skills-dir", value_name = "PATH")]
         skills_dir: Option<PathBuf>,
     },
+    /// Verify parity coverage between generated skill and live MCP tool list
+    Verify {
+        /// Server id (source:name) or unique server name
+        server: String,
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+        /// Additional MCP config file paths to inspect
+        #[arg(long = "config", value_name = "PATH")]
+        config: Vec<PathBuf>,
+        /// Override skills directory for generated files
+        #[arg(long = "skills-dir", value_name = "PATH")]
+        skills_dir: Option<PathBuf>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -271,6 +286,14 @@ fn main() -> anyhow::Result<()> {
                 skills_dir,
             }) => {
                 commands::convert::run_apply(&server, &mode, yes, json, &config, skills_dir)?;
+            }
+            Some(ConvertCommands::Verify {
+                server,
+                json,
+                config,
+                skills_dir,
+            }) => {
+                commands::convert::run_verify(&server, json, &config, skills_dir)?;
             }
             None => {
                 commands::convert::run_overview(&[])?;

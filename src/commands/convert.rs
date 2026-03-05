@@ -2,7 +2,8 @@ use anyhow::{Result, bail};
 use std::path::PathBuf;
 
 use crate::convert::{
-    self, ConvertApplyResult, ConvertInventory, ConvertPlan, MCPServerProfile, PlanMode,
+    self, ConvertApplyResult, ConvertInventory, ConvertPlan, ConvertVerifyReport, MCPServerProfile,
+    PlanMode,
 };
 
 pub fn parse_mode(raw: &str) -> Result<PlanMode> {
@@ -75,6 +76,21 @@ pub fn run_apply(
     Ok(())
 }
 
+pub fn run_verify(
+    selector: &str,
+    json: bool,
+    config_paths: &[PathBuf],
+    skills_dir: Option<PathBuf>,
+) -> Result<()> {
+    let report = convert::verify(selector, config_paths, skills_dir)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    print_verify_report(&report);
+    Ok(())
+}
+
 pub fn run_overview(config_paths: &[PathBuf]) -> Result<()> {
     let inventory = convert::discover(config_paths)?;
     print_inventory(&inventory);
@@ -83,6 +99,7 @@ pub fn run_overview(config_paths: &[PathBuf]) -> Result<()> {
     println!("  distill convert inspect <server-id|server-name>");
     println!("  distill convert plan <server-id|server-name> --mode auto|hybrid|replace");
     println!("  distill convert apply <server-id|server-name> --mode auto|hybrid|replace");
+    println!("  distill convert verify <server-id|server-name>");
     println!("Use --json for one-shot agent automation.");
     Ok(())
 }
@@ -195,6 +212,39 @@ fn print_apply_result(result: &ConvertApplyResult) {
     if !result.notes.is_empty() {
         println!("Notes:");
         for note in &result.notes {
+            println!("  - {note}");
+        }
+    }
+}
+
+fn print_verify_report(report: &ConvertVerifyReport) {
+    println!("Verification for {}", report.server.id);
+    println!("  passed               : {}", report.passed);
+    println!("  skill_path           : {}", report.skill_path.display());
+    println!("  introspection_ok     : {}", report.introspection_ok);
+    println!(
+        "  introspected_tools   : {}",
+        report.introspected_tool_count
+    );
+    println!(
+        "  required_hint_count  : {}",
+        report.required_tool_hints.len()
+    );
+    if !report.missing_in_server.is_empty() {
+        println!(
+            "  missing_in_server    : {}",
+            report.missing_in_server.join(", ")
+        );
+    }
+    if !report.missing_in_skill.is_empty() {
+        println!(
+            "  missing_in_skill     : {}",
+            report.missing_in_skill.join(", ")
+        );
+    }
+    if !report.notes.is_empty() {
+        println!("Notes:");
+        for note in &report.notes {
             println!("  - {note}");
         }
     }

@@ -1,3 +1,4 @@
 /target
 .workspaces/
 .distill-runtime/
+.codex-runtime/

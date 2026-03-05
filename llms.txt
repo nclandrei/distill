@@ -9,12 +9,13 @@
   - `distill convert list --json`
   - `distill convert inspect <server-id|server-name> --json [--config <path>]`
   - `distill convert plan <server-id|server-name> --mode auto|hybrid|replace --json [--config <path>]`
+  - `distill convert verify <server-id|server-name> --json [--config <path>]`
 - In `review.json`, set each proposal `decision` to `accept`, `reject`, or `skip` (missing decisions default to `skip`)
 - Use `-` as path for stdio: `--write-json -` (stdout), `--apply-json -` (stdin)
 
 ## Other useful commands
 - `distill scan --now` to generate proposal files immediately
-- `distill convert list|inspect|plan|apply` to analyze and convert MCP servers
+- `distill convert list|inspect|plan|apply|verify` to analyze, convert, and validate MCP servers
 - `distill status` to inspect config, pending proposals, and last scan
 - `distill watch --install|--uninstall` to manage scheduled scans
 - `distill notify --check` for shell-hook notification checks

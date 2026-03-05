@@ -3,7 +3,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use crate::config::Config;
 
@@ -109,6 +111,20 @@ pub struct ConvertApplyResult {
     pub skill_path: PathBuf,
     pub mcp_config_backup: Option<PathBuf>,
     pub mcp_config_updated: bool,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ConvertVerifyReport {
+    pub generated_at: DateTime<Utc>,
+    pub server: MCPServerProfile,
+    pub skill_path: PathBuf,
+    pub introspection_ok: bool,
+    pub introspected_tool_count: usize,
+    pub required_tool_hints: Vec<String>,
+    pub missing_in_server: Vec<String>,
+    pub missing_in_skill: Vec<String>,
+    pub passed: bool,
     pub notes: Vec<String>,
 }
 
@@ -247,9 +263,15 @@ pub fn apply(
     std::fs::create_dir_all(&skills_dir)
         .with_context(|| format!("Failed to create skills directory {}", skills_dir.display()))?;
 
+    let introspected_tools = introspect_tools(&conversion_plan.server).ok();
+
     let skill_filename = format!("mcp-{}.md", sanitize_slug(&conversion_plan.server.name));
     let skill_path = skills_dir.join(skill_filename);
-    std::fs::write(&skill_path, render_skill_markdown(&conversion_plan)).with_context(|| {
+    std::fs::write(
+        &skill_path,
+        render_skill_markdown(&conversion_plan, introspected_tools.as_deref()),
+    )
+    .with_context(|| {
         format!(
             "Failed to write converted skill file {}",
             skill_path.display()
@@ -266,6 +288,24 @@ pub fn apply(
             notes.push("MCP config left unchanged (hybrid mode).".to_string());
         }
         PlanMode::Replace => {
+            if introspected_tools.is_none() {
+                bail!(
+                    "Replace mode requires successful live MCP tool introspection before config mutation."
+                );
+            }
+            let verify = verify_with_server_and_path(
+                &conversion_plan.server,
+                &skill_path,
+                introspected_tools.as_deref(),
+            )?;
+            if !verify.passed {
+                bail!(
+                    "Replace mode verification failed for '{}': missing_in_server=[{}], missing_in_skill=[{}]",
+                    conversion_plan.server.id,
+                    verify.missing_in_server.join(", "),
+                    verify.missing_in_skill.join(", ")
+                );
+            }
             let (backup, updated) = remove_server_from_config(
                 &conversion_plan.server.source_path,
                 &conversion_plan.server.name,
@@ -295,6 +335,108 @@ pub fn apply(
     })
 }
 
+pub fn verify(
+    server_selector: &str,
+    additional_paths: &[PathBuf],
+    skills_dir: Option<PathBuf>,
+) -> Result<ConvertVerifyReport> {
+    let server = inspect(server_selector, additional_paths)?;
+    let skills_dir = skills_dir.unwrap_or_else(Config::skills_dir);
+    let skill_path = skills_dir.join(format!("mcp-{}.md", sanitize_slug(&server.name)));
+
+    let introspected = introspect_tools(&server).ok();
+    verify_with_server_and_path(&server, &skill_path, introspected.as_deref())
+}
+
+fn verify_with_server_and_path(
+    server: &MCPServerProfile,
+    skill_path: &Path,
+    introspected_tools: Option<&[String]>,
+) -> Result<ConvertVerifyReport> {
+    if !skill_path.exists() {
+        bail!(
+            "Generated skill file not found for verification: {}",
+            skill_path.display()
+        );
+    }
+
+    let skill_content = std::fs::read_to_string(skill_path)
+        .with_context(|| format!("Failed to read {}", skill_path.display()))?;
+    let skill_hints = extract_tool_hints_from_skill(&skill_content);
+    let required_hints = required_tool_hints(server, introspected_tools);
+
+    let mut notes = vec![];
+    let introspected_set = introspected_tools
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| normalize_tool_name(item))
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let introspection_ok = !introspected_set.is_empty();
+    if introspection_ok {
+        notes.push(format!(
+            "Live MCP introspection returned {} tools.",
+            introspected_set.len()
+        ));
+    } else {
+        notes.push(
+            "Live MCP introspection unavailable; verification is heuristic-only.".to_string(),
+        );
+    }
+
+    let skill_hint_set = skill_hints.iter().cloned().collect::<BTreeSet<_>>();
+    let missing_in_skill = required_hints
+        .iter()
+        .filter(|hint| !skill_hint_set.contains(*hint))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let required_tool_names = required_hints
+        .iter()
+        .map(|hint| hint_to_tool_name(hint))
+        .collect::<BTreeSet<_>>();
+    let missing_in_server = if introspection_ok {
+        required_tool_names
+            .iter()
+            .filter(|name| !introspected_set.contains(*name))
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        vec![]
+    };
+
+    let passed = if required_hints.is_empty() {
+        let mapped_skill_tools = skill_hints
+            .iter()
+            .map(|hint| hint_to_tool_name(hint))
+            .collect::<BTreeSet<_>>();
+        if introspection_ok {
+            mapped_skill_tools
+                .iter()
+                .any(|tool| introspected_set.contains(tool))
+        } else {
+            !mapped_skill_tools.is_empty()
+        }
+    } else {
+        missing_in_skill.is_empty() && (missing_in_server.is_empty() || !introspection_ok)
+    };
+
+    Ok(ConvertVerifyReport {
+        generated_at: Utc::now(),
+        server: server.clone(),
+        skill_path: skill_path.to_path_buf(),
+        introspection_ok,
+        introspected_tool_count: introspected_set.len(),
+        required_tool_hints: required_hints,
+        missing_in_server,
+        missing_in_skill,
+        passed,
+        notes,
+    })
+}
+
 #[derive(Debug, Clone)]
 struct CapabilityPlaybook {
     title: String,
@@ -303,7 +445,7 @@ struct CapabilityPlaybook {
     steps: Vec<String>,
 }
 
-fn render_skill_markdown(plan: &ConvertPlan) -> String {
+fn render_skill_markdown(plan: &ConvertPlan, introspected_tools: Option<&[String]>) -> String {
     let mut out = String::new();
     out.push_str(&format!("# MCP Workflow: {}\n\n", plan.server.name.trim()));
     out.push_str("## Purpose\n\n");
@@ -344,7 +486,7 @@ fn render_skill_markdown(plan: &ConvertPlan) -> String {
     ));
 
     out.push_str("## Capability Playbooks\n\n");
-    let playbooks = capability_playbooks(&plan.server, &plan.actions);
+    let playbooks = capability_playbooks(&plan.server, &plan.actions, introspected_tools);
     for (idx, playbook) in playbooks.iter().enumerate() {
         out.push_str(&format!("### {}. {}\n\n", idx + 1, playbook.title));
         out.push_str(&format!("Goal: {}\n\n", playbook.goal));
@@ -381,20 +523,32 @@ fn render_skill_markdown(plan: &ConvertPlan) -> String {
 fn capability_playbooks(
     server: &MCPServerProfile,
     fallback_actions: &[String],
+    introspected_tools: Option<&[String]>,
 ) -> Vec<CapabilityPlaybook> {
     let name = server.name.to_lowercase();
     let purpose = server.purpose.clone();
+    let introspected_set = introspected_tools
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| normalize_tool_name(item))
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
 
     if name.contains("xcodebuildmcp") || name.contains("xcode") {
         return vec![
             CapabilityPlaybook {
                 title: "Build and launch in simulator".to_string(),
                 goal: "Compile and run iOS code paths quickly during iteration.".to_string(),
-                tool_hints: vec![
-                    "mcp__XcodeBuildMCP__build_run_sim".to_string(),
-                    "mcp__XcodeBuildMCP__launch_app_sim".to_string(),
-                    "mcp__XcodeBuildMCP__list_sims".to_string(),
-                ],
+                tool_hints: filter_hints_by_introspection(
+                    vec![
+                        "mcp__XcodeBuildMCP__build_run_sim".to_string(),
+                        "mcp__XcodeBuildMCP__launch_app_sim".to_string(),
+                        "mcp__XcodeBuildMCP__list_sims".to_string(),
+                    ],
+                    &introspected_set,
+                ),
                 steps: vec![
                     "List available simulators and choose target device/OS.".to_string(),
                     "Build and run in simulator with project defaults.".to_string(),
@@ -405,12 +559,15 @@ fn capability_playbooks(
             CapabilityPlaybook {
                 title: "UI interaction and visual checks".to_string(),
                 goal: "Drive screens deterministically and confirm UI state.".to_string(),
-                tool_hints: vec![
-                    "mcp__XcodeBuildMCP__snapshot_ui".to_string(),
-                    "mcp__XcodeBuildMCP__tap".to_string(),
-                    "mcp__XcodeBuildMCP__type_text".to_string(),
-                    "mcp__XcodeBuildMCP__screenshot".to_string(),
-                ],
+                tool_hints: filter_hints_by_introspection(
+                    vec![
+                        "mcp__XcodeBuildMCP__snapshot_ui".to_string(),
+                        "mcp__XcodeBuildMCP__tap".to_string(),
+                        "mcp__XcodeBuildMCP__type_text".to_string(),
+                        "mcp__XcodeBuildMCP__screenshot".to_string(),
+                    ],
+                    &introspected_set,
+                ),
                 steps: vec![
                     "Take a UI snapshot to identify accessible targets.".to_string(),
                     "Trigger interactions by accessibility id/label first, coordinates last."
@@ -422,12 +579,15 @@ fn capability_playbooks(
             CapabilityPlaybook {
                 title: "Attach debugger and inspect failures".to_string(),
                 goal: "Investigate crashes, stuck flows, and state mismatches.".to_string(),
-                tool_hints: vec![
-                    "mcp__XcodeBuildMCP__debug_attach_sim".to_string(),
-                    "mcp__XcodeBuildMCP__debug_stack".to_string(),
-                    "mcp__XcodeBuildMCP__debug_variables".to_string(),
-                    "mcp__XcodeBuildMCP__debug_lldb_command".to_string(),
-                ],
+                tool_hints: filter_hints_by_introspection(
+                    vec![
+                        "mcp__XcodeBuildMCP__debug_attach_sim".to_string(),
+                        "mcp__XcodeBuildMCP__debug_stack".to_string(),
+                        "mcp__XcodeBuildMCP__debug_variables".to_string(),
+                        "mcp__XcodeBuildMCP__debug_lldb_command".to_string(),
+                    ],
+                    &introspected_set,
+                ),
                 steps: vec![
                     "Attach debugger to running app process.".to_string(),
                     "Collect backtrace and inspect frame variables at failure point.".to_string(),
@@ -442,12 +602,15 @@ fn capability_playbooks(
             CapabilityPlaybook {
                 title: "Navigate and inspect page state".to_string(),
                 goal: "Understand DOM/accessibility state before automation actions.".to_string(),
-                tool_hints: vec![
-                    "mcp__chrome-devtools__navigate_page".to_string(),
-                    "mcp__chrome-devtools__take_snapshot".to_string(),
-                    "mcp__chrome-devtools__click".to_string(),
-                    "mcp__chrome-devtools__fill".to_string(),
-                ],
+                tool_hints: filter_hints_by_introspection(
+                    vec![
+                        "mcp__chrome-devtools__navigate_page".to_string(),
+                        "mcp__chrome-devtools__take_snapshot".to_string(),
+                        "mcp__chrome-devtools__click".to_string(),
+                        "mcp__chrome-devtools__fill".to_string(),
+                    ],
+                    &introspected_set,
+                ),
                 steps: vec![
                     "Open target URL and wait for primary content.".to_string(),
                     "Capture a text snapshot and locate stable element identifiers.".to_string(),
@@ -457,12 +620,15 @@ fn capability_playbooks(
             CapabilityPlaybook {
                 title: "Trace network and console failures".to_string(),
                 goal: "Root-cause runtime errors and bad responses.".to_string(),
-                tool_hints: vec![
-                    "mcp__chrome-devtools__list_network_requests".to_string(),
-                    "mcp__chrome-devtools__get_network_request".to_string(),
-                    "mcp__chrome-devtools__list_console_messages".to_string(),
-                    "mcp__chrome-devtools__get_console_message".to_string(),
-                ],
+                tool_hints: filter_hints_by_introspection(
+                    vec![
+                        "mcp__chrome-devtools__list_network_requests".to_string(),
+                        "mcp__chrome-devtools__get_network_request".to_string(),
+                        "mcp__chrome-devtools__list_console_messages".to_string(),
+                        "mcp__chrome-devtools__get_console_message".to_string(),
+                    ],
+                    &introspected_set,
+                ),
                 steps: vec![
                     "List recent network requests and inspect failing responses.".to_string(),
                     "Collect console errors and correlate them with failing endpoints.".to_string(),
@@ -472,11 +638,14 @@ fn capability_playbooks(
             CapabilityPlaybook {
                 title: "Run performance diagnostics".to_string(),
                 goal: "Capture page performance issues and actionable insights.".to_string(),
-                tool_hints: vec![
-                    "mcp__chrome-devtools__performance_start_trace".to_string(),
-                    "mcp__chrome-devtools__performance_stop_trace".to_string(),
-                    "mcp__chrome-devtools__performance_analyze_insight".to_string(),
-                ],
+                tool_hints: filter_hints_by_introspection(
+                    vec![
+                        "mcp__chrome-devtools__performance_start_trace".to_string(),
+                        "mcp__chrome-devtools__performance_stop_trace".to_string(),
+                        "mcp__chrome-devtools__performance_analyze_insight".to_string(),
+                    ],
+                    &introspected_set,
+                ),
                 steps: vec![
                     "Start trace recording for the target journey.".to_string(),
                     "Stop trace and inspect key insights (latency, LCP breakdown, etc.)."
@@ -496,15 +665,178 @@ fn capability_playbooks(
     ];
     steps.extend(fallback_actions.iter().cloned());
 
+    let fallback_hints = if introspected_set.is_empty() {
+        vec![]
+    } else {
+        let mut names = introspected_set.iter().cloned().collect::<Vec<_>>();
+        names.sort();
+        names
+            .into_iter()
+            .take(6)
+            .map(|tool| format!("{}{}", tool_hint_prefix(server), tool))
+            .collect::<Vec<_>>()
+    };
+
     vec![CapabilityPlaybook {
         title: "General orchestration".to_string(),
         goal: format!(
             "Perform {} with reproducible sequencing.",
             purpose.to_lowercase()
         ),
-        tool_hints: vec![],
+        tool_hints: fallback_hints,
         steps,
     }]
+}
+
+fn filter_hints_by_introspection(
+    hints: Vec<String>,
+    introspected: &BTreeSet<String>,
+) -> Vec<String> {
+    if introspected.is_empty() {
+        return hints;
+    }
+    hints
+        .iter()
+        .filter(|hint| introspected.contains(&hint_to_tool_name(hint)))
+        .cloned()
+        .collect::<Vec<_>>()
+}
+
+fn required_tool_hints(
+    server: &MCPServerProfile,
+    introspected_tools: Option<&[String]>,
+) -> Vec<String> {
+    let mut hints = capability_playbooks(server, &[], introspected_tools)
+        .into_iter()
+        .flat_map(|playbook| playbook.tool_hints)
+        .collect::<Vec<_>>();
+    hints.sort();
+    hints.dedup();
+    hints
+}
+
+fn extract_tool_hints_from_skill(content: &str) -> Vec<String> {
+    let mut hints = vec![];
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("- `") || !trimmed.ends_with('`') {
+            continue;
+        }
+        let value = trimmed.trim_start_matches("- `").trim_end_matches('`');
+        if value.starts_with("mcp__") {
+            hints.push(value.to_string());
+        }
+    }
+    hints.sort();
+    hints.dedup();
+    hints
+}
+
+fn hint_to_tool_name(hint: &str) -> String {
+    hint.rsplit("__").next().unwrap_or(hint).trim().to_string()
+}
+
+fn normalize_tool_name(name: &str) -> String {
+    let trimmed = name.trim();
+    if trimmed.starts_with("mcp__") {
+        hint_to_tool_name(trimmed)
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn tool_hint_prefix(server: &MCPServerProfile) -> String {
+    let lower = server.name.to_lowercase();
+    if lower.contains("xcodebuildmcp") {
+        return "mcp__XcodeBuildMCP__".to_string();
+    }
+    if lower.contains("chrome-devtools") || lower.contains("devtools") {
+        return "mcp__chrome-devtools__".to_string();
+    }
+    format!("mcp__{}__", server.name)
+}
+
+fn introspect_tools(server: &MCPServerProfile) -> Result<Vec<String>> {
+    let command = server
+        .command
+        .as_deref()
+        .context("MCP server has no command to introspect")?;
+
+    let mut child = Command::new(command)
+        .args(&server.args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("Failed to spawn MCP command: {command}"))?;
+
+    let init = serde_json::json!({
+        "jsonrpc":"2.0",
+        "id":1,
+        "method":"initialize",
+        "params":{
+            "protocolVersion":"2025-03-26",
+            "capabilities":{},
+            "clientInfo":{"name":"distill","version":"0.1"}
+        }
+    });
+    let list = serde_json::json!({
+        "jsonrpc":"2.0",
+        "id":2,
+        "method":"tools/list",
+        "params":{}
+    });
+
+    {
+        let mut stdin = child.stdin.take().context("Failed to open MCP stdin")?;
+        writeln!(stdin, "{init}").context("Failed to write MCP initialize request")?;
+        writeln!(stdin, "{list}").context("Failed to write MCP tools/list request")?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .context("Failed while waiting for MCP introspection output")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut tools = vec![];
+    for line in stdout.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(id) = value.get("id").and_then(Value::as_i64) else {
+            continue;
+        };
+        if id != 2 {
+            continue;
+        }
+        let Some(items) = value
+            .get("result")
+            .and_then(|result| result.get("tools"))
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        tools = items
+            .iter()
+            .filter_map(|item| item.get("name").and_then(Value::as_str))
+            .map(normalize_tool_name)
+            .collect::<Vec<_>>();
+        break;
+    }
+
+    tools.sort();
+    tools.dedup();
+
+    if tools.is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "MCP introspection returned no tools for '{}'. stderr: {}",
+            server.id,
+            stderr.lines().take(5).collect::<Vec<_>>().join(" | ")
+        );
+    }
+
+    Ok(tools)
 }
 
 fn remove_server_from_config(path: &Path, server_name: &str) -> Result<(Option<PathBuf>, bool)> {
@@ -1299,17 +1631,31 @@ args = ["-y", "chrome-devtools-mcp@latest"]
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("settings.json");
         let skills_dir = dir.path().join("skills");
+        let mock_mcp = dir.path().join("mock-mcp.sh");
+        std::fs::write(
+            &mock_mcp,
+            "#!/bin/sh\nread _\nread _\nprintf '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{}}}\\n'\nprintf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"navigate\"},{\"name\":\"click\"},{\"name\":\"fill\"}]}}\\n'\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&mock_mcp, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         std::fs::write(
             &config_path,
-            r#"{
-  "mcpServers": {
-    "playwright": {
-      "command": "npx",
+            &format!(
+                r#"{{
+  "mcpServers": {{
+    "playwright": {{
+      "command": "{}",
       "description": "Read list",
       "readOnly": true
-    }
-  }
-}"#,
+    }}
+  }}
+}}"#,
+                mock_mcp.display()
+            ),
         )
         .unwrap();
 
@@ -1338,17 +1684,31 @@ args = ["-y", "chrome-devtools-mcp@latest"]
     fn test_apply_replace_requires_confirmation() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("settings.json");
+        let mock_mcp = dir.path().join("mock-mcp.sh");
+        std::fs::write(
+            &mock_mcp,
+            "#!/bin/sh\nread _\nread _\nprintf '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{}}}\\n'\nprintf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"navigate\"}]}}\\n'\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&mock_mcp, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         std::fs::write(
             &config_path,
-            r#"{
-  "mcpServers": {
-    "playwright": {
-      "command": "npx",
+            &format!(
+                r#"{{
+  "mcpServers": {{
+    "playwright": {{
+      "command": "{}",
       "description": "Read list",
       "readOnly": true
-    }
-  }
-}"#,
+    }}
+  }}
+}}"#,
+                mock_mcp.display()
+            ),
         )
         .unwrap();
 
@@ -1362,5 +1722,80 @@ args = ["-y", "chrome-devtools-mcp@latest"]
         .unwrap_err();
 
         assert!(format!("{err:#}").contains("--yes"));
+    }
+
+    #[test]
+    fn test_apply_replace_requires_live_introspection() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("settings.json");
+        std::fs::write(
+            &config_path,
+            r#"{
+  "mcpServers": {
+    "playwright": {
+      "command": "/bin/echo",
+      "args": ["not-json"],
+      "description": "Read list",
+      "readOnly": true
+    }
+  }
+}"#,
+        )
+        .unwrap();
+
+        let err = apply(
+            "playwright",
+            PlanMode::Replace,
+            true,
+            &[config_path],
+            Some(dir.path().join("skills")),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("live MCP tool introspection"));
+    }
+
+    #[test]
+    fn test_verify_normalizes_prefixed_tool_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_path = dir.path().join("mcp-playwright.md");
+        std::fs::write(
+            &skill_path,
+            r#"# MCP Workflow: playwright
+
+## Capability Playbooks
+
+### 1. Generic
+
+Tool hints:
+- `mcp__playwright__execute`
+"#,
+        )
+        .unwrap();
+
+        let server = MCPServerProfile {
+            id: "fixture:playwright".to_string(),
+            name: "playwright".to_string(),
+            source_label: "fixture".to_string(),
+            source_path: dir.path().join("settings.json"),
+            purpose: "Browser automation".to_string(),
+            command: Some("npx".to_string()),
+            args: vec!["-y".to_string(), "@playwright/mcp@latest".to_string()],
+            url: None,
+            env_keys: vec![],
+            declared_tool_count: 0,
+            permission_hints: vec![],
+            inferred_permission: PermissionLevel::ReadOnly,
+            recommendation: ConversionRecommendation::ReplaceCandidate,
+            recommendation_reason: "read-only".to_string(),
+        };
+
+        let introspected = vec!["mcp__playwright__execute".to_string()];
+        let report =
+            verify_with_server_and_path(&server, &skill_path, Some(&introspected)).unwrap();
+
+        assert!(report.introspection_ok);
+        assert!(report.missing_in_server.is_empty());
+        assert!(report.missing_in_skill.is_empty());
+        assert!(report.passed);
     }
 }
