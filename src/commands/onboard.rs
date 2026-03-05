@@ -115,8 +115,12 @@ fn export_spec(home: &Path) -> Result<OnboardingSpec> {
     let config_path = home.join(".distill").join("config.yaml");
     let has_existing_config = config_path.exists();
     let config = if has_existing_config {
-        Config::load_from(&config_path)
-            .with_context(|| format!("Failed to load existing distill config at {}", config_path.display()))?
+        Config::load_from(&config_path).with_context(|| {
+            format!(
+                "Failed to load existing distill config at {}",
+                config_path.display()
+            )
+        })?
     } else {
         default_config_from_detected(&detected)
     };

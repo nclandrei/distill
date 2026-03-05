@@ -30,7 +30,7 @@ pub fn run(check: bool) -> Result<()> {
         return match config.notifications {
             NotificationPref::None => Ok(()),
             NotificationPref::Terminal => {
-                print_pending_proposals(count);
+                print_pending_proposals(count, config.notification_icon.as_deref());
                 Ok(())
             }
             NotificationPref::Native => send_notification(
@@ -40,7 +40,7 @@ pub fn run(check: bool) -> Result<()> {
                 config.notification_icon.as_deref(),
             ),
             NotificationPref::Both => {
-                print_pending_proposals(count);
+                print_pending_proposals(count, config.notification_icon.as_deref());
                 send_notification(
                     &NotificationPref::Native,
                     "distill",
@@ -52,12 +52,12 @@ pub fn run(check: bool) -> Result<()> {
     }
 
     // Fallback for pre-onboarding setups where config is not available yet.
-    print_pending_proposals(count);
+    print_pending_proposals(count, None);
     Ok(())
 }
 
-fn print_pending_proposals(count: usize) {
-    print_terminal_branding();
+fn print_pending_proposals(count: usize, icon_path: Option<&str>) {
+    let _ = print_terminal_branding(icon_path);
     println!(
         "[distill] {count} new proposal{} ready",
         if count == 1 { "" } else { "s" }
@@ -71,12 +71,12 @@ mod tests {
 
     #[test]
     fn test_print_pending_proposals_runs_for_single_and_plural() {
-        print_pending_proposals(1);
-        print_pending_proposals(3);
+        print_pending_proposals(1, None);
+        print_pending_proposals(3, None);
     }
 
     #[test]
     fn test_print_pending_proposals_zero_is_still_safe() {
-        print_pending_proposals(0);
+        print_pending_proposals(0, None);
     }
 }

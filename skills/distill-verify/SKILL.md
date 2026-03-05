@@ -145,6 +145,22 @@ Treat this as success when artifacts confirm it:
 - accepted skill written under `$TEST_HOME/.distill/skills`
 - accepted entry appended to `$TEST_HOME/.distill/history/decisions.jsonl`
 
+## Notification Image Checks
+
+Terminal inline notification images are enabled by default.
+For default-behavior verification, run commands without setting `DISTILL_TERMINAL_IMAGE`.
+
+Use the env var only as an override during tests:
+
+- `DISTILL_TERMINAL_IMAGE=off` to disable inline images and validate text-only fallback.
+- `DISTILL_TERMINAL_IMAGE=on` to force-enable while comparing environments.
+
+In tmux, ensure passthrough is enabled before image checks:
+
+```bash
+tmux -L "$TMUX_SOCKET" set -g allow-passthrough on
+```
+
 ## Reliability Rules
 
 - Prefer Ghostty + tmux for all Distill verification tasks.

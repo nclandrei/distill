@@ -1,9 +1,10 @@
 use anyhow::{Context, Result};
-use std::io::IsTerminal;
+use base64::Engine as _;
+use image::ImageFormat;
+use image::imageops::FilterType;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::Command;
-#[cfg(any(target_os = "macos", test))]
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use crate::config::NotificationPref;
@@ -17,12 +18,14 @@ const EMBEDDED_ICON_PNG: &[u8] =
     include_bytes!("../../assets/icons/png/color/distill-color-256.png");
 const TERMINAL_BADGE: &str = "[distill]";
 const NOTIFIER_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
-#[cfg(any(target_os = "macos", test))]
-const PREFERRED_MACOS_SENDERS: &[&str] = &[
-    "com.mitchellh.ghostty",
-    "com.googlecode.iterm2",
-    "com.apple.Terminal",
-];
+const TERMINAL_IMAGE_MODE_ENV: &str = "DISTILL_TERMINAL_IMAGE";
+const TERMINAL_IMAGE_PROTOCOL_ENV: &str = "DISTILL_TERMINAL_IMAGE_PROTOCOL";
+const TERMINAL_IMAGE_COLUMNS: usize = 8;
+const TERMINAL_IMAGE_ROWS: usize = 4;
+const TERMINAL_IMAGE_ANSI_COLUMNS: usize = 8;
+const TERMINAL_IMAGE_ANSI_ROWS: usize = 4;
+const TERMINAL_IMAGE_MAX_EDGE_PX: u32 = 256;
+const TERMINAL_IMAGE_ITERM_PX: usize = 72;
 
 // ── Trait ────────────────────────────────────────────────────────────────────
 
@@ -42,38 +45,316 @@ fn binary_exists(bin: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn should_render_terminal_icon() -> bool {
-    if let Ok(raw) = std::env::var("DISTILL_TERMINAL_ICON") {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "0" | "false" | "off" => return false,
-            "1" | "true" | "on" => return true,
-            _ => {}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalImageProtocol {
+    Kitty,
+    Iterm,
+    Ansi,
+}
+
+fn parse_terminal_image_protocol(raw: &str) -> Option<TerminalImageProtocol> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "kitty" => Some(TerminalImageProtocol::Kitty),
+        "iterm" | "iterm2" | "osc1337" => Some(TerminalImageProtocol::Iterm),
+        "ansi" | "blocks" => Some(TerminalImageProtocol::Ansi),
+        "none" | "off" | "false" => None,
+        _ => None,
+    }
+}
+
+fn in_tmux() -> bool {
+    std::env::var_os("TMUX").is_some()
+}
+
+fn tmux_passthrough_enabled() -> bool {
+    if !in_tmux() {
+        return true;
+    }
+
+    let Ok(output) = Command::new("tmux")
+        .args(["show-options", "-gv", "allow-passthrough"])
+        .output()
+    else {
+        return false;
+    };
+
+    if !output.status.success() {
+        return false;
+    }
+
+    matches!(
+        String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "on" | "all" | "1" | "true"
+    )
+}
+
+fn tmux_client_termname() -> Option<String> {
+    if !in_tmux() {
+        return None;
+    }
+    let output = Command::new("tmux")
+        .args(["display-message", "-p", "#{client_termname}"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let term = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .to_ascii_lowercase();
+    if term.is_empty() { None } else { Some(term) }
+}
+
+fn protocol_from_terminal_name(name: &str) -> Option<TerminalImageProtocol> {
+    let normalized = name.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+    if normalized.contains("kitty")
+        || normalized.contains("ghostty")
+        || normalized.contains("wezterm")
+    {
+        return Some(TerminalImageProtocol::Kitty);
+    }
+    if normalized.contains("iterm") {
+        return Some(TerminalImageProtocol::Iterm);
+    }
+    None
+}
+
+fn detect_terminal_image_protocol() -> Option<TerminalImageProtocol> {
+    if let Ok(raw) = std::env::var(TERMINAL_IMAGE_PROTOCOL_ENV) {
+        let parsed = parse_terminal_image_protocol(&raw);
+        if in_tmux()
+            && !matches!(parsed, Some(TerminalImageProtocol::Ansi) | None)
+            && !tmux_passthrough_enabled()
+        {
+            return None;
+        }
+        return parsed;
+    }
+
+    if in_tmux() && !tmux_passthrough_enabled() {
+        return None;
+    }
+
+    if let Some(term) = tmux_client_termname() {
+        if let Some(protocol) = protocol_from_terminal_name(&term) {
+            return Some(protocol);
         }
     }
 
+    if let Ok(term_program) = std::env::var("TERM_PROGRAM") {
+        if let Some(protocol) = protocol_from_terminal_name(&term_program) {
+            return Some(protocol);
+        }
+    }
+
+    if let Ok(term) = std::env::var("TERM") {
+        if let Some(protocol) = protocol_from_terminal_name(&term) {
+            return Some(protocol);
+        }
+    }
+
+    None
+}
+
+fn should_render_terminal_image() -> bool {
     if !std::io::stdout().is_terminal() {
         return false;
     }
-    if std::env::var_os("NO_COLOR").is_some() {
+    if matches!(std::env::var("TERM").ok().as_deref(), Some("dumb")) {
         return false;
     }
-    !matches!(std::env::var("TERM").ok().as_deref(), Some("dumb"))
+
+    let mode = std::env::var(TERMINAL_IMAGE_MODE_ENV).ok();
+    match mode.as_deref().map(str::trim).map(str::to_ascii_lowercase) {
+        None => true,
+        Some(raw) => !matches!(raw.as_str(), "0" | "false" | "off" | "none"),
+    }
 }
 
-pub fn print_terminal_branding() {
-    if !should_render_terminal_icon() {
-        return;
+fn rasterize_svg_to_png(svg_bytes: &[u8], max_edge: u32) -> Option<Vec<u8>> {
+    let options = resvg::usvg::Options::default();
+    let tree = resvg::usvg::Tree::from_data(svg_bytes, &options).ok()?;
+    let size = tree.size();
+    let width = size.width();
+    let height = size.height();
+    if width <= 0.0 || height <= 0.0 {
+        return None;
     }
 
-    const CYAN: &str = "\x1b[38;2;6;182;212m";
-    const AMBER: &str = "\x1b[38;2;245;158;11m";
-    const RESET: &str = "\x1b[0m";
+    let max_dimension = width.max(height);
+    let scale = if max_dimension > max_edge as f32 {
+        max_edge as f32 / max_dimension
+    } else {
+        1.0
+    };
+    let target_width = (width * scale).round().max(1.0) as u32;
+    let target_height = (height * scale).round().max(1.0) as u32;
 
-    println!("{CYAN}      /================\\{RESET}");
-    println!("{CYAN}     /  ||   ||   ||    \\{RESET}");
-    println!("{CYAN}    /___||___||___||_____\\{RESET}");
-    println!("{CYAN}           \\   {AMBER}<>{CYAN}   /{RESET}");
-    println!("{AMBER}             \\ () /{RESET}");
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(target_width, target_height)?;
+    let transform = resvg::tiny_skia::Transform::from_scale(
+        target_width as f32 / width,
+        target_height as f32 / height,
+    );
+    let mut pixmap_mut = pixmap.as_mut();
+    resvg::render(&tree, transform, &mut pixmap_mut);
+    pixmap.encode_png().ok()
+}
+
+fn normalize_raster_to_png(bytes: &[u8]) -> Option<Vec<u8>> {
+    let dynamic = image::load_from_memory(bytes).ok()?;
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    dynamic.write_to(&mut cursor, ImageFormat::Png).ok()?;
+    Some(cursor.into_inner())
+}
+
+fn icon_path_extension(path: &std::path::Path) -> Option<String> {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+}
+
+fn terminal_image_bytes(icon_path: Option<&str>) -> Vec<u8> {
+    if let Some(path) = resolve_icon_path(icon_path) {
+        let path = PathBuf::from(path);
+        if let Ok(bytes) = std::fs::read(&path) {
+            if !bytes.is_empty() {
+                match icon_path_extension(&path).as_deref() {
+                    Some("png") => return bytes,
+                    Some("svg") => {
+                        if let Some(png) = rasterize_svg_to_png(&bytes, TERMINAL_IMAGE_MAX_EDGE_PX)
+                        {
+                            return png;
+                        }
+                    }
+                    _ => {
+                        if let Some(png) = normalize_raster_to_png(&bytes) {
+                            return png;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    EMBEDDED_ICON_PNG.to_vec()
+}
+
+fn emit_iterm_inline_image(png_bytes: &[u8]) -> std::io::Result<()> {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(png_bytes);
+    let mut out = std::io::stdout();
+    let sequence = format!(
+        "\x1b]1337;File=inline=1;width={}px;height={}px;preserveAspectRatio=1:{}\x07",
+        TERMINAL_IMAGE_ITERM_PX, TERMINAL_IMAGE_ITERM_PX, encoded,
+    );
+    write_terminal_control_sequence(&mut out, &sequence)?;
+    out.flush()
+}
+
+fn write_terminal_control_sequence(
+    out: &mut std::io::Stdout,
+    sequence: &str,
+) -> std::io::Result<()> {
+    if in_tmux() {
+        let escaped = sequence.replace('\x1b', "\x1b\x1b");
+        write!(out, "\x1bPtmux;{}\x1b\\", escaped)?;
+    } else {
+        out.write_all(sequence.as_bytes())?;
+    }
+    Ok(())
+}
+
+fn emit_kitty_inline_image(png_bytes: &[u8]) -> std::io::Result<()> {
+    const CHUNK_SIZE: usize = 4096;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(png_bytes);
+    let total_chunks = encoded.len().div_ceil(CHUNK_SIZE);
+    let mut out = std::io::stdout();
+
+    for (index, chunk) in encoded.as_bytes().chunks(CHUNK_SIZE).enumerate() {
+        let more = if index + 1 < total_chunks { 1 } else { 0 };
+        let chunk = std::str::from_utf8(chunk).unwrap_or_default();
+        let sequence = if index == 0 {
+            format!(
+                "\x1b_Gq=2,a=T,f=100,t=d,c={},r={},m={more};{chunk}\x1b\\",
+                TERMINAL_IMAGE_COLUMNS, TERMINAL_IMAGE_ROWS
+            )
+        } else {
+            format!("\x1b_Gq=2,m={more};{chunk}\x1b\\")
+        };
+        write_terminal_control_sequence(&mut out, &sequence)?;
+    }
+
+    out.flush()
+}
+
+fn blend_on_black(pixel: [u8; 4]) -> (u8, u8, u8) {
+    let alpha = pixel[3] as f32 / 255.0;
+    let r = (pixel[0] as f32 * alpha).round() as u8;
+    let g = (pixel[1] as f32 * alpha).round() as u8;
+    let b = (pixel[2] as f32 * alpha).round() as u8;
+    (r, g, b)
+}
+
+fn emit_ansi_block_image(png_bytes: &[u8]) -> std::io::Result<()> {
+    let dynamic = image::load_from_memory(png_bytes).map_err(std::io::Error::other)?;
+    let rgba = dynamic.to_rgba8();
+    let resized = image::imageops::resize(
+        &rgba,
+        TERMINAL_IMAGE_ANSI_COLUMNS as u32,
+        (TERMINAL_IMAGE_ANSI_ROWS * 2) as u32,
+        FilterType::Triangle,
+    );
+
+    let mut out = std::io::stdout();
+    for row in 0..TERMINAL_IMAGE_ANSI_ROWS {
+        for col in 0..TERMINAL_IMAGE_ANSI_COLUMNS {
+            let top = resized.get_pixel(col as u32, (row * 2) as u32).0;
+            let bottom = resized.get_pixel(col as u32, (row * 2 + 1) as u32).0;
+            let (tr, tg, tb) = blend_on_black(top);
+            let (br, bg, bb) = blend_on_black(bottom);
+            write!(out, "\x1b[38;2;{tr};{tg};{tb}m\x1b[48;2;{br};{bg};{bb}m▀")?;
+        }
+        writeln!(out, "\x1b[0m")?;
+    }
+    out.flush()
+}
+
+pub fn print_terminal_branding(icon_path: Option<&str>) -> bool {
+    if !should_render_terminal_image() {
+        return false;
+    }
+    let Some(protocol) = detect_terminal_image_protocol() else {
+        return false;
+    };
+    let bytes = terminal_image_bytes(icon_path);
+    let rendered = match protocol {
+        TerminalImageProtocol::Kitty => emit_kitty_inline_image(&bytes),
+        TerminalImageProtocol::Iterm => emit_iterm_inline_image(&bytes),
+        TerminalImageProtocol::Ansi => emit_ansi_block_image(&bytes),
+    }
+    .is_ok();
+
+    if rendered {
+        let mut out = std::io::stdout();
+        let padding_lines = match protocol {
+            // Kitty/iTerm images are drawn as overlays and do not reliably move
+            // the cursor in tmux. Reserve line height explicitly before text.
+            TerminalImageProtocol::Kitty => TERMINAL_IMAGE_ROWS,
+            TerminalImageProtocol::Iterm => 4,
+            // ANSI path already emits its own lines.
+            TerminalImageProtocol::Ansi => 1,
+        };
+        for _ in 0..padding_lines {
+            let _ = writeln!(out);
+        }
+        let _ = out.flush();
+    }
+
+    rendered
 }
 
 fn run_command_with_timeout(command: &mut Command, name: &str, timeout: Duration) -> Result<()> {
@@ -221,18 +502,18 @@ impl Notifier for MacOsScriptNotifier {
 
 /// macOS native notifier via `terminal-notifier`.
 ///
-/// We prefer stable sender icons (`-sender`) over `-appIcon`, because
-/// `-appIcon` relies on private APIs and is unreliable on newer macOS versions.
+/// Used when an icon path is configured, because `osascript` does not support
+/// custom notification icons.
 #[cfg(any(target_os = "macos", test))]
 pub struct MacOsTerminalNotifier;
 
 #[cfg(any(target_os = "macos", test))]
 impl Notifier for MacOsTerminalNotifier {
-    fn send(&self, title: &str, body: &str, _icon_path: Option<&str>) -> Result<()> {
+    fn send(&self, title: &str, body: &str, icon_path: Option<&str>) -> Result<()> {
         let mut command = Command::new("terminal-notifier");
         command.arg("-title").arg(title).arg("-message").arg(body);
-        if let Some(sender) = macos_sender_bundle_id() {
-            command.arg("-sender").arg(sender);
+        if let Some(icon) = icon_path.filter(|path| !path.trim().is_empty()) {
+            command.arg("-appIcon").arg(icon);
         }
         run_command_with_timeout(&mut command, "terminal-notifier", NOTIFIER_COMMAND_TIMEOUT)
     }
@@ -244,17 +525,21 @@ impl Notifier for MacOsTerminalNotifier {
 
 /// macOS native notifier with icon-aware backend selection.
 ///
-/// If `terminal-notifier` is installed, it is used for richer behavior.
+/// If an icon is configured and `terminal-notifier` is installed, it is used.
 /// Otherwise, we fall back to `osascript`.
 #[cfg(any(target_os = "macos", test))]
 pub struct MacOsNotifier;
 
 #[cfg(any(target_os = "macos", test))]
 impl Notifier for MacOsNotifier {
-    fn send(&self, title: &str, body: &str, _icon_path: Option<&str>) -> Result<()> {
-        let notifier = MacOsTerminalNotifier;
-        if notifier.is_available() {
-            return notifier.send(title, body, None);
+    fn send(&self, title: &str, body: &str, icon_path: Option<&str>) -> Result<()> {
+        if icon_path.is_some() {
+            let notifier = MacOsTerminalNotifier;
+            if notifier.is_available() {
+                if notifier.send(title, body, icon_path).is_ok() {
+                    return Ok(());
+                }
+            }
         }
         MacOsScriptNotifier.send(title, body, None)
     }
@@ -294,8 +579,8 @@ impl Notifier for LinuxNotifier {
 pub struct TerminalNotifier;
 
 impl Notifier for TerminalNotifier {
-    fn send(&self, title: &str, body: &str, _icon_path: Option<&str>) -> Result<()> {
-        print_terminal_branding();
+    fn send(&self, title: &str, body: &str, icon_path: Option<&str>) -> Result<()> {
+        let _ = print_terminal_branding(icon_path);
         println!("{TERMINAL_BADGE} {title}");
         println!("          {body}");
         Ok(())
@@ -352,51 +637,6 @@ pub fn send_notification(
             Ok(())
         }
     }
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn choose_sender_bundle_id<F>(mut has_bundle_id: F) -> Option<String>
-where
-    F: FnMut(&str) -> bool,
-{
-    PREFERRED_MACOS_SENDERS
-        .iter()
-        .copied()
-        .find(|bundle_id| has_bundle_id(bundle_id))
-        .map(str::to_owned)
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn macos_has_application_bundle(bundle_id: &str) -> bool {
-    let escaped_bundle = escape_for_applescript(bundle_id);
-    let script = format!("id of application id \"{escaped_bundle}\"");
-    Command::new("osascript")
-        .arg("-e")
-        .arg(script)
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn default_macos_sender_bundle_id() -> Option<String> {
-    static DETECTED: OnceLock<Option<String>> = OnceLock::new();
-    DETECTED
-        .get_or_init(|| choose_sender_bundle_id(macos_has_application_bundle))
-        .clone()
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn macos_sender_bundle_id() -> Option<String> {
-    if let Some(override_sender) = std::env::var("DISTILL_NOTIFICATION_SENDER")
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-    {
-        return Some(override_sender);
-    }
-
-    default_macos_sender_bundle_id()
 }
 
 fn send_native_notification(
@@ -514,42 +754,48 @@ mod tests {
     }
 
     #[test]
-    fn test_choose_sender_bundle_id_prefers_ghostty_over_others() {
-        let selected = choose_sender_bundle_id(|bundle_id| {
-            matches!(
-                bundle_id,
-                "com.mitchellh.ghostty" | "com.googlecode.iterm2" | "com.apple.Terminal"
-            )
-        });
+    fn test_parse_terminal_image_protocol_iterm_aliases() {
         assert_eq!(
-            selected.as_deref(),
-            Some("com.mitchellh.ghostty"),
-            "Ghostty should win when available"
+            parse_terminal_image_protocol("iterm2"),
+            Some(TerminalImageProtocol::Iterm)
+        );
+        assert_eq!(
+            parse_terminal_image_protocol("osc1337"),
+            Some(TerminalImageProtocol::Iterm)
         );
     }
 
     #[test]
-    fn test_choose_sender_bundle_id_falls_back_to_iterm() {
-        let selected = choose_sender_bundle_id(|bundle_id| {
-            matches!(bundle_id, "com.googlecode.iterm2" | "com.apple.Terminal")
-        });
+    fn test_parse_terminal_image_protocol_kitty() {
         assert_eq!(
-            selected.as_deref(),
-            Some("com.googlecode.iterm2"),
-            "iTerm should win when Ghostty is unavailable"
+            parse_terminal_image_protocol("kitty"),
+            Some(TerminalImageProtocol::Kitty)
         );
     }
 
     #[test]
-    fn test_choose_sender_bundle_id_falls_back_to_terminal_last() {
-        let selected = choose_sender_bundle_id(|bundle_id| bundle_id == "com.apple.Terminal");
-        assert_eq!(selected.as_deref(), Some("com.apple.Terminal"));
+    fn test_protocol_from_terminal_name_prefers_kitty_like() {
+        assert_eq!(
+            protocol_from_terminal_name("xterm-ghostty"),
+            Some(TerminalImageProtocol::Kitty)
+        );
+        assert_eq!(
+            protocol_from_terminal_name("xterm-kitty"),
+            Some(TerminalImageProtocol::Kitty)
+        );
     }
 
     #[test]
-    fn test_choose_sender_bundle_id_returns_none_when_no_known_sender_available() {
-        let selected = choose_sender_bundle_id(|_| false);
-        assert!(selected.is_none());
+    fn test_protocol_from_terminal_name_iterm() {
+        assert_eq!(
+            protocol_from_terminal_name("iTerm.app"),
+            Some(TerminalImageProtocol::Iterm)
+        );
+    }
+
+    #[test]
+    fn test_parse_terminal_image_protocol_none_for_unknown() {
+        assert_eq!(parse_terminal_image_protocol("unknown"), None);
     }
 
     // ── MacOsNotifier ─────────────────────────────────────────────────────────

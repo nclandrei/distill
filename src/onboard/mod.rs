@@ -169,9 +169,8 @@ pub fn save_config_then_setup(
                 });
             }
 
-            Err(setup_err).context(
-                "Post-onboarding setup failed; restored previous config file state",
-            )
+            Err(setup_err)
+                .context("Post-onboarding setup failed; restored previous config file state")
         }
     }
 }

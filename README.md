@@ -73,11 +73,18 @@ Notes:
 
 - `notifications`: `terminal|native|both|none`
 - `notification_icon`: `null` or absolute icon path
-- Terminal notifications render a small Distill ANSI icon in interactive terminals (`DISTILL_TERMINAL_ICON=off` to disable; `=on` to force).
+- Terminal notifications show an inline icon when supported by the terminal:
+  - Ghostty/kitty-like terminals via kitty graphics protocol
+  - iTerm2 via OSC 1337
+  - Fallback is text-only
+- Optional terminal controls:
+  - `DISTILL_TERMINAL_IMAGE=on|off` (`on` by default; set `off` to disable)
+  - `DISTILL_TERMINAL_IMAGE_PROTOCOL=ansi|kitty|iterm|none`
+- If running inside tmux, enable passthrough for image rendering: `set -g allow-passthrough on`.
+- In tmux sessions, distill auto-detects the attached terminal (`ghostty/kitty` first, then `iTerm`) and falls back to text-only when passthrough is disabled.
+- SVG `notification_icon` values are rasterized to PNG for terminal inline rendering.
 - On Linux native notifications, `notification_icon: null` falls back to the built-in project icon automatically.
-- On macOS native notifications, the notification icon is controlled by the sender app bundle icon (`terminal-notifier -sender`), not a custom per-notification icon.
-- Default macOS sender fallback order: Ghostty (`com.mitchellh.ghostty`) -> iTerm (`com.googlecode.iterm2`) -> Terminal (`com.apple.Terminal`).
-- Optional macOS override: set `DISTILL_NOTIFICATION_SENDER` to a bundle ID.
+- On macOS native notifications, distill tries `terminal-notifier -appIcon <icon>` first and falls back to AppleScript notification if that path fails.
 
 ## For AI Agents
 
