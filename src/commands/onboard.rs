@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use crate::agents::AgentKind;
 use crate::config::{AgentEntry, Config, Interval, NotificationPref, ShellType};
 use crate::onboard;
-use crate::shell::HookStatus;
+use crate::shell::{self, HookStatus};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -112,12 +112,19 @@ fn apply_spec_json(path: &Path) -> Result<()> {
 
 fn export_spec(home: &Path) -> Result<OnboardingSpec> {
     let detected = onboard::detect_agents(home);
-    let config = if Config::exists() {
-        Config::load().context("Failed to load existing distill config")?
+    let config_path = home.join(".distill").join("config.yaml");
+    let has_existing_config = config_path.exists();
+    let config = if has_existing_config {
+        Config::load_from(&config_path)
+            .with_context(|| format!("Failed to load existing distill config at {}", config_path.display()))?
     } else {
         default_config_from_detected(&detected)
     };
-    let install_shell_hook = config.shell != ShellType::Other;
+    let install_shell_hook = if has_existing_config {
+        shell_hook_installed(&config.shell, home)
+    } else {
+        config.shell != ShellType::Other
+    };
 
     Ok(OnboardingSpec {
         format_version: onboarding_format_version(),
@@ -136,6 +143,15 @@ fn export_spec(home: &Path) -> Result<OnboardingSpec> {
         notification_icon: config.notification_icon,
         install_shell_hook,
     })
+}
+
+fn shell_hook_installed(shell_type: &ShellType, home: &Path) -> bool {
+    let Some(path) = shell::shell_config_path(shell_type, home) else {
+        return false;
+    };
+    fs::read_to_string(path)
+        .map(|content| content.contains("# distill hook"))
+        .unwrap_or(false)
 }
 
 fn default_config_from_detected(detected: &[(AgentKind, bool)]) -> Config {
@@ -299,6 +315,7 @@ fn display_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn test_default_config_from_detected_prefers_installed_agents() {
@@ -372,5 +389,59 @@ mod tests {
         assert_eq!(config.shell, ShellType::Bash);
         assert_eq!(config.notifications, NotificationPref::Native);
         assert_eq!(config.notification_icon.as_deref(), Some("/tmp/icon.png"));
+    }
+
+    #[test]
+    fn test_export_spec_existing_config_without_hook_sets_install_shell_hook_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let config_path = home.join(".distill").join("config.yaml");
+        let config = Config {
+            agents: vec![AgentEntry {
+                name: "claude".to_string(),
+                enabled: true,
+            }],
+            scan_interval: Interval::Weekly,
+            proposal_agent: "claude".to_string(),
+            shell: ShellType::Zsh,
+            notifications: NotificationPref::Both,
+            notification_icon: None,
+        };
+        config.save_to(&config_path).unwrap();
+
+        let spec = export_spec(home).unwrap();
+        assert!(
+            !spec.install_shell_hook,
+            "should reflect current shell hook state when config already exists"
+        );
+    }
+
+    #[test]
+    fn test_export_spec_existing_config_with_hook_sets_install_shell_hook_true() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let config_path = home.join(".distill").join("config.yaml");
+        let config = Config {
+            agents: vec![AgentEntry {
+                name: "claude".to_string(),
+                enabled: true,
+            }],
+            scan_interval: Interval::Weekly,
+            proposal_agent: "claude".to_string(),
+            shell: ShellType::Zsh,
+            notifications: NotificationPref::Both,
+            notification_icon: None,
+        };
+        config.save_to(&config_path).unwrap();
+
+        let zshrc = PathBuf::from(home).join(".zshrc");
+        fs::write(
+            &zshrc,
+            "# distill hook\ncommand -v distill &>/dev/null && distill notify --check\n",
+        )
+        .unwrap();
+
+        let spec = export_spec(home).unwrap();
+        assert!(spec.install_shell_hook);
     }
 }
