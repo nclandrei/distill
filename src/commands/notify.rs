@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::config::NotificationPref;
+use crate::notify::print_terminal_branding;
 use crate::notify::send_notification;
 use anyhow::Result;
 
@@ -56,11 +57,12 @@ pub fn run(check: bool) -> Result<()> {
 }
 
 fn print_pending_proposals(count: usize) {
+    print_terminal_branding();
     println!(
-        "distill: {count} new proposal{} ready",
+        "[distill] {count} new proposal{} ready",
         if count == 1 { "" } else { "s" }
     );
-    println!("         Run 'distill review' to review them.");
+    println!("          Run 'distill review' to review them.");
 }
 
 #[cfg(test)]

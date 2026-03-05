@@ -202,9 +202,9 @@ mod tests {
 
         // Verify Codex's per-skill files
         let codex_testing =
-            std::fs::read_to_string(home.join(".codex/skills/testing/SKILL.md")).unwrap();
+            std::fs::read_to_string(home.join(".agents/skills/testing/SKILL.md")).unwrap();
         let codex_debugging =
-            std::fs::read_to_string(home.join(".codex/skills/debugging/SKILL.md")).unwrap();
+            std::fs::read_to_string(home.join(".agents/skills/debugging/SKILL.md")).unwrap();
         assert_eq!(codex_testing, "# Testing\nWrite tests first.");
         assert_eq!(codex_debugging, "# Debugging\nRead the error message.");
     }
@@ -297,8 +297,9 @@ mod tests {
         assert_eq!(claude_tdd, "# TDD\nRed, green, refactor.");
         assert_eq!(claude_docs, "# Docs\nWrite docs as you go.");
 
-        let codex_tdd = std::fs::read_to_string(home.join(".codex/skills/tdd/SKILL.md")).unwrap();
-        let codex_docs = std::fs::read_to_string(home.join(".codex/skills/docs/SKILL.md")).unwrap();
+        let codex_tdd = std::fs::read_to_string(home.join(".agents/skills/tdd/SKILL.md")).unwrap();
+        let codex_docs =
+            std::fs::read_to_string(home.join(".agents/skills/docs/SKILL.md")).unwrap();
         assert_eq!(codex_tdd, "# TDD\nRed, green, refactor.");
         assert_eq!(codex_docs, "# Docs\nWrite docs as you go.");
     }

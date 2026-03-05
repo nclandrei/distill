@@ -1,6 +1,10 @@
 use anyhow::{Context, Result};
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::Command;
+#[cfg(any(target_os = "macos", test))]
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use crate::config::NotificationPref;
 
@@ -11,6 +15,14 @@ const ICON_SHARE_SVG_RELATIVE: &str = "share/distill/icons/distill-icon.svg";
 const EMBEDDED_ICON_FILENAME: &str = "distill-color-256.png";
 const EMBEDDED_ICON_PNG: &[u8] =
     include_bytes!("../../assets/icons/png/color/distill-color-256.png");
+const TERMINAL_BADGE: &str = "[distill]";
+const NOTIFIER_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(any(target_os = "macos", test))]
+const PREFERRED_MACOS_SENDERS: &[&str] = &[
+    "com.mitchellh.ghostty",
+    "com.googlecode.iterm2",
+    "com.apple.Terminal",
+];
 
 // ── Trait ────────────────────────────────────────────────────────────────────
 
@@ -28,6 +40,67 @@ fn binary_exists(bin: &str) -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+fn should_render_terminal_icon() -> bool {
+    if let Ok(raw) = std::env::var("DISTILL_TERMINAL_ICON") {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "0" | "false" | "off" => return false,
+            "1" | "true" | "on" => return true,
+            _ => {}
+        }
+    }
+
+    if !std::io::stdout().is_terminal() {
+        return false;
+    }
+    if std::env::var_os("NO_COLOR").is_some() {
+        return false;
+    }
+    !matches!(std::env::var("TERM").ok().as_deref(), Some("dumb"))
+}
+
+pub fn print_terminal_branding() {
+    if !should_render_terminal_icon() {
+        return;
+    }
+
+    const CYAN: &str = "\x1b[38;2;6;182;212m";
+    const AMBER: &str = "\x1b[38;2;245;158;11m";
+    const RESET: &str = "\x1b[0m";
+
+    println!("{CYAN}      /================\\{RESET}");
+    println!("{CYAN}     /  ||   ||   ||    \\{RESET}");
+    println!("{CYAN}    /___||___||___||_____\\{RESET}");
+    println!("{CYAN}           \\   {AMBER}<>{CYAN}   /{RESET}");
+    println!("{AMBER}             \\ () /{RESET}");
+}
+
+fn run_command_with_timeout(command: &mut Command, name: &str, timeout: Duration) -> Result<()> {
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("Failed to run {name}"))?;
+    let start = Instant::now();
+
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .with_context(|| format!("Failed while waiting for {name}"))?
+        {
+            if status.success() {
+                return Ok(());
+            }
+            anyhow::bail!("{name} exited with non-zero status: {status}");
+        }
+
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("{name} timed out after {}ms", timeout.as_millis());
+        }
+
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn first_existing_path(candidates: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
@@ -136,15 +209,9 @@ impl Notifier for MacOsScriptNotifier {
             "display notification \"{}\" with title \"{}\"",
             escaped_body, escaped_title
         );
-        let status = Command::new("osascript")
-            .arg("-e")
-            .arg(&script)
-            .status()
-            .context("Failed to run osascript")?;
-        if !status.success() {
-            anyhow::bail!("osascript exited with non-zero status: {}", status);
-        }
-        Ok(())
+        let mut command = Command::new("osascript");
+        command.arg("-e").arg(&script);
+        run_command_with_timeout(&mut command, "osascript", NOTIFIER_COMMAND_TIMEOUT)
     }
 
     fn is_available(&self) -> bool {
@@ -154,27 +221,20 @@ impl Notifier for MacOsScriptNotifier {
 
 /// macOS native notifier via `terminal-notifier`.
 ///
-/// Used when an icon path is configured, because `osascript` does not support
-/// custom notification icons.
+/// We prefer stable sender icons (`-sender`) over `-appIcon`, because
+/// `-appIcon` relies on private APIs and is unreliable on newer macOS versions.
 #[cfg(any(target_os = "macos", test))]
 pub struct MacOsTerminalNotifier;
 
 #[cfg(any(target_os = "macos", test))]
 impl Notifier for MacOsTerminalNotifier {
-    fn send(&self, title: &str, body: &str, icon_path: Option<&str>) -> Result<()> {
+    fn send(&self, title: &str, body: &str, _icon_path: Option<&str>) -> Result<()> {
         let mut command = Command::new("terminal-notifier");
         command.arg("-title").arg(title).arg("-message").arg(body);
-        if let Some(icon) = icon_path.filter(|path| !path.trim().is_empty()) {
-            command.arg("-appIcon").arg(icon);
+        if let Some(sender) = macos_sender_bundle_id() {
+            command.arg("-sender").arg(sender);
         }
-
-        let status = command
-            .status()
-            .context("Failed to run terminal-notifier")?;
-        if !status.success() {
-            anyhow::bail!("terminal-notifier exited with non-zero status: {}", status);
-        }
-        Ok(())
+        run_command_with_timeout(&mut command, "terminal-notifier", NOTIFIER_COMMAND_TIMEOUT)
     }
 
     fn is_available(&self) -> bool {
@@ -184,19 +244,17 @@ impl Notifier for MacOsTerminalNotifier {
 
 /// macOS native notifier with icon-aware backend selection.
 ///
-/// If an icon is configured and `terminal-notifier` is installed, it is used.
+/// If `terminal-notifier` is installed, it is used for richer behavior.
 /// Otherwise, we fall back to `osascript`.
 #[cfg(any(target_os = "macos", test))]
 pub struct MacOsNotifier;
 
 #[cfg(any(target_os = "macos", test))]
 impl Notifier for MacOsNotifier {
-    fn send(&self, title: &str, body: &str, icon_path: Option<&str>) -> Result<()> {
-        if icon_path.is_some() {
-            let notifier = MacOsTerminalNotifier;
-            if notifier.is_available() {
-                return notifier.send(title, body, icon_path);
-            }
+    fn send(&self, title: &str, body: &str, _icon_path: Option<&str>) -> Result<()> {
+        let notifier = MacOsTerminalNotifier;
+        if notifier.is_available() {
+            return notifier.send(title, body, None);
         }
         MacOsScriptNotifier.send(title, body, None)
     }
@@ -221,16 +279,8 @@ impl Notifier for LinuxNotifier {
         if let Some(icon) = icon_path.filter(|path| !path.trim().is_empty()) {
             command.arg("--icon").arg(icon);
         }
-
-        let status = command
-            .arg(title)
-            .arg(body)
-            .status()
-            .context("Failed to run notify-send")?;
-        if !status.success() {
-            anyhow::bail!("notify-send exited with non-zero status: {}", status);
-        }
-        Ok(())
+        command.arg(title).arg(body);
+        run_command_with_timeout(&mut command, "notify-send", NOTIFIER_COMMAND_TIMEOUT)
     }
 
     fn is_available(&self) -> bool {
@@ -245,8 +295,9 @@ pub struct TerminalNotifier;
 
 impl Notifier for TerminalNotifier {
     fn send(&self, title: &str, body: &str, _icon_path: Option<&str>) -> Result<()> {
-        println!("distill: {title}");
-        println!("         {body}");
+        print_terminal_branding();
+        println!("{TERMINAL_BADGE} {title}");
+        println!("          {body}");
         Ok(())
     }
 
@@ -301,6 +352,51 @@ pub fn send_notification(
             Ok(())
         }
     }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn choose_sender_bundle_id<F>(mut has_bundle_id: F) -> Option<String>
+where
+    F: FnMut(&str) -> bool,
+{
+    PREFERRED_MACOS_SENDERS
+        .iter()
+        .copied()
+        .find(|bundle_id| has_bundle_id(bundle_id))
+        .map(str::to_owned)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_has_application_bundle(bundle_id: &str) -> bool {
+    let escaped_bundle = escape_for_applescript(bundle_id);
+    let script = format!("id of application id \"{escaped_bundle}\"");
+    Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn default_macos_sender_bundle_id() -> Option<String> {
+    static DETECTED: OnceLock<Option<String>> = OnceLock::new();
+    DETECTED
+        .get_or_init(|| choose_sender_bundle_id(macos_has_application_bundle))
+        .clone()
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_sender_bundle_id() -> Option<String> {
+    if let Some(override_sender) = std::env::var("DISTILL_NOTIFICATION_SENDER")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+    {
+        return Some(override_sender);
+    }
+
+    default_macos_sender_bundle_id()
 }
 
 fn send_native_notification(
@@ -417,6 +513,45 @@ mod tests {
         assert!(result.is_ok(), "TerminalNotifier::send should never error");
     }
 
+    #[test]
+    fn test_choose_sender_bundle_id_prefers_ghostty_over_others() {
+        let selected = choose_sender_bundle_id(|bundle_id| {
+            matches!(
+                bundle_id,
+                "com.mitchellh.ghostty" | "com.googlecode.iterm2" | "com.apple.Terminal"
+            )
+        });
+        assert_eq!(
+            selected.as_deref(),
+            Some("com.mitchellh.ghostty"),
+            "Ghostty should win when available"
+        );
+    }
+
+    #[test]
+    fn test_choose_sender_bundle_id_falls_back_to_iterm() {
+        let selected = choose_sender_bundle_id(|bundle_id| {
+            matches!(bundle_id, "com.googlecode.iterm2" | "com.apple.Terminal")
+        });
+        assert_eq!(
+            selected.as_deref(),
+            Some("com.googlecode.iterm2"),
+            "iTerm should win when Ghostty is unavailable"
+        );
+    }
+
+    #[test]
+    fn test_choose_sender_bundle_id_falls_back_to_terminal_last() {
+        let selected = choose_sender_bundle_id(|bundle_id| bundle_id == "com.apple.Terminal");
+        assert_eq!(selected.as_deref(), Some("com.apple.Terminal"));
+    }
+
+    #[test]
+    fn test_choose_sender_bundle_id_returns_none_when_no_known_sender_available() {
+        let selected = choose_sender_bundle_id(|_| false);
+        assert!(selected.is_none());
+    }
+
     // ── MacOsNotifier ─────────────────────────────────────────────────────────
 
     #[test]
@@ -466,12 +601,18 @@ mod tests {
 
     #[test]
     fn test_send_native_notification_is_best_effort_without_terminal_fallback() {
+        if cfg!(target_os = "macos") {
+            return;
+        }
         let result = send_native_notification("distill", "message", None, false);
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_send_native_notification_is_best_effort_with_terminal_fallback() {
+        if cfg!(target_os = "macos") {
+            return;
+        }
         let result = send_native_notification("distill", "message", None, true);
         assert!(result.is_ok());
     }

@@ -206,7 +206,7 @@ impl Agent for ClaudeAdapter {
 // ---------------------------------------------------------------------------
 
 /// Codex adapter — reads from ~/.codex/, writes skills to
-/// ~/.codex/skills/<skill-name>/SKILL.md
+/// ~/.agents/skills/<skill-name>/SKILL.md
 pub struct CodexAdapter {
     pub home: PathBuf,
 }
@@ -247,7 +247,7 @@ impl Agent for CodexAdapter {
     fn write_skill(&self, skill: &Skill) -> Result<()> {
         let target = self
             .home
-            .join(".codex")
+            .join(".agents")
             .join("skills")
             .join(&skill.name)
             .join("SKILL.md");
@@ -358,11 +358,11 @@ mod tests {
 
         adapter.write_skill(&skill).unwrap();
         let first =
-            std::fs::read_to_string(home.join(".codex/skills/test-skill/SKILL.md")).unwrap();
+            std::fs::read_to_string(home.join(".agents/skills/test-skill/SKILL.md")).unwrap();
 
         adapter.write_skill(&skill).unwrap();
         let second =
-            std::fs::read_to_string(home.join(".codex/skills/test-skill/SKILL.md")).unwrap();
+            std::fs::read_to_string(home.join(".agents/skills/test-skill/SKILL.md")).unwrap();
 
         assert_eq!(first, second);
     }
@@ -598,7 +598,7 @@ mod tests {
         };
         adapter.write_skill(&skill).unwrap();
         let written =
-            std::fs::read_to_string(home.join(".codex/skills/auto-dir/SKILL.md")).unwrap();
+            std::fs::read_to_string(home.join(".agents/skills/auto-dir/SKILL.md")).unwrap();
         assert_eq!(written, "created automatically");
     }
 
@@ -648,8 +648,9 @@ mod tests {
         adapter.write_skill(&skill_a).unwrap();
         adapter.write_skill(&skill_b).unwrap();
 
-        let written_a = std::fs::read_to_string(home.join(".codex/skills/alpha/SKILL.md")).unwrap();
-        let written_b = std::fs::read_to_string(home.join(".codex/skills/beta/SKILL.md")).unwrap();
+        let written_a =
+            std::fs::read_to_string(home.join(".agents/skills/alpha/SKILL.md")).unwrap();
+        let written_b = std::fs::read_to_string(home.join(".agents/skills/beta/SKILL.md")).unwrap();
         assert_eq!(written_a, "Alpha content");
         assert_eq!(written_b, "Beta content");
     }

@@ -27,6 +27,34 @@ distill review       # Review proposals (accept/reject/edit/snooze/batch)
 distill status       # Check config + pending proposals + last scan
 ```
 
+## Local Commit Checks (Git + jj)
+
+For this repo, run:
+
+```bash
+make hooks-install
+```
+
+This configures:
+- Git `pre-commit` hook (via `core.hooksPath`) to run local checks before `git commit`
+- repo-local `jj` aliases:
+  - `jj safe-commit ...`
+  - `jj safe-describe ...`
+
+The shared check pipeline auto-applies format/fixes, then verifies tests:
+
+```bash
+cargo fmt --all
+cargo clippy --fix --allow-dirty --allow-staged -- -D warnings
+cargo fmt --all
+cargo clippy -- -D warnings
+cargo test
+```
+
+Notes:
+- `jj` currently does not have native commit hooks, so the practical equivalent is using the `safe-*` aliases for commit-time enforcement.
+- You can run the same pipeline anytime with `make local-checks`.
+
 ## Commands
 
 | Command | Description |
@@ -44,7 +72,11 @@ distill status       # Check config + pending proposals + last scan
 
 - `notifications`: `terminal|native|both|none`
 - `notification_icon`: `null` or absolute icon path
-- If `notification_icon` is `null`, distill falls back to the built-in project icon automatically.
+- Terminal notifications render a small Distill ANSI icon in interactive terminals (`DISTILL_TERMINAL_ICON=off` to disable; `=on` to force).
+- On Linux native notifications, `notification_icon: null` falls back to the built-in project icon automatically.
+- On macOS native notifications, the notification icon is controlled by the sender app bundle icon (`terminal-notifier -sender`), not a custom per-notification icon.
+- Default macOS sender fallback order: Ghostty (`com.mitchellh.ghostty`) -> iTerm (`com.googlecode.iterm2`) -> Terminal (`com.apple.Terminal`).
+- Optional macOS override: set `DISTILL_NOTIFICATION_SENDER` to a bundle ID.
 
 ## For AI Agents
 
@@ -83,7 +115,10 @@ distill review --apply-json review.json
 `review.json` behavior:
 - Contains all pending proposals plus an editable `decision` field
 - Missing decisions default to `skip`
-- Applying decisions writes skills, logs history, removes processed proposals, and syncs accepted skills to configured agents
+- Applying decisions writes skills, logs history, and removes processed proposals
+- Accepted skills are synced to:
+  - `~/.agents/skills/<skill-name>/SKILL.md` (default shared target)
+  - `~/.claude/skills/<skill-name>/SKILL.md` when Claude is enabled
 
 ### 3) Stdin/stdout mode
 
