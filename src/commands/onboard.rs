@@ -80,10 +80,8 @@ fn apply_spec_json(path: &Path) -> Result<()> {
     validate_spec(&spec)?;
 
     let config = config_from_spec(&spec);
-    config.save()?;
-
     let home = home_dir();
-    let post_setup = onboard::apply_post_onboarding_setup(&config, &home, spec.install_shell_hook)?;
+    let post_setup = onboard::save_config_then_setup(&config, &home, spec.install_shell_hook)?;
 
     println!("Onboarding applied from JSON.");
     println!("  Config path      : {}", Config::config_path().display());

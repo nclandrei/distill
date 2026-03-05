@@ -126,6 +126,56 @@ pub fn apply_post_onboarding_setup(
     })
 }
 
+/// Persist config, then run setup side-effects.
+///
+/// If side-effects fail, restore the previous config file state so onboarding
+/// doesn't leave a partially applied config behind.
+pub fn save_config_then_setup(
+    config: &Config,
+    home: &Path,
+    install_shell_hook: bool,
+) -> Result<PostSetupResult> {
+    let config_path = Config::config_path();
+    let had_previous = config_path.exists();
+    let previous_config = if had_previous {
+        Some(
+            std::fs::read_to_string(&config_path)
+                .with_context(|| format!("Failed to read {}", config_path.display()))?,
+        )
+    } else {
+        None
+    };
+
+    config.save()?;
+    match apply_post_onboarding_setup(config, home, install_shell_hook) {
+        Ok(result) => Ok(result),
+        Err(setup_err) => {
+            let rollback = if had_previous {
+                std::fs::write(&config_path, previous_config.unwrap_or_default())
+            } else {
+                match std::fs::remove_file(&config_path) {
+                    Ok(()) => Ok(()),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(err) => Err(err),
+                }
+            };
+
+            if let Err(rollback_err) = rollback {
+                return Err(setup_err).with_context(|| {
+                    format!(
+                        "Post-onboarding setup failed and config rollback failed: {}",
+                        rollback_err
+                    )
+                });
+            }
+
+            Err(setup_err).context(
+                "Post-onboarding setup failed; restored previous config file state",
+            )
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Interactive TUI helpers
 // ---------------------------------------------------------------------------
@@ -1249,8 +1299,7 @@ pub fn run_interactive() -> Result<()> {
     };
 
     let config = build_config(&answers);
-    config.save()?;
-    let post_setup = apply_post_onboarding_setup(&config, &home, install_shell_hook)?;
+    let post_setup = save_config_then_setup(&config, &home, install_shell_hook)?;
 
     let enabled_names: Vec<&str> = config
         .agents
