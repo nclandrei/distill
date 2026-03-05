@@ -16,7 +16,7 @@
 
 ## Other useful commands
 - `distill scan --now` to generate proposal files immediately
-- `distill convert <server>` for one-shot conversion/verification, or `distill convert list|inspect|plan|apply|verify` for expert flows
+- `distill convert <server>` for one-shot conversion/verification (generates orchestrator + capability skills), or `distill convert list|inspect|plan|apply|verify` for expert flows
 - `distill status` to inspect config, pending proposals, and last scan
 - `distill watch --install|--uninstall` to manage scheduled scans
 - `distill notify --check` for shell-hook notification checks

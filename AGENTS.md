@@ -139,7 +139,7 @@ screencapture -x -i /absolute/path/selection.png
   - `distill convert apply <server> --mode auto --config "$TMPDIR/distill-mcp.json"`
   - `distill convert verify <server> --config "$TMPDIR/distill-mcp.json"`
 - For replace-mode verification, require explicit `--yes` and assert both:
-  - generated skill file exists under `~/.distill/skills/`
+  - generated orchestrator skill plus capability skills exist under `~/.distill/skills/`
   - MCP config backup file (`*.bak-<timestamp>`) is created before config mutation
 - For one-proposal review flows, pressing `a` can immediately complete the app and stop tmux.
 - If tmux exits right after action, treat that as expected completion and verify outcomes via filesystem artifacts:

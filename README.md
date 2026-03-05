@@ -67,8 +67,8 @@ Notes:
 | `distill convert list [--json] [--config <path>]` | Discover MCP servers from known config locations |
 | `distill convert inspect <server> [--json] [--config <path>]` | Inspect one MCP server profile and recommendation |
 | `distill convert plan <server> [--mode auto|hybrid|replace] [--json]` | Generate a conversion plan with safety gates |
-| `distill convert apply <server> [--mode auto|hybrid|replace] [--yes] [--json]` | Generate a clean skill (and optionally update MCP config for replace mode) |
-| `distill convert verify <server> [--json] [--config <path>]` | Verify generated skill coverage against live MCP tools |
+| `distill convert apply <server> [--mode auto|hybrid|replace] [--yes] [--json]` | Generate one orchestrator skill plus per-tool capability skills (and optionally update MCP config for replace mode) |
+| `distill convert verify <server> [--json] [--config <path>]` | Verify generated orchestrator/capability skill parity against live MCP tools |
 | `distill dedupe [--dry-run]` | Detect duplicate global skills and propose removals |
 | `distill sync-agents ...` | Propose `AGENTS.md` updates from project evidence |
 | `distill status` | Show config, pending proposals, accepted skills |
@@ -171,6 +171,6 @@ Behavior notes:
 - `distill convert <server>` defaults to safe hybrid application and then verifies parity.
 - `inspect` accepts either a full server id (`source:name`) or a unique server name.
 - `plan --mode replace` is blocked automatically when the server is not a safe replacement candidate.
-- `apply` writes clean generated skills into `~/.distill/skills/` by default, and stores parity metadata in `~/.distill/skills/.distill-manifests/`.
+- `apply` writes one orchestrator skill (`mcp-<server>.md`) plus capability skills (`mcp-<server>-tool-<tool>.md`) into `~/.distill/skills/` by default, and stores parity metadata in `~/.distill/skills/.distill-manifests/`.
 - `apply --mode replace` requires `--yes`, creates a backup of the MCP config, and removes the target server entry when safe.
-- `verify` compares generated skill hints with live MCP introspection to report parity gaps (`missing_in_server`, `missing_in_skill`).
+- `verify` checks required tool coverage and generated file presence, and reports parity gaps (`missing_in_server`, `missing_in_skill`, `missing_skill_files`).

@@ -79,6 +79,9 @@ Default one-shot flow:
 This runs inspect -> plan(auto) -> apply(hybrid by default) -> verify.
 Use --replace --yes if you explicitly want destructive config mutation.
 
+`apply` generates one orchestrator skill plus per-tool capability skills.
+`verify` checks parity for required tools and required generated skill files.
+
 For non-interactive automation, use:
   distill convert <server> --json
   distill convert list --json

@@ -294,7 +294,11 @@ fn print_apply_result(result: &ConvertApplyResult) {
     println!("Applied conversion for {}", result.server.id);
     println!("  requested_mode    : {}", result.requested_mode);
     println!("  effective_mode    : {}", result.effective_mode);
-    println!("  skill_path        : {}", result.skill_path.display());
+    println!(
+        "  orchestrator      : {}",
+        result.orchestrator_skill_path.display()
+    );
+    println!("  capability_skills : {}", result.tool_skill_paths.len());
     println!("  mcp_config_updated: {}", result.mcp_config_updated);
     if let Some(backup) = &result.mcp_config_backup {
         println!("  mcp_config_backup : {}", backup.display());
@@ -311,16 +315,17 @@ fn print_apply_result(result: &ConvertApplyResult) {
 fn print_verify_report(report: &ConvertVerifyReport) {
     println!("Verification for {}", report.server.id);
     println!("  passed               : {}", report.passed);
-    println!("  skill_path           : {}", report.skill_path.display());
+    println!(
+        "  orchestrator         : {}",
+        report.orchestrator_skill_path.display()
+    );
+    println!("  capability_skills    : {}", report.tool_skill_paths.len());
     println!("  introspection_ok     : {}", report.introspection_ok);
     println!(
         "  introspected_tools   : {}",
         report.introspected_tool_count
     );
-    println!(
-        "  required_hint_count  : {}",
-        report.required_tool_hints.len()
-    );
+    println!("  required_tool_count  : {}", report.required_tools.len());
     if !report.missing_in_server.is_empty() {
         println!(
             "  missing_in_server    : {}",
@@ -331,6 +336,12 @@ fn print_verify_report(report: &ConvertVerifyReport) {
         println!(
             "  missing_in_skill     : {}",
             report.missing_in_skill.join(", ")
+        );
+    }
+    if !report.missing_skill_files.is_empty() {
+        println!(
+            "  missing_skill_files  : {}",
+            report.missing_skill_files.join(", ")
         );
     }
     if !report.notes.is_empty() {
@@ -344,14 +355,15 @@ fn print_verify_report(report: &ConvertVerifyReport) {
 fn print_run_result(result: &ConvertRunResult) {
     println!("Converted {}", result.server_id);
     println!(
-        "mode={} verify={} skill={}",
+        "mode={} verify={} orchestrator={} capability_skills={}",
         result.applied_mode,
         if result.verify_passed {
             "passed"
         } else {
             "failed"
         },
-        result.apply.skill_path.display()
+        result.apply.orchestrator_skill_path.display(),
+        result.apply.tool_skill_paths.len()
     );
     if result.apply.mcp_config_updated {
         if let Some(backup) = &result.apply.mcp_config_backup {
@@ -372,6 +384,12 @@ fn print_run_result(result: &ConvertRunResult) {
             }
             if !verify.missing_in_skill.is_empty() {
                 println!("missing_in_skill={}", verify.missing_in_skill.join(","));
+            }
+            if !verify.missing_skill_files.is_empty() {
+                println!(
+                    "missing_skill_files={}",
+                    verify.missing_skill_files.join(",")
+                );
             }
         }
     }

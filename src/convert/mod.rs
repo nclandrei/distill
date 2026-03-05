@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -108,7 +108,9 @@ pub struct ConvertApplyResult {
     pub server: MCPServerProfile,
     pub requested_mode: PlanMode,
     pub effective_mode: PlanMode,
+    pub orchestrator_skill_path: PathBuf,
     pub skill_path: PathBuf,
+    pub tool_skill_paths: Vec<PathBuf>,
     pub mcp_config_backup: Option<PathBuf>,
     pub mcp_config_updated: bool,
     pub notes: Vec<String>,
@@ -118,14 +120,23 @@ pub struct ConvertApplyResult {
 pub struct ConvertVerifyReport {
     pub generated_at: DateTime<Utc>,
     pub server: MCPServerProfile,
+    pub orchestrator_skill_path: PathBuf,
     pub skill_path: PathBuf,
+    pub tool_skill_paths: Vec<PathBuf>,
     pub introspection_ok: bool,
     pub introspected_tool_count: usize,
-    pub required_tool_hints: Vec<String>,
+    pub required_tools: Vec<String>,
     pub missing_in_server: Vec<String>,
     pub missing_in_skill: Vec<String>,
+    pub missing_skill_files: Vec<String>,
     pub passed: bool,
     pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ManifestToolSkill {
+    tool_name: String,
+    skill_file: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -134,7 +145,20 @@ struct SkillParityManifest {
     generated_at: DateTime<Utc>,
     server_id: String,
     server_name: String,
+    #[serde(default)]
+    orchestrator_skill: Option<String>,
+    #[serde(default)]
+    required_tools: Vec<String>,
+    #[serde(default)]
+    tool_skills: Vec<ManifestToolSkill>,
+    #[serde(default)]
     required_tool_hints: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ToolSpec {
+    name: String,
+    description: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -177,7 +201,7 @@ pub fn plan(
 
     let mut actions = vec![
         "Capture the current MCP server config and create a rollback backup.".to_string(),
-        "Generate skill drafts from server purpose, command metadata, and permission profile."
+        "Generate one orchestrator skill and a capability skill set mapped to tool behaviors."
             .to_string(),
     ];
     let mut warnings = vec![];
@@ -186,7 +210,7 @@ pub fn plan(
     match effective_mode {
         PlanMode::Hybrid => {
             actions.push(
-                "Keep MCP enabled and emit workflow-oriented skills that orchestrate MCP usage."
+                "Keep MCP enabled and use the generated skill set as the default orchestration layer."
                     .to_string(),
             );
             actions.push(
@@ -196,7 +220,7 @@ pub fn plan(
         }
         PlanMode::Replace => {
             actions.push(
-                "Generate replacement skills and parity checks for baseline MCP behaviors."
+                "Generate replacement skill set and parity checks for tool-level behaviors."
                     .to_string(),
             );
             actions.push(
@@ -272,32 +296,93 @@ pub fn apply(
     std::fs::create_dir_all(&skills_dir)
         .with_context(|| format!("Failed to create skills directory {}", skills_dir.display()))?;
 
-    let introspected_tools = introspect_tools(&conversion_plan.server).ok();
-    let required_hints =
-        required_tool_hints(&conversion_plan.server, introspected_tools.as_deref());
+    let introspected_specs = introspect_tool_specs(&conversion_plan.server).ok();
+    let introspected_tools = introspected_specs.as_ref().map(|items| {
+        items
+            .iter()
+            .map(|item| item.name.clone())
+            .collect::<Vec<String>>()
+    });
 
-    let skill_filename = format!("mcp-{}.md", sanitize_slug(&conversion_plan.server.name));
-    let skill_path = skills_dir.join(skill_filename);
+    let mut required_tools =
+        required_tool_names(&conversion_plan.server, introspected_tools.as_deref());
+    if required_tools.is_empty() {
+        required_tools.push("general-orchestration".to_string());
+    }
+
+    let spec_by_name = introspected_specs
+        .as_ref()
+        .map(|items| {
+            items
+                .iter()
+                .cloned()
+                .map(|item| (item.name.clone(), item))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+
+    let server_slug = sanitize_slug(&conversion_plan.server.name);
+    let mut slug_counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut tool_skills = Vec::new();
+    let mut tool_skill_paths = Vec::new();
+    for tool_name in &required_tools {
+        let base_slug = sanitize_slug(tool_name);
+        let counter = slug_counts.entry(base_slug.clone()).or_insert(0);
+        let tool_slug = if *counter == 0 {
+            base_slug.clone()
+        } else {
+            format!("{base_slug}-{}", *counter + 1)
+        };
+        *counter += 1;
+
+        let file_name = format!("mcp-{server_slug}-tool-{tool_slug}.md");
+        let skill_path = skills_dir.join(&file_name);
+        let description = spec_by_name
+            .get(tool_name)
+            .and_then(|item| item.description.as_deref());
+        std::fs::write(
+            &skill_path,
+            render_capability_skill_markdown(&conversion_plan.server, tool_name, description),
+        )
+        .with_context(|| format!("Failed to write capability skill {}", skill_path.display()))?;
+        tool_skills.push(ManifestToolSkill {
+            tool_name: tool_name.clone(),
+            skill_file: file_name,
+        });
+        tool_skill_paths.push(skill_path);
+    }
+
+    let orchestrator_filename = format!("mcp-{server_slug}.md");
+    let skill_path = skills_dir.join(&orchestrator_filename);
     std::fs::write(
         &skill_path,
-        render_skill_markdown(&conversion_plan, introspected_tools.as_deref()),
+        render_orchestrator_skill_markdown(&conversion_plan, &tool_skills),
     )
     .with_context(|| {
         format!(
-            "Failed to write converted skill file {}",
+            "Failed to write converted orchestrator skill {}",
             skill_path.display()
         )
     })?;
     let manifest = SkillParityManifest {
-        format_version: 1,
+        format_version: 2,
         generated_at: Utc::now(),
         server_id: conversion_plan.server.id.clone(),
         server_name: conversion_plan.server.name.clone(),
-        required_tool_hints: required_hints,
+        orchestrator_skill: Some(orchestrator_filename),
+        required_tools: required_tools.clone(),
+        tool_skills: tool_skills.clone(),
+        required_tool_hints: required_tools
+            .iter()
+            .map(|tool| format!("{}{}", tool_hint_prefix(&conversion_plan.server), tool))
+            .collect(),
     };
     write_skill_manifest(&skill_path, &manifest)?;
 
-    let mut notes = vec!["Generated a workflow skill from conversion plan.".to_string()];
+    let mut notes = vec![format!(
+        "Generated 1 orchestrator skill and {} capability skills.",
+        tool_skills.len()
+    )];
     notes.push("Wrote internal parity manifest for verify checks.".to_string());
     let mut mcp_config_backup = None;
     let mut mcp_config_updated = false;
@@ -319,10 +404,11 @@ pub fn apply(
             )?;
             if !verify.passed {
                 bail!(
-                    "Replace mode verification failed for '{}': missing_in_server=[{}], missing_in_skill=[{}]",
+                    "Replace mode verification failed for '{}': missing_in_server=[{}], missing_in_skill=[{}], missing_skill_files=[{}]",
                     conversion_plan.server.id,
                     verify.missing_in_server.join(", "),
-                    verify.missing_in_skill.join(", ")
+                    verify.missing_in_skill.join(", "),
+                    verify.missing_skill_files.join(", ")
                 );
             }
             let (backup, updated) = remove_server_from_config(
@@ -347,7 +433,9 @@ pub fn apply(
         server: conversion_plan.server,
         requested_mode,
         effective_mode: conversion_plan.effective_mode,
+        orchestrator_skill_path: skill_path.clone(),
         skill_path,
+        tool_skill_paths,
         mcp_config_backup,
         mcp_config_updated,
         notes,
@@ -381,7 +469,7 @@ fn verify_with_server_and_path(
 
     let skill_content = std::fs::read_to_string(skill_path)
         .with_context(|| format!("Failed to read {}", skill_path.display()))?;
-    let required_hints = required_tool_hints(server, introspected_tools);
+    let mut required_tools = required_tool_names(server, introspected_tools);
 
     let mut notes = vec![];
     let introspected_set = introspected_tools
@@ -405,7 +493,9 @@ fn verify_with_server_and_path(
     }
 
     let manifest_path = manifest_path_for_skill(skill_path)?;
-    let skill_hints = if manifest_path.exists() {
+    let mut manifest_tool_skills = vec![];
+    let mut orchestrator_skill_path = skill_path.to_path_buf();
+    if manifest_path.exists() {
         let manifest_raw = std::fs::read_to_string(&manifest_path)
             .with_context(|| format!("Failed to read {}", manifest_path.display()))?;
         let manifest: SkillParityManifest =
@@ -419,26 +509,75 @@ fn verify_with_server_and_path(
             "Loaded parity manifest from {}.",
             manifest_path.display()
         ));
-        manifest.required_tool_hints
+        if let Some(orchestrator) = manifest.orchestrator_skill {
+            if let Some(parent) = skill_path.parent() {
+                orchestrator_skill_path = parent.join(orchestrator);
+            }
+        }
+        if !manifest.required_tools.is_empty() {
+            required_tools = manifest
+                .required_tools
+                .iter()
+                .map(|tool| normalize_tool_name(tool))
+                .collect();
+        } else if !manifest.required_tool_hints.is_empty() {
+            required_tools = manifest
+                .required_tool_hints
+                .iter()
+                .map(|hint| hint_to_tool_name(hint))
+                .collect();
+        }
+        manifest_tool_skills = manifest.tool_skills;
     } else {
-        let legacy = extract_tool_hints_from_skill(&skill_content);
+        let legacy = extract_tool_hints_from_skill(&skill_content)
+            .iter()
+            .map(|hint| hint_to_tool_name(hint))
+            .collect::<Vec<_>>();
         notes.push(
             "Parity manifest missing; falling back to legacy tool-hint parsing from markdown."
                 .to_string(),
         );
-        legacy
-    };
-    let skill_hint_set = skill_hints.iter().cloned().collect::<BTreeSet<_>>();
-    let missing_in_skill = required_hints
+        if required_tools.is_empty() {
+            required_tools = legacy.clone();
+        }
+        if !legacy.is_empty() {
+            let current_file = skill_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("skill.md")
+                .to_string();
+            manifest_tool_skills = legacy
+                .iter()
+                .map(|tool_name| ManifestToolSkill {
+                    tool_name: tool_name.clone(),
+                    skill_file: current_file.clone(),
+                })
+                .collect();
+        }
+    }
+
+    required_tools.sort();
+    required_tools.dedup();
+
+    let parent_dir = skill_path
+        .parent()
+        .context("Skill path has no parent directory for verification")?;
+    let tool_skill_paths = manifest_tool_skills
         .iter()
-        .filter(|hint| !skill_hint_set.contains(*hint))
+        .map(|tool| parent_dir.join(&tool.skill_file))
+        .collect::<Vec<_>>();
+    let mapped_tool_names = manifest_tool_skills
+        .iter()
+        .map(|tool| normalize_tool_name(&tool.tool_name))
+        .collect::<BTreeSet<_>>();
+
+    let missing_in_skill = required_tools
+        .iter()
+        .filter(|tool| !mapped_tool_names.contains(*tool))
         .cloned()
         .collect::<Vec<_>>();
 
-    let required_tool_names = required_hints
-        .iter()
-        .map(|hint| hint_to_tool_name(hint))
-        .collect::<BTreeSet<_>>();
+    let required_tool_names = required_tools.iter().cloned().collect::<BTreeSet<_>>();
     let missing_in_server = if introspection_ok {
         required_tool_names
             .iter()
@@ -449,36 +588,50 @@ fn verify_with_server_and_path(
         vec![]
     };
 
-    let passed = if required_hints.is_empty() {
-        let mapped_skill_tools = skill_hints
-            .iter()
-            .map(|hint| hint_to_tool_name(hint))
-            .collect::<BTreeSet<_>>();
-        if introspection_ok {
-            mapped_skill_tools
-                .iter()
-                .any(|tool| introspected_set.contains(tool))
-        } else {
-            !mapped_skill_tools.is_empty()
-        }
-    } else {
-        missing_in_skill.is_empty() && (missing_in_server.is_empty() || !introspection_ok)
-    };
+    let mut missing_skill_files = manifest_tool_skills
+        .iter()
+        .zip(tool_skill_paths.iter())
+        .filter_map(|(tool, path)| {
+            if path.exists() {
+                None
+            } else {
+                Some(tool.skill_file.clone())
+            }
+        })
+        .collect::<Vec<_>>();
+    if !orchestrator_skill_path.exists() {
+        missing_skill_files.push(
+            orchestrator_skill_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("orchestrator-skill")
+                .to_string(),
+        );
+    }
+
+    let passed = missing_in_skill.is_empty()
+        && missing_skill_files.is_empty()
+        && (missing_in_server.is_empty() || !introspection_ok)
+        && !tool_skill_paths.is_empty();
 
     Ok(ConvertVerifyReport {
         generated_at: Utc::now(),
         server: server.clone(),
+        orchestrator_skill_path: orchestrator_skill_path.clone(),
         skill_path: skill_path.to_path_buf(),
+        tool_skill_paths,
         introspection_ok,
         introspected_tool_count: introspected_set.len(),
-        required_tool_hints: required_hints,
+        required_tools,
         missing_in_server,
         missing_in_skill,
+        missing_skill_files,
         passed,
         notes,
     })
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct CapabilityPlaybook {
     title: String,
@@ -487,23 +640,36 @@ struct CapabilityPlaybook {
     steps: Vec<String>,
 }
 
-fn render_skill_markdown(plan: &ConvertPlan, introspected_tools: Option<&[String]>) -> String {
+fn render_orchestrator_skill_markdown(
+    plan: &ConvertPlan,
+    tool_skills: &[ManifestToolSkill],
+) -> String {
     let mut out = String::new();
     out.push_str(&format!("# Workflow: {}\n\n", plan.server.name.trim()));
     out.push_str("## Purpose\n\n");
     out.push_str(&format!("{}\n\n", plan.server.purpose));
 
-    out.push_str("## Capability Playbooks\n\n");
-    let playbooks = capability_playbooks(&plan.server, &plan.actions, introspected_tools);
-    for (idx, playbook) in playbooks.iter().enumerate() {
-        out.push_str(&format!("### {}. {}\n\n", idx + 1, playbook.title));
-        out.push_str(&format!("Goal: {}\n\n", playbook.goal));
-        out.push_str("Steps:\n");
-        for (step_idx, step) in playbook.steps.iter().enumerate() {
-            out.push_str(&format!("{}. {}\n", step_idx + 1, step));
+    out.push_str("## Capability Skills\n\n");
+    if tool_skills.is_empty() {
+        out.push_str("- No capability skills were generated.\n\n");
+    } else {
+        for skill in tool_skills {
+            let skill_name = skill.skill_file.trim_end_matches(".md");
+            out.push_str(&format!(
+                "- `${skill_name}`: Executes `{}` operations.\n",
+                skill.tool_name
+            ));
         }
         out.push('\n');
     }
+
+    out.push_str("## Orchestration\n\n");
+    out.push_str("1. Clarify the user goal and select the minimum capability skills needed.\n");
+    out.push_str(
+        "2. Execute capability skills in dependency order, one focused action at a time.\n",
+    );
+    out.push_str("3. After each capability run, validate output and decide next step.\n");
+    out.push_str("4. Stop immediately on errors, report root cause, and suggest recovery.\n\n");
 
     out.push_str("## Guardrails\n\n");
     out.push_str(
@@ -517,6 +683,39 @@ fn render_skill_markdown(plan: &ConvertPlan, introspected_tools: Option<&[String
             out.push_str(&format!("- {}\n", warning));
         }
     }
+
+    out
+}
+
+fn render_capability_skill_markdown(
+    server: &MCPServerProfile,
+    tool_name: &str,
+    description: Option<&str>,
+) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("# Capability: {tool_name}\n\n"));
+    out.push_str("## Purpose\n\n");
+    if let Some(text) = description.map(str::trim).filter(|text| !text.is_empty()) {
+        out.push_str(text);
+        out.push_str("\n\n");
+    } else {
+        out.push_str(&format!(
+            "Execute `{tool_name}` tasks for {}.\n\n",
+            server.purpose.to_lowercase()
+        ));
+    }
+
+    out.push_str("## Execution\n\n");
+    out.push_str("1. Confirm prerequisites and collect only required inputs.\n");
+    out.push_str(&format!(
+        "2. Run the `{tool_name}` capability and capture raw output.\n"
+    ));
+    out.push_str("3. Validate errors, status, and key fields before continuing.\n");
+    out.push_str("4. Return a concise result and next-step recommendation.\n\n");
+
+    out.push_str("## Safety\n\n");
+    out.push_str("- Ask for confirmation before destructive or irreversible actions.\n");
+    out.push_str("- If arguments are unclear, run a non-destructive check first.\n");
 
     out
 }
@@ -716,6 +915,31 @@ fn required_tool_hints(
     hints
 }
 
+fn required_tool_names(
+    server: &MCPServerProfile,
+    introspected_tools: Option<&[String]>,
+) -> Vec<String> {
+    if let Some(items) = introspected_tools {
+        let mut names = items
+            .iter()
+            .map(|item| normalize_tool_name(item))
+            .collect::<Vec<_>>();
+        names.sort();
+        names.dedup();
+        if !names.is_empty() {
+            return names;
+        }
+    }
+
+    let mut fallback = required_tool_hints(server, None)
+        .iter()
+        .map(|hint| hint_to_tool_name(hint))
+        .collect::<Vec<_>>();
+    fallback.sort();
+    fallback.dedup();
+    fallback
+}
+
 fn extract_tool_hints_from_skill(content: &str) -> Vec<String> {
     let mut hints = vec![];
     for line in content.lines() {
@@ -758,6 +982,19 @@ fn tool_hint_prefix(server: &MCPServerProfile) -> String {
 }
 
 fn introspect_tools(server: &MCPServerProfile) -> Result<Vec<String>> {
+    let mut tools = introspect_tool_specs(server)?
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect::<Vec<_>>();
+    tools.sort();
+    tools.dedup();
+    if tools.is_empty() {
+        bail!("MCP introspection returned no tools for '{}'.", server.id);
+    }
+    Ok(tools)
+}
+
+fn introspect_tool_specs(server: &MCPServerProfile) -> Result<Vec<ToolSpec>> {
     let command = server
         .command
         .as_deref()
@@ -819,14 +1056,28 @@ fn introspect_tools(server: &MCPServerProfile) -> Result<Vec<String>> {
         };
         tools = items
             .iter()
-            .filter_map(|item| item.get("name").and_then(Value::as_str))
-            .map(normalize_tool_name)
+            .filter_map(|item| {
+                let name = item.get("name").and_then(Value::as_str)?;
+                let description = item
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .map(ToString::to_string);
+                Some(ToolSpec {
+                    name: normalize_tool_name(name),
+                    description,
+                })
+            })
             .collect::<Vec<_>>();
         break;
     }
 
-    tools.sort();
-    tools.dedup();
+    let mut deduped: BTreeMap<String, ToolSpec> = BTreeMap::new();
+    for tool in tools {
+        deduped.entry(tool.name.clone()).or_insert(tool);
+    }
+    let tools = deduped.into_values().collect::<Vec<_>>();
 
     if tools.is_empty() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1695,6 +1946,9 @@ args = ["-y", "chrome-devtools-mcp@latest"]
         .unwrap();
 
         assert!(result.skill_path.exists());
+        assert!(result.orchestrator_skill_path.exists());
+        assert_eq!(result.tool_skill_paths.len(), 3);
+        assert!(result.tool_skill_paths.iter().all(|path| path.exists()));
         assert!(result.mcp_config_updated);
         assert!(result.mcp_config_backup.is_some());
 
@@ -1702,12 +1956,16 @@ args = ["-y", "chrome-devtools-mcp@latest"]
         assert!(!updated.contains("playwright"));
 
         let skill = std::fs::read_to_string(&result.skill_path).unwrap();
-        assert!(skill.contains("## Capability Playbooks"));
+        assert!(skill.contains("## Capability Skills"));
         assert!(!skill.contains("## Server Metadata"));
         assert!(!skill.contains("mcp__"));
 
         let manifest_path = manifest_path_for_skill(&result.skill_path).unwrap();
         assert!(manifest_path.exists());
+        let manifest: SkillParityManifest =
+            serde_json::from_str(&std::fs::read_to_string(manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest.required_tools.len(), 3);
+        assert_eq!(manifest.tool_skills.len(), 3);
     }
 
     #[test]
@@ -1785,6 +2043,51 @@ args = ["-y", "chrome-devtools-mcp@latest"]
     }
 
     #[test]
+    fn test_apply_dedupes_duplicate_tool_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("settings.json");
+        let skills_dir = dir.path().join("skills");
+        let mock_mcp = dir.path().join("mock-mcp.sh");
+        std::fs::write(
+            &mock_mcp,
+            "#!/bin/sh\nread _\nread _\nprintf '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{}}}\\n'\nprintf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"navigate\"},{\"name\":\"navigate\"},{\"name\":\"click\"}]}}\\n'\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&mock_mcp, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(
+            &config_path,
+            &format!(
+                r#"{{
+  "mcpServers": {{
+    "playwright": {{
+      "command": "{}",
+      "description": "Read list",
+      "readOnly": true
+    }}
+  }}
+}}"#,
+                mock_mcp.display()
+            ),
+        )
+        .unwrap();
+
+        let result = apply(
+            "playwright",
+            PlanMode::Hybrid,
+            false,
+            &[config_path],
+            Some(skills_dir),
+        )
+        .unwrap();
+
+        assert_eq!(result.tool_skill_paths.len(), 2);
+    }
+
+    #[test]
     fn test_verify_uses_manifest_with_clean_skill_markdown() {
         let dir = tempfile::tempdir().unwrap();
         let skill_path = dir.path().join("mcp-playwright.md");
@@ -1822,12 +2125,23 @@ Steps:
         };
 
         let manifest = SkillParityManifest {
-            format_version: 1,
+            format_version: 2,
             generated_at: Utc::now(),
             server_id: server.id.clone(),
             server_name: server.name.clone(),
+            orchestrator_skill: Some("mcp-playwright.md".to_string()),
+            required_tools: vec!["execute".to_string()],
+            tool_skills: vec![ManifestToolSkill {
+                tool_name: "execute".to_string(),
+                skill_file: "mcp-playwright-tool-execute.md".to_string(),
+            }],
             required_tool_hints: vec!["mcp__playwright__execute".to_string()],
         };
+        std::fs::write(
+            dir.path().join("mcp-playwright-tool-execute.md"),
+            "# Capability: execute\n",
+        )
+        .unwrap();
         write_skill_manifest(&skill_path, &manifest).unwrap();
 
         let introspected = vec!["mcp__playwright__execute".to_string()];
@@ -1837,6 +2151,7 @@ Steps:
         assert!(report.introspection_ok);
         assert!(report.missing_in_server.is_empty());
         assert!(report.missing_in_skill.is_empty());
+        assert!(report.missing_skill_files.is_empty());
         assert!(report.passed);
     }
 }
