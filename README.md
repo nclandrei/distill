@@ -63,6 +63,9 @@ Notes:
 | `distill onboard` | Run onboarding TUI explicitly |
 | `distill scan --now` | Run an immediate scan for skill proposals |
 | `distill review` | Review pending proposals in a TUI (`a/r/e/s/A`) |
+| `distill convert list [--json] [--config <path>]` | Discover MCP servers from known config locations |
+| `distill convert inspect <server> [--json] [--config <path>]` | Inspect one MCP server profile and recommendation |
+| `distill convert plan <server> [--mode auto|hybrid|replace] [--json]` | Generate a conversion plan with safety gates |
 | `distill dedupe [--dry-run]` | Detect duplicate global skills and propose removals |
 | `distill status` | Show config, pending proposals, accepted skills |
 | `distill watch --install` | Install scheduled scan (launchd/systemd) |
@@ -133,3 +136,19 @@ distill review --apply-json review.json
 Both onboarding and review JSON flags accept `-` as path:
 - `--write-json -` writes JSON to stdout
 - `--apply-json -` reads JSON from stdin
+
+### 4) MCP convert planning (non-interactive)
+
+`distill convert` supports one-shot, machine-readable workflows:
+
+```bash
+distill convert list --json
+distill convert inspect custom-1:playwright --json --config /path/to/mcp.json
+distill convert plan custom-1:playwright --mode auto --json --config /path/to/mcp.json
+```
+
+Behavior notes:
+- Discovery reads default MCP locations (`~/.claude/mcp.json`, `~/.codex/mcp.json`, project-level variants, and shared config path) plus any `--config` paths.
+- `inspect` accepts either a full server id (`source:name`) or a unique server name.
+- `plan --mode replace` is blocked automatically when the server is not a safe replacement candidate.
+- This phase is planning-only; no MCP config is modified yet.

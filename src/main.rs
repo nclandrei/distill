@@ -1,6 +1,7 @@
 mod agents;
 mod commands;
 mod config;
+mod convert;
 mod notify;
 mod onboard;
 mod proposals;
@@ -68,6 +69,17 @@ One-shot AI review workflow:
   3) distill review --apply-json review.json
 ";
 
+const CONVERT_LONG_ABOUT: &str = "\
+Inspect MCP server configurations and plan conversion to skills.
+
+For non-interactive automation, use:
+  distill convert list --json
+  distill convert inspect <server> --json
+  distill convert plan <server> --mode auto|hybrid|replace --json
+
+You can pass one or more --config <path> values to include extra MCP config files.
+";
+
 #[derive(Parser)]
 #[command(
     name = "distill",
@@ -108,6 +120,12 @@ enum Commands {
         #[arg(long, value_name = "PATH", conflicts_with = "write_json")]
         apply_json: Option<PathBuf>,
     },
+    /// Inspect MCP servers and plan conversion to skills
+    #[command(long_about = CONVERT_LONG_ABOUT)]
+    Convert {
+        #[command(subcommand)]
+        command: Option<ConvertCommands>,
+    },
     /// Detect duplicate global skills and create remove proposals
     Dedupe {
         /// Preview duplicates without writing proposals
@@ -130,6 +148,47 @@ enum Commands {
         /// Check for pending proposals (used by shell hook)
         #[arg(long)]
         check: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConvertCommands {
+    /// List discovered MCP servers
+    List {
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+        /// Additional MCP config file paths to inspect
+        #[arg(long = "config", value_name = "PATH")]
+        config: Vec<PathBuf>,
+    },
+    /// Inspect one MCP server by id or by unique name
+    Inspect {
+        /// Server id (source:name) or unique server name
+        server: String,
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+        /// Additional MCP config file paths to inspect
+        #[arg(long = "config", value_name = "PATH")]
+        config: Vec<PathBuf>,
+    },
+    /// Generate a conversion plan for one MCP server
+    Plan {
+        /// Server id (source:name) or unique server name
+        server: String,
+        /// Planning mode (auto resolves from recommendation)
+        #[arg(long, default_value = "auto", value_parser = ["auto", "hybrid", "replace"])]
+        mode: String,
+        /// Explicit no-op apply guard (planning only)
+        #[arg(long)]
+        dry_run: bool,
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+        /// Additional MCP config file paths to inspect
+        #[arg(long = "config", value_name = "PATH")]
+        config: Vec<PathBuf>,
     },
 }
 
@@ -162,6 +221,30 @@ fn main() -> anyhow::Result<()> {
         }) => {
             commands::review::run(write_json.as_deref(), apply_json.as_deref())?;
         }
+        Some(Commands::Convert { command }) => match command {
+            Some(ConvertCommands::List { json, config }) => {
+                commands::convert::run_list(json, &config)?;
+            }
+            Some(ConvertCommands::Inspect {
+                server,
+                json,
+                config,
+            }) => {
+                commands::convert::run_inspect(&server, json, &config)?;
+            }
+            Some(ConvertCommands::Plan {
+                server,
+                mode,
+                dry_run,
+                json,
+                config,
+            }) => {
+                commands::convert::run_plan(&server, &mode, dry_run, json, &config)?;
+            }
+            None => {
+                commands::convert::run_overview(&[])?;
+            }
+        },
         Some(Commands::Dedupe { dry_run }) => {
             commands::dedupe::run(dry_run)?;
         }

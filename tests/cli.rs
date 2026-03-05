@@ -472,3 +472,74 @@ fn test_dedupe_writes_remove_proposal() {
     assert!(content.contains("type: remove"));
     assert!(content.contains("target_skill: beta.md"));
 }
+
+#[test]
+fn test_convert_list_json_from_custom_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("mcp.json");
+    std::fs::write(
+        &config_path,
+        r#"{
+  "mcpServers": {
+    "playwright": {
+      "command": "npx",
+      "args": ["-y", "@playwright/mcp"],
+      "description": "Browser automation workflows",
+      "tools": ["navigate", "click", "fill"]
+    }
+  }
+}"#,
+    )
+    .unwrap();
+
+    distill_cmd(dir.path())
+        .args(["convert", "list", "--json", "--config"])
+        .arg(&config_path)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"name\": \"playwright\""))
+        .stdout(predicate::str::contains("\"declared_tool_count\": 3"));
+}
+
+#[test]
+fn test_convert_inspect_and_plan_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("mcp.json");
+    std::fs::write(
+        &config_path,
+        r#"{
+  "mcpServers": {
+    "infra-admin": {
+      "command": "terraform",
+      "description": "Apply and destroy infra",
+      "permissions": ["write"]
+    }
+  }
+}"#,
+    )
+    .unwrap();
+
+    distill_cmd(dir.path())
+        .args(["convert", "inspect", "infra-admin", "--json", "--config"])
+        .arg(&config_path)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"name\": \"infra-admin\""))
+        .stdout(predicate::str::contains("\"recommendation\": \"keep-mcp\""));
+
+    distill_cmd(dir.path())
+        .args([
+            "convert",
+            "plan",
+            "infra-admin",
+            "--mode",
+            "replace",
+            "--json",
+            "--config",
+        ])
+        .arg(&config_path)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"blocked\": true"))
+        .stdout(predicate::str::contains("\"effective_mode\": \"replace\""));
+}

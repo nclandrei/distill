@@ -1,0 +1,177 @@
+use anyhow::{Result, bail};
+use std::path::PathBuf;
+
+use crate::convert::{self, ConvertInventory, ConvertPlan, MCPServerProfile, PlanMode};
+
+pub fn parse_mode(raw: &str) -> Result<PlanMode> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "auto" => Ok(PlanMode::Auto),
+        "hybrid" => Ok(PlanMode::Hybrid),
+        "replace" => Ok(PlanMode::Replace),
+        other => bail!("Unsupported mode '{other}'. Expected: auto, hybrid, replace."),
+    }
+}
+
+pub fn run_list(json: bool, config_paths: &[PathBuf]) -> Result<()> {
+    let inventory = convert::discover(config_paths)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&inventory)?);
+        return Ok(());
+    }
+
+    print_inventory(&inventory);
+    Ok(())
+}
+
+pub fn run_inspect(selector: &str, json: bool, config_paths: &[PathBuf]) -> Result<()> {
+    let server = convert::inspect(selector, config_paths)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&server)?);
+        return Ok(());
+    }
+
+    print_server(&server);
+    Ok(())
+}
+
+pub fn run_plan(
+    selector: &str,
+    mode_raw: &str,
+    dry_run: bool,
+    json: bool,
+    config_paths: &[PathBuf],
+) -> Result<()> {
+    let mode = parse_mode(mode_raw)?;
+    let plan = convert::plan(selector, mode, config_paths)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&plan)?);
+        return Ok(());
+    }
+
+    print_plan(&plan, dry_run);
+    Ok(())
+}
+
+pub fn run_overview(config_paths: &[PathBuf]) -> Result<()> {
+    let inventory = convert::discover(config_paths)?;
+    print_inventory(&inventory);
+    println!();
+    println!("Next steps:");
+    println!("  distill convert inspect <server-id|server-name>");
+    println!("  distill convert plan <server-id|server-name> --mode auto|hybrid|replace");
+    println!("Use --json for one-shot agent automation.");
+    Ok(())
+}
+
+fn print_inventory(inventory: &ConvertInventory) {
+    if inventory.servers.is_empty() {
+        println!("No MCP servers found.");
+        println!("Searched paths:");
+        for path in &inventory.searched_paths {
+            println!("  - {}", path.display());
+        }
+        return;
+    }
+
+    let existing_sources = inventory
+        .servers
+        .iter()
+        .map(|server| server.source_path.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+
+    println!(
+        "Found {} MCP server(s) across {} config file(s).",
+        inventory.servers.len(),
+        existing_sources.len()
+    );
+
+    for server in &inventory.servers {
+        println!("- {}", server.id);
+        println!("  source         : {}", server.source_path.display());
+        println!("  purpose        : {}", server.purpose);
+        println!("  permissions    : {}", server.inferred_permission);
+        println!("  recommendation : {}", server.recommendation);
+    }
+}
+
+fn print_server(server: &MCPServerProfile) {
+    println!("Server: {}", server.id);
+    println!("  Name                : {}", server.name);
+    println!("  Source              : {}", server.source_path.display());
+    println!("  Purpose             : {}", server.purpose);
+    println!(
+        "  Command             : {}",
+        display_option(&server.command)
+    );
+    println!("  URL                 : {}", display_option(&server.url));
+    if server.args.is_empty() {
+        println!("  Args                : (none)");
+    } else {
+        println!("  Args                : {}", server.args.join(" "));
+    }
+    if server.env_keys.is_empty() {
+        println!("  Required env keys   : (none)");
+    } else {
+        println!("  Required env keys   : {}", server.env_keys.join(", "));
+    }
+    if server.permission_hints.is_empty() {
+        println!("  Permission hints    : (none)");
+    } else {
+        println!(
+            "  Permission hints    : {}",
+            server.permission_hints.join(", ")
+        );
+    }
+    println!("  Declared tool count : {}", server.declared_tool_count);
+    println!("  Inferred permission : {}", server.inferred_permission);
+    println!("  Recommendation      : {}", server.recommendation);
+    println!("  Why                 : {}", server.recommendation_reason);
+}
+
+fn print_plan(plan: &ConvertPlan, dry_run: bool) {
+    println!("Plan for {}", plan.server.id);
+    println!("  requested_mode : {}", plan.requested_mode);
+    println!("  recommended    : {}", plan.recommended_mode);
+    println!("  effective_mode : {}", plan.effective_mode);
+    println!("  blocked        : {}", plan.blocked);
+
+    if dry_run {
+        println!("  dry_run        : true (no files were changed)");
+    }
+
+    println!("Actions:");
+    for action in &plan.actions {
+        println!("  - {action}");
+    }
+
+    if !plan.warnings.is_empty() {
+        println!("Warnings:");
+        for warning in &plan.warnings {
+            println!("  - {warning}");
+        }
+    }
+
+    if plan.blocked {
+        println!(
+            "Apply step is blocked for this plan. Use hybrid mode or adjust server scope before replace."
+        );
+    }
+}
+
+fn display_option(value: &Option<String>) -> String {
+    value.clone().unwrap_or_else(|| "(none)".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_mode() {
+        assert_eq!(parse_mode("auto").unwrap(), PlanMode::Auto);
+        assert_eq!(parse_mode("hybrid").unwrap(), PlanMode::Hybrid);
+        assert_eq!(parse_mode("replace").unwrap(), PlanMode::Replace);
+        assert!(parse_mode("invalid").is_err());
+    }
+}

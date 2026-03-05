@@ -131,6 +131,10 @@ screencapture -x -i /absolute/path/selection.png
 ## Verification Notes
 
 - For test/demo review runs, prefer an isolated home (`HOME="$TMPDIR/...")` so real `~/.distill` data is not modified.
+- For `distill convert` verification, use a temporary MCP fixture JSON and pass it with `--config` to keep checks deterministic:
+  - `distill convert list --config "$TMPDIR/distill-mcp.json"`
+  - `distill convert inspect <server> --config "$TMPDIR/distill-mcp.json"`
+  - `distill convert plan <server> --mode auto --config "$TMPDIR/distill-mcp.json"`
 - For one-proposal review flows, pressing `a` can immediately complete the app and stop tmux.
 - If tmux exits right after action, treat that as expected completion and verify outcomes via filesystem artifacts:
   - proposal removed from `.distill/proposals`
