@@ -1,4 +1,4 @@
-.PHONY: build test lint fmt check clean
+.PHONY: build test lint fmt check local-checks hooks-install clean
 
 build:
 	cargo build
@@ -14,6 +14,12 @@ fmt:
 
 check: fmt lint test
 	@echo "All checks passed."
+
+local-checks:
+	./scripts/local-checks.sh
+
+hooks-install:
+	./scripts/install-hooks.sh
 
 clean:
 	cargo clean
