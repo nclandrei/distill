@@ -63,10 +63,11 @@ Notes:
 | `distill onboard` | Run onboarding TUI explicitly |
 | `distill scan --now` | Run an immediate scan for skill proposals |
 | `distill review` | Review pending proposals in a TUI (`a/r/e/s/A`) |
+| `distill convert <server> [--replace --yes] [--json] [--config <path>]` | One-shot inspect + plan + apply + verify flow (safe hybrid by default) |
 | `distill convert list [--json] [--config <path>]` | Discover MCP servers from known config locations |
 | `distill convert inspect <server> [--json] [--config <path>]` | Inspect one MCP server profile and recommendation |
 | `distill convert plan <server> [--mode auto|hybrid|replace] [--json]` | Generate a conversion plan with safety gates |
-| `distill convert apply <server> [--mode auto|hybrid|replace] [--yes] [--json]` | Generate a skill from MCP metadata (and optionally update MCP config for replace mode) |
+| `distill convert apply <server> [--mode auto|hybrid|replace] [--yes] [--json]` | Generate a clean skill (and optionally update MCP config for replace mode) |
 | `distill convert verify <server> [--json] [--config <path>]` | Verify generated skill coverage against live MCP tools |
 | `distill dedupe [--dry-run]` | Detect duplicate global skills and propose removals |
 | `distill status` | Show config, pending proposals, accepted skills |
@@ -141,7 +142,14 @@ Both onboarding and review JSON flags accept `-` as path:
 
 ### 4) MCP convert planning (non-interactive)
 
-`distill convert` supports one-shot, machine-readable workflows:
+`distill convert` supports one-shot conversion by default:
+
+```bash
+distill convert custom-1:playwright --json
+distill convert custom-1:playwright --replace --yes --json
+```
+
+Expert/automation subcommands are still available:
 
 ```bash
 distill convert list --json
@@ -153,8 +161,9 @@ distill convert verify custom-1:playwright --json --config /path/to/mcp.json
 
 Behavior notes:
 - Discovery reads default MCP locations (`~/.claude/mcp.json`, `~/.claude/settings.json`, `~/.codex/mcp.json`, `~/.codex/config.toml`, project-level variants, and shared config paths) plus any `--config` paths.
+- `distill convert <server>` defaults to safe hybrid application and then verifies parity.
 - `inspect` accepts either a full server id (`source:name`) or a unique server name.
 - `plan --mode replace` is blocked automatically when the server is not a safe replacement candidate.
-- `apply` writes generated skills into `~/.distill/skills/` by default, with capability playbooks and MCP tool hints.
+- `apply` writes clean generated skills into `~/.distill/skills/` by default, and stores parity metadata in `~/.distill/skills/.distill-manifests/`.
 - `apply --mode replace` requires `--yes`, creates a backup of the MCP config, and removes the target server entry when safe.
 - `verify` compares generated skill hints with live MCP introspection to report parity gaps (`missing_in_server`, `missing_in_skill`).

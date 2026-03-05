@@ -128,6 +128,15 @@ pub struct ConvertVerifyReport {
     pub notes: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct SkillParityManifest {
+    format_version: u32,
+    generated_at: DateTime<Utc>,
+    server_id: String,
+    server_name: String,
+    required_tool_hints: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 struct ConfigSource {
     label: String,
@@ -264,6 +273,8 @@ pub fn apply(
         .with_context(|| format!("Failed to create skills directory {}", skills_dir.display()))?;
 
     let introspected_tools = introspect_tools(&conversion_plan.server).ok();
+    let required_hints =
+        required_tool_hints(&conversion_plan.server, introspected_tools.as_deref());
 
     let skill_filename = format!("mcp-{}.md", sanitize_slug(&conversion_plan.server.name));
     let skill_path = skills_dir.join(skill_filename);
@@ -277,9 +288,17 @@ pub fn apply(
             skill_path.display()
         )
     })?;
+    let manifest = SkillParityManifest {
+        format_version: 1,
+        generated_at: Utc::now(),
+        server_id: conversion_plan.server.id.clone(),
+        server_name: conversion_plan.server.name.clone(),
+        required_tool_hints: required_hints,
+    };
+    write_skill_manifest(&skill_path, &manifest)?;
 
-    let mut notes =
-        vec!["Generated a workflow skill from MCP metadata and conversion policy.".to_string()];
+    let mut notes = vec!["Generated a workflow skill from conversion plan.".to_string()];
+    notes.push("Wrote internal parity manifest for verify checks.".to_string());
     let mut mcp_config_backup = None;
     let mut mcp_config_updated = false;
 
@@ -362,7 +381,6 @@ fn verify_with_server_and_path(
 
     let skill_content = std::fs::read_to_string(skill_path)
         .with_context(|| format!("Failed to read {}", skill_path.display()))?;
-    let skill_hints = extract_tool_hints_from_skill(&skill_content);
     let required_hints = required_tool_hints(server, introspected_tools);
 
     let mut notes = vec![];
@@ -386,6 +404,30 @@ fn verify_with_server_and_path(
         );
     }
 
+    let manifest_path = manifest_path_for_skill(skill_path)?;
+    let skill_hints = if manifest_path.exists() {
+        let manifest_raw = std::fs::read_to_string(&manifest_path)
+            .with_context(|| format!("Failed to read {}", manifest_path.display()))?;
+        let manifest: SkillParityManifest =
+            serde_json::from_str(&manifest_raw).with_context(|| {
+                format!(
+                    "Failed to parse parity manifest {}",
+                    manifest_path.display()
+                )
+            })?;
+        notes.push(format!(
+            "Loaded parity manifest from {}.",
+            manifest_path.display()
+        ));
+        manifest.required_tool_hints
+    } else {
+        let legacy = extract_tool_hints_from_skill(&skill_content);
+        notes.push(
+            "Parity manifest missing; falling back to legacy tool-hint parsing from markdown."
+                .to_string(),
+        );
+        legacy
+    };
     let skill_hint_set = skill_hints.iter().cloned().collect::<BTreeSet<_>>();
     let missing_in_skill = required_hints
         .iter()
@@ -447,56 +489,15 @@ struct CapabilityPlaybook {
 
 fn render_skill_markdown(plan: &ConvertPlan, introspected_tools: Option<&[String]>) -> String {
     let mut out = String::new();
-    out.push_str(&format!("# MCP Workflow: {}\n\n", plan.server.name.trim()));
+    out.push_str(&format!("# Workflow: {}\n\n", plan.server.name.trim()));
     out.push_str("## Purpose\n\n");
     out.push_str(&format!("{}\n\n", plan.server.purpose));
-
-    out.push_str("## Server Metadata\n\n");
-    out.push_str(&format!(
-        "- Source: `{}`\n",
-        plan.server.source_path.display()
-    ));
-    out.push_str(&format!(
-        "- Command: `{}`\n",
-        plan.server
-            .command
-            .clone()
-            .unwrap_or_else(|| "(none)".to_string())
-    ));
-    if plan.server.args.is_empty() {
-        out.push_str("- Args: `(none)`\n");
-    } else {
-        out.push_str(&format!("- Args: `{}`\n", plan.server.args.join(" ")));
-    }
-    if plan.server.env_keys.is_empty() {
-        out.push_str("- Required env keys: `(none)`\n");
-    } else {
-        out.push_str(&format!(
-            "- Required env keys: `{}`\n",
-            plan.server.env_keys.join(", ")
-        ));
-    }
-    out.push_str(&format!(
-        "- Inferred permission: `{}`\n",
-        plan.server.inferred_permission
-    ));
-    out.push_str(&format!(
-        "- Conversion recommendation: `{}`\n\n",
-        plan.server.recommendation
-    ));
 
     out.push_str("## Capability Playbooks\n\n");
     let playbooks = capability_playbooks(&plan.server, &plan.actions, introspected_tools);
     for (idx, playbook) in playbooks.iter().enumerate() {
         out.push_str(&format!("### {}. {}\n\n", idx + 1, playbook.title));
         out.push_str(&format!("Goal: {}\n\n", playbook.goal));
-        if !playbook.tool_hints.is_empty() {
-            out.push_str("Tool hints:\n");
-            for hint in &playbook.tool_hints {
-                out.push_str(&format!("- `{}`\n", hint));
-            }
-            out.push('\n');
-        }
         out.push_str("Steps:\n");
         for (step_idx, step) in playbook.steps.iter().enumerate() {
             out.push_str(&format!("{}. {}\n", step_idx + 1, step));
@@ -958,6 +959,31 @@ fn backup_file(path: &Path) -> Result<PathBuf> {
         )
     })?;
     Ok(backup_path)
+}
+
+fn manifest_path_for_skill(skill_path: &Path) -> Result<PathBuf> {
+    let parent = skill_path
+        .parent()
+        .context("Skill path has no parent directory for manifest")?;
+    let stem = skill_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("skill");
+    Ok(parent
+        .join(".distill-manifests")
+        .join(format!("{stem}.json")))
+}
+
+fn write_skill_manifest(skill_path: &Path, manifest: &SkillParityManifest) -> Result<PathBuf> {
+    let manifest_path = manifest_path_for_skill(skill_path)?;
+    if let Some(dir) = manifest_path.parent() {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("Failed to create {}", dir.display()))?;
+    }
+    let body = serde_json::to_string_pretty(manifest).context("Failed to serialize manifest")?;
+    std::fs::write(&manifest_path, format!("{body}\n"))
+        .with_context(|| format!("Failed to write {}", manifest_path.display()))?;
+    Ok(manifest_path)
 }
 
 fn sanitize_slug(input: &str) -> String {
@@ -1677,7 +1703,11 @@ args = ["-y", "chrome-devtools-mcp@latest"]
 
         let skill = std::fs::read_to_string(&result.skill_path).unwrap();
         assert!(skill.contains("## Capability Playbooks"));
-        assert!(!skill.contains("## Mode"));
+        assert!(!skill.contains("## Server Metadata"));
+        assert!(!skill.contains("mcp__"));
+
+        let manifest_path = manifest_path_for_skill(&result.skill_path).unwrap();
+        assert!(manifest_path.exists());
     }
 
     #[test]
@@ -1755,7 +1785,7 @@ args = ["-y", "chrome-devtools-mcp@latest"]
     }
 
     #[test]
-    fn test_verify_normalizes_prefixed_tool_names() {
+    fn test_verify_uses_manifest_with_clean_skill_markdown() {
         let dir = tempfile::tempdir().unwrap();
         let skill_path = dir.path().join("mcp-playwright.md");
         std::fs::write(
@@ -1766,8 +1796,10 @@ args = ["-y", "chrome-devtools-mcp@latest"]
 
 ### 1. Generic
 
-Tool hints:
-- `mcp__playwright__execute`
+Goal: Run browser automation workflows.
+
+Steps:
+1. Open browser.
 "#,
         )
         .unwrap();
@@ -1788,6 +1820,15 @@ Tool hints:
             recommendation: ConversionRecommendation::ReplaceCandidate,
             recommendation_reason: "read-only".to_string(),
         };
+
+        let manifest = SkillParityManifest {
+            format_version: 1,
+            generated_at: Utc::now(),
+            server_id: server.id.clone(),
+            server_name: server.name.clone(),
+            required_tool_hints: vec!["mcp__playwright__execute".to_string()],
+        };
+        write_skill_manifest(&skill_path, &manifest).unwrap();
 
         let introspected = vec!["mcp__playwright__execute".to_string()];
         let report =

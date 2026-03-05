@@ -1,4 +1,5 @@
 use anyhow::{Result, bail};
+use serde::Serialize;
 use std::path::PathBuf;
 
 use crate::convert::{
@@ -13,6 +14,20 @@ pub fn parse_mode(raw: &str) -> Result<PlanMode> {
         "replace" => Ok(PlanMode::Replace),
         other => bail!("Unsupported mode '{other}'. Expected: auto, hybrid, replace."),
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ConvertRunResult {
+    server_id: String,
+    requested_mode: PlanMode,
+    planned_mode: PlanMode,
+    applied_mode: PlanMode,
+    safe_mode_downgrade: bool,
+    verify_passed: bool,
+    verified_in_apply: bool,
+    apply: ConvertApplyResult,
+    verify: Option<ConvertVerifyReport>,
+    notes: Vec<String>,
 }
 
 pub fn run_list(json: bool, config_paths: &[PathBuf]) -> Result<()> {
@@ -91,11 +106,87 @@ pub fn run_verify(
     Ok(())
 }
 
+pub fn run_one_shot(
+    selector: &str,
+    replace: bool,
+    yes: bool,
+    json: bool,
+    config_paths: &[PathBuf],
+    skills_dir: Option<PathBuf>,
+) -> Result<()> {
+    if replace && !yes {
+        bail!("--replace requires --yes because this mutates MCP config.");
+    }
+
+    let requested_mode = if replace {
+        PlanMode::Replace
+    } else {
+        PlanMode::Auto
+    };
+    let plan = convert::plan(selector, requested_mode, config_paths)?;
+
+    let mut applied_mode = plan.effective_mode;
+    let mut safe_mode_downgrade = false;
+    let mut notes = vec![];
+    if !replace && applied_mode == PlanMode::Replace {
+        applied_mode = PlanMode::Hybrid;
+        safe_mode_downgrade = true;
+        notes.push(
+            "Auto planning resolved to replace; one-shot defaulted to hybrid for safety. Use --replace --yes to mutate config."
+                .to_string(),
+        );
+    }
+
+    let apply = convert::apply(
+        selector,
+        applied_mode,
+        yes,
+        config_paths,
+        skills_dir.clone(),
+    )?;
+    let (verify, verified_in_apply, verify_passed) = if apply.effective_mode == PlanMode::Replace {
+        // replace-mode already gates config mutation on live verification inside apply()
+        (None, true, true)
+    } else {
+        let verify = convert::verify(selector, config_paths, skills_dir)?;
+        let passed = verify.passed;
+        (Some(verify), false, passed)
+    };
+
+    let result = ConvertRunResult {
+        server_id: apply.server.id.clone(),
+        requested_mode,
+        planned_mode: plan.effective_mode,
+        applied_mode: apply.effective_mode,
+        safe_mode_downgrade,
+        verify_passed,
+        verified_in_apply,
+        apply,
+        verify,
+        notes,
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        print_run_result(&result);
+    }
+
+    if !result.verify_passed {
+        bail!(
+            "One-shot conversion completed but verification failed. Check missing_in_server/missing_in_skill in JSON output."
+        );
+    }
+
+    Ok(())
+}
+
 pub fn run_overview(config_paths: &[PathBuf]) -> Result<()> {
     let inventory = convert::discover(config_paths)?;
     print_inventory(&inventory);
     println!();
     println!("Next steps:");
+    println!("  distill convert <server-id|server-name>");
     println!("  distill convert inspect <server-id|server-name>");
     println!("  distill convert plan <server-id|server-name> --mode auto|hybrid|replace");
     println!("  distill convert apply <server-id|server-name> --mode auto|hybrid|replace");
@@ -246,6 +337,42 @@ fn print_verify_report(report: &ConvertVerifyReport) {
         println!("Notes:");
         for note in &report.notes {
             println!("  - {note}");
+        }
+    }
+}
+
+fn print_run_result(result: &ConvertRunResult) {
+    println!("Converted {}", result.server_id);
+    println!(
+        "mode={} verify={} skill={}",
+        result.applied_mode,
+        if result.verify_passed {
+            "passed"
+        } else {
+            "failed"
+        },
+        result.apply.skill_path.display()
+    );
+    if result.apply.mcp_config_updated {
+        if let Some(backup) = &result.apply.mcp_config_backup {
+            println!("mcp_config=updated backup={}", backup.display());
+        } else {
+            println!("mcp_config=updated");
+        }
+    } else {
+        println!("mcp_config=unchanged");
+    }
+    if result.safe_mode_downgrade {
+        println!("note=safe-default-used (auto->replace was downgraded to hybrid)");
+    }
+    if !result.verify_passed {
+        if let Some(verify) = &result.verify {
+            if !verify.missing_in_server.is_empty() {
+                println!("missing_in_server={}", verify.missing_in_server.join(","));
+            }
+            if !verify.missing_in_skill.is_empty() {
+                println!("missing_in_skill={}", verify.missing_in_skill.join(","));
+            }
         }
     }
 }

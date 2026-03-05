@@ -72,7 +72,14 @@ One-shot AI review workflow:
 const CONVERT_LONG_ABOUT: &str = "\
 Inspect MCP server configurations and plan conversion to skills.
 
+Default one-shot flow:
+  distill convert <server>
+
+This runs inspect -> plan(auto) -> apply(hybrid by default) -> verify.
+Use --replace --yes if you explicitly want destructive config mutation.
+
 For non-interactive automation, use:
+  distill convert <server> --json
   distill convert list --json
   distill convert inspect <server> --json
   distill convert plan <server> --mode auto|hybrid|replace --json
@@ -123,8 +130,25 @@ enum Commands {
         apply_json: Option<PathBuf>,
     },
     /// Inspect MCP servers and plan conversion to skills
-    #[command(long_about = CONVERT_LONG_ABOUT)]
+    #[command(long_about = CONVERT_LONG_ABOUT, args_conflicts_with_subcommands = true)]
     Convert {
+        /// Server id (source:name) or unique server name
+        server: Option<String>,
+        /// Allow destructive replace mode instead of safe hybrid default
+        #[arg(long)]
+        replace: bool,
+        /// Required when --replace is set
+        #[arg(long)]
+        yes: bool,
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+        /// Additional MCP config file paths to inspect
+        #[arg(long = "config", value_name = "PATH")]
+        config: Vec<PathBuf>,
+        /// Override output directory for generated skills
+        #[arg(long = "skills-dir", value_name = "PATH")]
+        skills_dir: Option<PathBuf>,
         #[command(subcommand)]
         command: Option<ConvertCommands>,
     },
@@ -257,7 +281,15 @@ fn main() -> anyhow::Result<()> {
         }) => {
             commands::review::run(write_json.as_deref(), apply_json.as_deref())?;
         }
-        Some(Commands::Convert { command }) => match command {
+        Some(Commands::Convert {
+            server,
+            replace,
+            yes,
+            json,
+            config,
+            skills_dir,
+            command,
+        }) => match command {
             Some(ConvertCommands::List { json, config }) => {
                 commands::convert::run_list(json, &config)?;
             }
@@ -296,7 +328,13 @@ fn main() -> anyhow::Result<()> {
                 commands::convert::run_verify(&server, json, &config, skills_dir)?;
             }
             None => {
-                commands::convert::run_overview(&[])?;
+                if let Some(server) = server {
+                    commands::convert::run_one_shot(
+                        &server, replace, yes, json, &config, skills_dir,
+                    )?;
+                } else {
+                    commands::convert::run_overview(&[])?;
+                }
             }
         },
         Some(Commands::Dedupe { dry_run }) => {

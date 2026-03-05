@@ -132,6 +132,7 @@ screencapture -x -i /absolute/path/selection.png
 
 - For test/demo review runs, prefer an isolated home (`HOME="$TMPDIR/...")` so real `~/.distill` data is not modified.
 - For `distill convert` verification, use a temporary MCP fixture JSON and pass it with `--config` to keep checks deterministic:
+  - `distill convert <server> --config "$TMPDIR/distill-mcp.json"`
   - `distill convert list --config "$TMPDIR/distill-mcp.json"`
   - `distill convert inspect <server> --config "$TMPDIR/distill-mcp.json"`
   - `distill convert plan <server> --mode auto --config "$TMPDIR/distill-mcp.json"`

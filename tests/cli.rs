@@ -624,6 +624,26 @@ fn test_convert_apply_hybrid_writes_skill_file() {
             .exists(),
         "hybrid apply should write a generated skill file"
     );
+
+    let skill_path = dir
+        .path()
+        .join(".distill")
+        .join("skills")
+        .join("mcp-xcodebuildmcp.md");
+    let skill = std::fs::read_to_string(&skill_path).unwrap();
+    assert!(!skill.contains("## Server Metadata"));
+    assert!(!skill.contains("mcp__"));
+
+    let manifest_path = dir
+        .path()
+        .join(".distill")
+        .join("skills")
+        .join(".distill-manifests")
+        .join("mcp-xcodebuildmcp.json");
+    assert!(
+        manifest_path.exists(),
+        "hybrid apply should write parity manifest"
+    );
 }
 
 #[test]
@@ -752,4 +772,134 @@ fn test_convert_verify_reports_passed_for_generated_skill() {
         .success()
         .stdout(predicate::str::contains("\"passed\": true"))
         .stdout(predicate::str::contains("\"introspection_ok\": true"));
+}
+
+#[test]
+fn test_convert_one_shot_defaults_to_hybrid_for_replace_candidates() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("settings.json");
+    let skills_dir = dir.path().join("skills");
+    let mock_mcp = dir.path().join("mock-mcp.sh");
+    std::fs::write(
+        &mock_mcp,
+        "#!/bin/sh\nread _\nread _\nprintf '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{}}}\\n'\nprintf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"execute\"}]}}\\n'\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&mock_mcp, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::fs::write(
+        &config_path,
+        &format!(
+            r#"{{
+  "mcpServers": {{
+    "playwright": {{
+      "command": "{}",
+      "description": "Read-only browser helpers",
+      "readOnly": true
+    }}
+  }}
+}}"#,
+            mock_mcp.display()
+        ),
+    )
+    .unwrap();
+
+    distill_cmd(dir.path())
+        .args(["convert", "playwright", "--json", "--config"])
+        .arg(&config_path)
+        .args(["--skills-dir"])
+        .arg(&skills_dir)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"safe_mode_downgrade\": true"))
+        .stdout(predicate::str::contains("\"applied_mode\": \"hybrid\""))
+        .stdout(predicate::str::contains("\"verify_passed\": true"));
+
+    let updated = std::fs::read_to_string(&config_path).unwrap();
+    assert!(
+        updated.contains("playwright"),
+        "one-shot default mode must not mutate MCP config"
+    );
+}
+
+#[test]
+fn test_convert_one_shot_replace_requires_yes() {
+    let dir = tempfile::tempdir().unwrap();
+    distill_cmd(dir.path())
+        .args(["convert", "playwright", "--replace"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--replace requires --yes"));
+}
+
+#[test]
+fn test_convert_one_shot_replace_mutates_config_when_confirmed() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("settings.json");
+    let skills_dir = dir.path().join("skills");
+    let mock_mcp = dir.path().join("mock-mcp.sh");
+    std::fs::write(
+        &mock_mcp,
+        "#!/bin/sh\nread _\nread _\nprintf '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{}}}\\n'\nprintf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"execute\"}]}}\\n'\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&mock_mcp, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::fs::write(
+        &config_path,
+        &format!(
+            r#"{{
+  "mcpServers": {{
+    "playwright": {{
+      "command": "{}",
+      "description": "Read-only browser helpers",
+      "readOnly": true
+    }}
+  }}
+}}"#,
+            mock_mcp.display()
+        ),
+    )
+    .unwrap();
+
+    distill_cmd(dir.path())
+        .args([
+            "convert",
+            "playwright",
+            "--replace",
+            "--yes",
+            "--json",
+            "--config",
+        ])
+        .arg(&config_path)
+        .args(["--skills-dir"])
+        .arg(&skills_dir)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"applied_mode\": \"replace\""))
+        .stdout(predicate::str::contains("\"verified_in_apply\": true"));
+
+    let updated = std::fs::read_to_string(&config_path).unwrap();
+    assert!(
+        !updated.contains("playwright"),
+        "one-shot replace should remove server from config"
+    );
+
+    let backup_count = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("settings.json.bak-")
+        })
+        .count();
+    assert_eq!(backup_count, 1, "one-shot replace should create one backup");
 }
