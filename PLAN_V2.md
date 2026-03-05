@@ -2,6 +2,14 @@
 
 Ideas and features planned after V1 ships.
 
+## Status Snapshot (2026-03-05)
+
+- Completed: global-only skill deduplication shipped as `distill dedupe [--dry-run]`.
+- Completed: dedupe flow writes standard `remove` proposals and preserves existing review/apply workflow.
+- Completed: duplicate detection normalizes markdown content and skips targets that already have pending remove proposals.
+- Removed from current scope: project-level skills implementation and project-over-global precedence behavior.
+- Current product direction: keep skills global (`~/.distill/skills/`) and reduce noise via dedupe.
+
 ---
 
 ## `distill convert` — MCP to Skills
@@ -53,6 +61,8 @@ Each skill contains the knowledge of *when* and *how* to use those tools, withou
 ---
 
 ## Project-Level Skills
+
+> Status (2026-03-05): **De-scoped and reverted**. Keep as a future idea only.
 
 ### Problem
 
@@ -138,6 +148,8 @@ Review each selected repository and keep AGENTS.md aligned with current engineer
 
 ## Skill Deduplication
 
+> Status (2026-03-05): **Implemented (global-only)**.
+
 ### Problem
 
 Over time, skills accumulate. Global skills might overlap with project skills. Two skills might cover the same workflow slightly differently. Renamed or evolved skills might leave stale versions behind.
@@ -146,10 +158,11 @@ Over time, skills accumulate. Global skills might overlap with project skills. T
 
 Periodic deduplication pass (can run as part of `distill scan` or as `distill dedupe`):
 
-1. Semantic comparison of all skills (using the configured agent)
-2. Detect overlaps, conflicts, and stale skills
-3. Propose merges, removals, or consolidations as regular proposals
-4. User reviews via `distill review` as usual
+1. `distill dedupe --dry-run` previews duplicate global skills without writing proposals.
+2. `distill dedupe` compares normalized markdown content in `~/.distill/skills/`.
+3. For duplicates, keep one canonical file and emit `remove` proposals for the rest in `~/.distill/proposals/`.
+4. Skip duplicates that already have pending remove proposals.
+5. User reviews via `distill review` as usual.
 
 ---
 
@@ -253,9 +266,9 @@ Roughly ordered by value and implementation complexity:
 | # | Feature | Notes | Done |
 |---|---------|-------|------|
 | 1 | **`distill convert` (MCP to skills)** | high value, addresses a real pain point now | |
-| 2 | **Project-level skills** | natural extension, needed once people use it on multiple projects | |
+| 2 | **Project-level skills** | de-scoped/reverted for now; keep as future idea only | removed |
 | 3 | **`distill sync-agents` (AGENTS.md drift detection)** | keeps project instructions current with real workflows | |
-| 4 | **Skill deduplication** | maintenance feature, prevents skill sprawl | |
+| 4 | **Skill deduplication** | global-only `distill dedupe` shipped | done |
 | 5 | **Team sync** | multiplier feature, makes distill valuable for teams | |
 | 6 | **`distill publish`** | community feature, needs critical mass first | |
 | 7 | **Preference learning** | refinement, improves quality over time | |
