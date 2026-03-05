@@ -235,6 +235,9 @@ fn validate_spec(spec: &OnboardingSpec) -> Result<()> {
             );
         }
     }
+    if !spec.agents.iter().any(|entry| entry.enabled) {
+        bail!("`agents` must include at least one enabled entry.");
+    }
 
     if spec.proposal_agent.trim().is_empty() {
         bail!("`proposal_agent` must be non-empty.");
@@ -251,6 +254,16 @@ fn validate_spec(spec: &OnboardingSpec) -> Result<()> {
     if !seen.contains(&spec.proposal_agent) {
         bail!(
             "`proposal_agent` must also appear in `agents` (got '{}').",
+            spec.proposal_agent
+        );
+    }
+    if !spec
+        .agents
+        .iter()
+        .any(|entry| entry.enabled && entry.name == spec.proposal_agent)
+    {
+        bail!(
+            "`proposal_agent` must refer to an enabled entry in `agents` (got '{}').",
             spec.proposal_agent
         );
     }
@@ -353,6 +366,56 @@ mod tests {
             }],
             scan_interval: Interval::Weekly,
             proposal_agent: "unknown".to_string(),
+            shell: ShellType::Zsh,
+            notifications: NotificationPref::Both,
+            notification_icon: None,
+            install_shell_hook: true,
+        };
+        assert!(validate_spec(&spec).is_err());
+    }
+
+    #[test]
+    fn test_validate_spec_rejects_all_agents_disabled() {
+        let spec = OnboardingSpec {
+            format_version: 1,
+            detected_agents: vec![],
+            agents: vec![
+                AgentEntry {
+                    name: "claude".to_string(),
+                    enabled: false,
+                },
+                AgentEntry {
+                    name: "codex".to_string(),
+                    enabled: false,
+                },
+            ],
+            scan_interval: Interval::Weekly,
+            proposal_agent: "claude".to_string(),
+            shell: ShellType::Zsh,
+            notifications: NotificationPref::Both,
+            notification_icon: None,
+            install_shell_hook: true,
+        };
+        assert!(validate_spec(&spec).is_err());
+    }
+
+    #[test]
+    fn test_validate_spec_rejects_disabled_proposal_agent() {
+        let spec = OnboardingSpec {
+            format_version: 1,
+            detected_agents: vec![],
+            agents: vec![
+                AgentEntry {
+                    name: "claude".to_string(),
+                    enabled: false,
+                },
+                AgentEntry {
+                    name: "codex".to_string(),
+                    enabled: true,
+                },
+            ],
+            scan_interval: Interval::Weekly,
+            proposal_agent: "claude".to_string(),
             shell: ShellType::Zsh,
             notifications: NotificationPref::Both,
             notification_icon: None,

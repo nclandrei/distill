@@ -1240,6 +1240,12 @@ fn run_tui_flow(state: &mut OnboardingUiState) -> Result<OnboardingExit> {
                 if state.step == OnboardingStep::Confirm {
                     match state.confirm_action {
                         ConfirmAction::Save => {
+                            if state.selected_agents.is_empty() {
+                                state.status_line =
+                                    "Select at least one monitored agent before saving."
+                                        .to_string();
+                                continue;
+                            }
                             let answers = OnboardingAnswers {
                                 detected_agents: state.detected_agents.clone(),
                                 enabled_agents: state.selected_agents.clone(),
