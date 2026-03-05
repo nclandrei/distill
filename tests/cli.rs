@@ -424,3 +424,51 @@ fn test_status_with_config() {
         .stdout(predicate::str::contains("distill status"))
         .stdout(predicate::str::contains("claude"));
 }
+
+#[test]
+fn test_dedupe_dry_run_does_not_write_proposals() {
+    let dir = tempfile::tempdir().unwrap();
+    let skills_dir = dir.path().join(".distill").join("skills");
+    std::fs::create_dir_all(&skills_dir).unwrap();
+    std::fs::write(skills_dir.join("alpha.md"), "# Same\nContent\n").unwrap();
+    std::fs::write(skills_dir.join("beta.md"), "# Same\nContent\n").unwrap();
+
+    distill_cmd(dir.path())
+        .args(["dedupe", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Found 1 duplicate skill file(s)"))
+        .stdout(predicate::str::contains("Dry run"));
+
+    let proposals_dir = dir.path().join(".distill").join("proposals");
+    assert!(
+        !proposals_dir.exists() || std::fs::read_dir(&proposals_dir).unwrap().next().is_none(),
+        "dry-run should not write proposal files"
+    );
+}
+
+#[test]
+fn test_dedupe_writes_remove_proposal() {
+    let dir = tempfile::tempdir().unwrap();
+    let skills_dir = dir.path().join(".distill").join("skills");
+    std::fs::create_dir_all(&skills_dir).unwrap();
+    std::fs::write(skills_dir.join("alpha.md"), "# Same\nContent\n").unwrap();
+    std::fs::write(skills_dir.join("beta.md"), "# Same\nContent\n").unwrap();
+
+    distill_cmd(dir.path())
+        .arg("dedupe")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Wrote 1 remove proposal(s)"));
+
+    let proposals_dir = dir.path().join(".distill").join("proposals");
+    let proposals = std::fs::read_dir(&proposals_dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .collect::<Vec<_>>();
+    assert_eq!(proposals.len(), 1);
+
+    let content = std::fs::read_to_string(proposals[0].path()).unwrap();
+    assert!(content.contains("type: remove"));
+    assert!(content.contains("target_skill: beta.md"));
+}

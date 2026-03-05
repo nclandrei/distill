@@ -1,3 +1,4 @@
+pub mod dedupe;
 pub mod notify;
 pub mod onboard;
 pub mod review;

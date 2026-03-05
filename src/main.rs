@@ -108,6 +108,12 @@ enum Commands {
         #[arg(long, value_name = "PATH", conflicts_with = "write_json")]
         apply_json: Option<PathBuf>,
     },
+    /// Detect duplicate global skills and create remove proposals
+    Dedupe {
+        /// Preview duplicates without writing proposals
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Show current config, last scan, and pending proposals
     Status,
     /// Manage the scheduled scan watcher
@@ -155,6 +161,9 @@ fn main() -> anyhow::Result<()> {
             apply_json,
         }) => {
             commands::review::run(write_json.as_deref(), apply_json.as_deref())?;
+        }
+        Some(Commands::Dedupe { dry_run }) => {
+            commands::dedupe::run(dry_run)?;
         }
         Some(Commands::Status) => {
             commands::status::run()?;

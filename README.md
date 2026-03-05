@@ -63,6 +63,7 @@ Notes:
 | `distill onboard` | Run onboarding TUI explicitly |
 | `distill scan --now` | Run an immediate scan for skill proposals |
 | `distill review` | Review pending proposals in a TUI (`a/r/e/s/A`) |
+| `distill dedupe [--dry-run]` | Detect duplicate global skills and propose removals |
 | `distill status` | Show config, pending proposals, accepted skills |
 | `distill watch --install` | Install scheduled scan (launchd/systemd) |
 | `distill watch --uninstall` | Remove scheduled scan |
