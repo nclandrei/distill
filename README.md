@@ -1,6 +1,6 @@
 # distill
 
-![distill icon](assets/icons/distill-preview.png)
+![distill icon](assets/icons/png/color/distill-color-256.png)
 
 `distill` helps you turn repeated AI-agent work into reusable skills. It watches Claude/Codex sessions, proposes improvements, and lets you accept them with a quick review flow.
 
