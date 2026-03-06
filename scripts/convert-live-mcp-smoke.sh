@@ -23,7 +23,8 @@ Options:
 EOF
 }
 
-repo_root="${JJ_WORKSPACE_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd "$script_dir/.." && pwd)"
 cd "$repo_root"
 
 servers_arg="memory=@modelcontextprotocol/server-memory,chrome-devtools=chrome-devtools-mcp@latest"
@@ -181,4 +182,3 @@ else
   echo "[smoke] Cleaning artifacts at: $test_root"
   rm -rf "$test_root"
 fi
-

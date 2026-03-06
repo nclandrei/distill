@@ -151,7 +151,7 @@ struct SkillParityManifest {
     required_tools: Vec<String>,
     #[serde(default)]
     tool_skills: Vec<ManifestToolSkill>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     required_tool_hints: Vec<String>,
 }
 
@@ -372,10 +372,7 @@ pub fn apply(
         orchestrator_skill: Some(orchestrator_filename),
         required_tools: required_tools.clone(),
         tool_skills: tool_skills.clone(),
-        required_tool_hints: required_tools
-            .iter()
-            .map(|tool| format!("{}{}", tool_hint_prefix(&conversion_plan.server), tool))
-            .collect(),
+        required_tool_hints: vec![],
     };
     write_skill_manifest(&skill_path, &manifest)?;
 
@@ -1635,7 +1632,21 @@ fn infer_purpose(
     }
     if contains_any(
         &corpus,
-        &["jira", "linear", "github", "gitlab", "issue", "pr"],
+        &["memory", "knowledge graph", "read_graph", "search_nodes"],
+    ) {
+        return "Memory and knowledge graph workflows".to_string();
+    }
+    if contains_any(
+        &corpus,
+        &[
+            "jira",
+            "linear",
+            "github",
+            "gitlab",
+            "issue",
+            "pull request",
+            "merge request",
+        ],
     ) {
         return "Project and issue management workflows".to_string();
     }
@@ -1848,6 +1859,21 @@ args = ["-y", "chrome-devtools-mcp@latest"]
     }
 
     #[test]
+    fn test_infer_purpose_memory_server_is_memory_workflow() {
+        let purpose = infer_purpose(
+            "memory",
+            None,
+            Some("npx"),
+            None,
+            &[
+                "-y".to_string(),
+                "@modelcontextprotocol/server-memory".to_string(),
+            ],
+        );
+        assert_eq!(purpose, "Memory and knowledge graph workflows");
+    }
+
+    #[test]
     fn test_plan_blocks_replace_for_non_replace_candidate() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("mcp.json");
@@ -1962,8 +1988,9 @@ args = ["-y", "chrome-devtools-mcp@latest"]
 
         let manifest_path = manifest_path_for_skill(&result.skill_path).unwrap();
         assert!(manifest_path.exists());
-        let manifest: SkillParityManifest =
-            serde_json::from_str(&std::fs::read_to_string(manifest_path).unwrap()).unwrap();
+        let manifest_raw = std::fs::read_to_string(&manifest_path).unwrap();
+        assert!(!manifest_raw.contains("\"required_tool_hints\""));
+        let manifest: SkillParityManifest = serde_json::from_str(&manifest_raw).unwrap();
         assert_eq!(manifest.required_tools.len(), 3);
         assert_eq!(manifest.tool_skills.len(), 3);
     }
