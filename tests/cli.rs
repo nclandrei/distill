@@ -719,166 +719,17 @@ fn test_convert_list_detects_claude_settings_by_default() {
 }
 
 #[test]
-fn test_convert_apply_hybrid_writes_skill_file() {
-    let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("mcp.json");
-    let mock_mcp = dir.path().join("mock-mcp.sh");
-    std::fs::write(
-        &mock_mcp,
-        "#!/bin/sh\nread _\nread _\nprintf '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{}}}\\n'\nprintf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"build_run_sim\"},{\"name\":\"launch_app_sim\"},{\"name\":\"list_sims\"}]}}\\n'\n",
-    )
-    .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&mock_mcp, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    std::fs::write(
-        &config_path,
-        &format!(
-            r#"{{
-  "mcpServers": {{
-    "XcodeBuildMCP": {{
-      "command": "{}",
-      "args": ["-y", "xcodebuildmcp@latest", "mcp"]
-    }}
-  }}
-}}"#,
-            mock_mcp.display()
-        ),
-    )
-    .unwrap();
-
-    distill_cmd(dir.path())
-        .args([
-            "convert",
-            "apply",
-            "XcodeBuildMCP",
-            "--mode",
-            "auto",
-            "--json",
-            "--config",
-        ])
-        .arg(&config_path)
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"effective_mode\": \"hybrid\""))
-        .stdout(predicate::str::contains("\"mcp_config_updated\": false"));
-
-    assert!(
-        dir.path()
-            .join(".distill")
-            .join("skills")
-            .join("mcp-xcodebuildmcp.md")
-            .exists(),
-        "hybrid apply should write a generated skill file"
-    );
-
-    let skill_path = dir
-        .path()
-        .join(".distill")
-        .join("skills")
-        .join("mcp-xcodebuildmcp.md");
-    let skill = std::fs::read_to_string(&skill_path).unwrap();
-    assert!(!skill.contains("## Server Metadata"));
-    assert!(!skill.contains("mcp__"));
-
-    let manifest_path = dir
-        .path()
-        .join(".distill")
-        .join("skills")
-        .join(".distill-manifests")
-        .join("mcp-xcodebuildmcp.json");
-    assert!(
-        manifest_path.exists(),
-        "hybrid apply should write parity manifest"
-    );
-}
-
-#[test]
-fn test_convert_apply_replace_removes_server_and_creates_backup() {
+fn test_convert_v3_discover_build_contract_apply() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("settings.json");
-    let mock_mcp = dir.path().join("mock-mcp.sh");
-    std::fs::write(
-        &mock_mcp,
-        "#!/bin/sh\nread _\nread _\nprintf '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{}}}\\n'\nprintf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"navigate\"},{\"name\":\"click\"}]}}\\n'\n",
-    )
-    .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&mock_mcp, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    std::fs::write(
-        &config_path,
-        &format!(
-            r#"{{
-  "mcpServers": {{
-    "playwright": {{
-      "command": "{}",
-      "description": "Read-only browser helpers",
-      "readOnly": true
-    }}
-  }}
-}}"#,
-            mock_mcp.display()
-        ),
-    )
-    .unwrap();
-
-    distill_cmd(dir.path())
-        .args([
-            "convert",
-            "apply",
-            "playwright",
-            "--mode",
-            "replace",
-            "--yes",
-            "--json",
-            "--config",
-        ])
-        .arg(&config_path)
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"mcp_config_updated\": true"))
-        .stdout(predicate::str::contains("\"effective_mode\": \"replace\""));
-
-    let updated = std::fs::read_to_string(&config_path).unwrap();
-    assert!(
-        !updated.contains("playwright"),
-        "replace mode should remove the server from MCP config"
-    );
-
-    let backup_count = std::fs::read_dir(dir.path())
-        .unwrap()
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with("settings.json.bak-")
-        })
-        .count();
-    assert_eq!(backup_count, 1, "replace mode should create one backup");
-}
-
-#[test]
-fn test_convert_verify_reports_passed_for_generated_skill() {
-    let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("settings.json");
+    let dossier_path = dir.path().join("dossier.json");
+    let report_path = dir.path().join("contract-report.json");
     let skills_dir = dir.path().join("skills");
     let mock_mcp = dir.path().join("mock-mcp.sh");
-    std::fs::write(
-        &mock_mcp,
-        "#!/bin/sh\nread _\nread _\nprintf '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{}}}\\n'\nprintf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"navigate\"},{\"name\":\"click\"}]}}\\n'\n",
-    )
-    .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&mock_mcp, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    let mock_codex = dir.path().join("mock-codex.sh");
+    write_mock_mcp_script(&mock_mcp, &["execute"]);
+    write_mock_codex_script(&mock_codex);
+
     std::fs::write(
         &config_path,
         &format!(
@@ -897,148 +748,49 @@ fn test_convert_verify_reports_passed_for_generated_skill() {
     .unwrap();
 
     distill_cmd(dir.path())
-        .args([
-            "convert",
-            "apply",
-            "playwright",
-            "--mode",
-            "hybrid",
-            "--json",
-            "--config",
-        ])
+        .env("DISTILL_CONVERT_CODEX_COMMAND", &mock_codex)
+        .args(["convert", "discover", "playwright", "--json", "--out"])
+        .arg(&dossier_path)
+        .args(["--config"])
         .arg(&config_path)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"server_gate\": \"ready\""));
+
+    distill_cmd(dir.path())
+        .args(["convert", "build", "--from-dossier"])
+        .arg(&dossier_path)
         .args(["--skills-dir"])
         .arg(&skills_dir)
         .assert()
         .success();
 
     distill_cmd(dir.path())
-        .args(["convert", "verify", "playwright", "--json", "--config"])
-        .arg(&config_path)
-        .args(["--skills-dir"])
+        .args(["convert", "contract-test", "--from-dossier"])
+        .arg(&dossier_path)
+        .args(["--report"])
+        .arg(&report_path)
+        .assert()
+        .success();
+
+    distill_cmd(dir.path())
+        .args(["convert", "apply", "--from-dossier"])
+        .arg(&dossier_path)
+        .args(["--yes", "--json", "--skills-dir"])
         .arg(&skills_dir)
         .assert()
         .success()
-        .stdout(predicate::str::contains("\"passed\": true"))
-        .stdout(predicate::str::contains("\"introspection_ok\": true"));
-}
-
-#[test]
-fn test_convert_one_shot_defaults_to_hybrid_for_replace_candidates() {
-    let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("settings.json");
-    let skills_dir = dir.path().join("skills");
-    let mock_mcp = dir.path().join("mock-mcp.sh");
-    std::fs::write(
-        &mock_mcp,
-        "#!/bin/sh\nread _\nread _\nprintf '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{}}}\\n'\nprintf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"execute\"}]}}\\n'\n",
-    )
-    .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&mock_mcp, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    std::fs::write(
-        &config_path,
-        &format!(
-            r#"{{
-  "mcpServers": {{
-    "playwright": {{
-      "command": "{}",
-      "description": "Read-only browser helpers",
-      "readOnly": true
-    }}
-  }}
-}}"#,
-            mock_mcp.display()
-        ),
-    )
-    .unwrap();
-
-    distill_cmd(dir.path())
-        .args(["convert", "playwright", "--json", "--config"])
-        .arg(&config_path)
-        .args(["--skills-dir"])
-        .arg(&skills_dir)
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"safe_mode_downgrade\": true"))
-        .stdout(predicate::str::contains("\"applied_mode\": \"hybrid\""))
-        .stdout(predicate::str::contains("\"verify_passed\": true"));
-
-    let updated = std::fs::read_to_string(&config_path).unwrap();
-    assert!(
-        updated.contains("playwright"),
-        "one-shot default mode must not mutate MCP config"
-    );
-}
-
-#[test]
-fn test_convert_one_shot_replace_requires_yes() {
-    let dir = tempfile::tempdir().unwrap();
-    distill_cmd(dir.path())
-        .args(["convert", "playwright", "--replace"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("--replace requires --yes"));
-}
-
-#[test]
-fn test_convert_one_shot_replace_mutates_config_when_confirmed() {
-    let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("settings.json");
-    let skills_dir = dir.path().join("skills");
-    let mock_mcp = dir.path().join("mock-mcp.sh");
-    std::fs::write(
-        &mock_mcp,
-        "#!/bin/sh\nread _\nread _\nprintf '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{}}}\\n'\nprintf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"execute\"}]}}\\n'\n",
-    )
-    .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&mock_mcp, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    std::fs::write(
-        &config_path,
-        &format!(
-            r#"{{
-  "mcpServers": {{
-    "playwright": {{
-      "command": "{}",
-      "description": "Read-only browser helpers",
-      "readOnly": true
-    }}
-  }}
-}}"#,
-            mock_mcp.display()
-        ),
-    )
-    .unwrap();
-
-    distill_cmd(dir.path())
-        .args([
-            "convert",
-            "playwright",
-            "--replace",
-            "--yes",
-            "--json",
-            "--config",
-        ])
-        .arg(&config_path)
-        .args(["--skills-dir"])
-        .arg(&skills_dir)
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"applied_mode\": \"replace\""))
-        .stdout(predicate::str::contains("\"verified_in_apply\": true"));
+        .stdout(predicate::str::contains("\"mcp_config_updated\": true"));
 
     let updated = std::fs::read_to_string(&config_path).unwrap();
     assert!(
         !updated.contains("playwright"),
-        "one-shot replace should remove server from config"
+        "V3 apply should remove the server from MCP config"
     );
+
+    assert!(skills_dir.join("playwright.md").exists());
+    assert!(skills_dir.join("playwright--execute.md").exists());
+    assert!(report_path.exists());
 
     let backup_count = std::fs::read_dir(dir.path())
         .unwrap()
@@ -1050,5 +802,494 @@ fn test_convert_one_shot_replace_mutates_config_when_confirmed() {
                 .starts_with("settings.json.bak-")
         })
         .count();
-    assert_eq!(backup_count, 1, "one-shot replace should create one backup");
+    assert_eq!(backup_count, 1, "V3 apply should create one backup");
+}
+
+#[test]
+fn test_convert_v3_apply_requires_yes() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("settings.json");
+    let dossier_path = dir.path().join("dossier.json");
+    let mock_codex = dir.path().join("mock-codex.sh");
+    let skills_dir = dir.path().join("skills");
+    let mock_mcp = dir.path().join("mock-mcp.sh");
+    write_mock_mcp_script(&mock_mcp, &["execute"]);
+    write_mock_codex_script(&mock_codex);
+    std::fs::write(
+        &config_path,
+        &format!(
+            r#"{{
+  "mcpServers": {{
+    "playwright": {{
+      "command": "{}",
+      "description": "Read-only browser helpers",
+      "readOnly": true
+    }}
+  }}
+}}"#,
+            mock_mcp.display()
+        ),
+    )
+    .unwrap();
+
+    distill_cmd(dir.path())
+        .env("DISTILL_CONVERT_CODEX_COMMAND", &mock_codex)
+        .args(["convert", "discover", "playwright", "--out"])
+        .arg(&dossier_path)
+        .args(["--config"])
+        .arg(&config_path)
+        .assert()
+        .success();
+
+    distill_cmd(dir.path())
+        .args(["convert", "apply", "--from-dossier"])
+        .arg(&dossier_path)
+        .args(["--skills-dir"])
+        .arg(&skills_dir)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("apply requires --yes"));
+}
+
+#[test]
+fn test_convert_one_shot_v3_mutates_config_on_full_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("settings.json");
+    let skills_dir = dir.path().join("skills");
+    let mock_mcp = dir.path().join("mock-mcp.sh");
+    let mock_codex = dir.path().join("mock-codex.sh");
+    write_mock_mcp_script(&mock_mcp, &["execute"]);
+    write_mock_codex_script(&mock_codex);
+    std::fs::write(
+        &config_path,
+        &format!(
+            r#"{{
+  "mcpServers": {{
+    "playwright": {{
+      "command": "{}",
+      "description": "Read-only browser helpers",
+      "readOnly": true
+    }}
+  }}
+}}"#,
+            mock_mcp.display()
+        ),
+    )
+    .unwrap();
+
+    distill_cmd(dir.path())
+        .env("DISTILL_CONVERT_CODEX_COMMAND", &mock_codex)
+        .args(["convert", "playwright", "--json", "--config"])
+        .arg(&config_path)
+        .args(["--skills-dir"])
+        .arg(&skills_dir)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"contract_test\""))
+        .stdout(predicate::str::contains("\"mcp_config_updated\": true"));
+
+    let updated = std::fs::read_to_string(&config_path).unwrap();
+    assert!(
+        !updated.contains("playwright"),
+        "one-shot V3 should mutate MCP config after full pass"
+    );
+    assert!(skills_dir.join("playwright.md").exists());
+}
+
+#[test]
+fn test_convert_one_shot_v3_works_with_claude_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("settings.json");
+    let skills_dir = dir.path().join("skills");
+    let mock_mcp = dir.path().join("mock-mcp.sh");
+    let mock_claude = dir.path().join("mock-claude.sh");
+    write_mock_mcp_script(&mock_mcp, &["execute"]);
+    write_mock_claude_script(&mock_claude);
+    std::fs::write(
+        &config_path,
+        &format!(
+            r#"{{
+  "mcpServers": {{
+    "playwright": {{
+      "command": "{}",
+      "description": "Read-only browser helpers",
+      "readOnly": true
+    }}
+  }}
+}}"#,
+            mock_mcp.display()
+        ),
+    )
+    .unwrap();
+
+    distill_cmd(dir.path())
+        .env(
+            "DISTILL_CONVERT_CODEX_COMMAND",
+            dir.path().join("missing-codex"),
+        )
+        .env("DISTILL_CONVERT_CLAUDE_COMMAND", &mock_claude)
+        .args(["convert", "playwright", "--json", "--config"])
+        .arg(&config_path)
+        .args(["--skills-dir"])
+        .arg(&skills_dir)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"backend_used\": \"claude\""));
+
+    let updated = std::fs::read_to_string(&config_path).unwrap();
+    assert!(!updated.contains("playwright"));
+}
+
+#[test]
+fn test_convert_discover_v3_fails_cleanly_when_no_backend_installed() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("settings.json");
+    let mock_mcp = dir.path().join("mock-mcp.sh");
+    write_mock_mcp_script(&mock_mcp, &["execute"]);
+    std::fs::write(
+        &config_path,
+        &format!(
+            r#"{{
+  "mcpServers": {{
+    "playwright": {{
+      "command": "{}",
+      "description": "Read-only browser helpers",
+      "readOnly": true
+    }}
+  }}
+}}"#,
+            mock_mcp.display()
+        ),
+    )
+    .unwrap();
+
+    distill_cmd(dir.path())
+        .env(
+            "DISTILL_CONVERT_CODEX_COMMAND",
+            dir.path().join("missing-codex"),
+        )
+        .env(
+            "DISTILL_CONVERT_CLAUDE_COMMAND",
+            dir.path().join("missing-claude"),
+        )
+        .args(["convert", "discover", "playwright", "--config"])
+        .arg(&config_path)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "No supported backend is installed",
+        ));
+}
+
+#[test]
+fn test_convert_contract_test_blocks_on_schema_gap() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("settings.json");
+    let dossier_path = dir.path().join("dossier.json");
+    let mock_mcp = dir.path().join("mock-mcp-no-schema.sh");
+    let mock_codex = dir.path().join("mock-codex.sh");
+    write_mock_mcp_no_schema_script(&mock_mcp, "execute");
+    write_mock_codex_script_for(&mock_codex, &["execute"]);
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"{{
+  "mcpServers": {{
+    "playwright": {{
+      "command": "{}",
+      "description": "Read-only browser helpers",
+      "readOnly": true
+    }}
+  }}
+}}"#,
+            mock_mcp.display()
+        ),
+    )
+    .unwrap();
+
+    distill_cmd(dir.path())
+        .env("DISTILL_CONVERT_CODEX_COMMAND", &mock_codex)
+        .args(["convert", "discover", "playwright", "--out"])
+        .arg(&dossier_path)
+        .args(["--config"])
+        .arg(&config_path)
+        .assert()
+        .success();
+
+    distill_cmd(dir.path())
+        .args(["convert", "contract-test", "--from-dossier"])
+        .arg(&dossier_path)
+        .args(["--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"passed\": false"))
+        .stdout(predicate::str::contains("\"error_kind\": \"schema-gap\""));
+}
+
+#[test]
+fn test_convert_contract_test_enforces_side_effect_safety_by_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("settings.json");
+    let dossier_path = dir.path().join("dossier.json");
+    let mock_mcp = dir.path().join("mock-mcp-delete.sh");
+    let mock_codex = dir.path().join("mock-codex.sh");
+    write_mock_mcp_id_schema_script(&mock_mcp, "delete_item");
+    write_mock_codex_script_for(&mock_codex, &["delete_item"]);
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"{{
+  "mcpServers": {{
+    "admin": {{
+      "command": "{}",
+      "description": "Admin mutations"
+    }}
+  }}
+}}"#,
+            mock_mcp.display()
+        ),
+    )
+    .unwrap();
+
+    distill_cmd(dir.path())
+        .env("DISTILL_CONVERT_CODEX_COMMAND", &mock_codex)
+        .args(["convert", "discover", "admin", "--out"])
+        .arg(&dossier_path)
+        .args(["--config"])
+        .arg(&config_path)
+        .assert()
+        .success();
+
+    distill_cmd(dir.path())
+        .args(["convert", "contract-test", "--from-dossier"])
+        .arg(&dossier_path)
+        .args(["--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"passed\": false"))
+        .stdout(predicate::str::contains("\"error_kind\": \"unsafe\""));
+
+    distill_cmd(dir.path())
+        .args(["convert", "apply", "--from-dossier"])
+        .arg(&dossier_path)
+        .args(["--yes"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Conversion blocked: one or more contract tests failed",
+        ));
+}
+
+#[test]
+fn test_convert_contract_test_allows_side_effect_probe_with_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("settings.json");
+    let dossier_path = dir.path().join("dossier.json");
+    let mock_mcp = dir.path().join("mock-mcp-delete.sh");
+    let mock_codex = dir.path().join("mock-codex.sh");
+    write_mock_mcp_id_schema_script(&mock_mcp, "delete_item");
+    write_mock_codex_script_for(&mock_codex, &["delete_item"]);
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"{{
+  "mcpServers": {{
+    "admin": {{
+      "command": "{}",
+      "description": "Admin mutations"
+    }}
+  }}
+}}"#,
+            mock_mcp.display()
+        ),
+    )
+    .unwrap();
+
+    distill_cmd(dir.path())
+        .env("DISTILL_CONVERT_CODEX_COMMAND", &mock_codex)
+        .args(["convert", "discover", "admin", "--out"])
+        .arg(&dossier_path)
+        .args(["--config"])
+        .arg(&config_path)
+        .assert()
+        .success();
+
+    distill_cmd(dir.path())
+        .args(["convert", "contract-test", "--from-dossier"])
+        .arg(&dossier_path)
+        .args(["--allow-side-effects", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"passed\": true"));
+}
+
+fn write_mock_mcp_script(path: &std::path::Path, tool_names: &[&str]) {
+    let tools = tool_names
+        .iter()
+        .map(|name| {
+            format!(
+                r#"{{\"name\":\"{name}\",\"description\":\"Tool {name}\",\"inputSchema\":{{\"type\":\"object\",\"required\":[\"query\"],\"properties\":{{\"query\":{{\"type\":\"string\"}}}}}}}}"#
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let body = format!(
+        r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":"2025-03-26","capabilities":{{}}}}}}\n'
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{{"jsonrpc":"2.0","id":2,"result":{{"tools":[{tools}]}}}}\n'
+      ;;
+    *'"method":"tools/call"'*)
+      if echo "$line" | grep -q '"query":"'; then
+        printf '{{"jsonrpc":"2.0","id":2,"result":{{"content":[{{"type":"text","text":"ok"}}],"isError":false}}}}\n'
+      else
+        printf '{{"jsonrpc":"2.0","id":2,"error":{{"code":-32602,"message":"invalid query"}}}}\n'
+      fi
+      ;;
+  esac
+done
+"#
+    );
+    write_agent_script(path, &body);
+}
+
+fn write_mock_codex_script(path: &std::path::Path) {
+    let tools = vec![
+        "build_run_sim",
+        "launch_app_sim",
+        "list_sims",
+        "navigate",
+        "click",
+        "fill",
+        "execute",
+    ];
+    write_mock_codex_script_for(path, &tools);
+}
+
+fn write_mock_codex_script_for(path: &std::path::Path, tools: &[&str]) {
+    let dossiers = tools
+        .iter()
+        .map(|name| {
+            format!(
+                r#"{{"name":"{name}","explanation":"Run {name}","recipe":["validate input","execute {name}","verify output"],"evidence":["runtime metadata"],"confidence":0.9,"contract_tests":[{{"probe":"happy-path","expected":"valid output","method":"run valid request","applicable":true}},{{"probe":"invalid-input","expected":"returns validation error","method":"run malformed request","applicable":true}},{{"probe":"side-effect-safety","expected":"requires confirmation for mutations","method":"run check/dry-run first","applicable":true}}]}}"#,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let payload = format!(r#"{{"tool_dossiers":[{dossiers}]}}"#);
+    let body = format!(
+        r#"#!/bin/sh
+if [ "$1" = "--version" ] || [ "$1" = "-v" ] || [ "$1" = "version" ]; then
+  echo "mock-codex"
+  exit 0
+fi
+last_message_file=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --output-last-message|-o)
+      last_message_file="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+cat > /dev/null
+[ -n "$last_message_file" ] || exit 12
+cat > "$last_message_file" <<'JSON'
+{payload}
+JSON
+"#
+    );
+    write_agent_script(path, &body);
+}
+
+fn write_mock_claude_script(path: &std::path::Path) {
+    let tools = vec![
+        "build_run_sim",
+        "launch_app_sim",
+        "list_sims",
+        "navigate",
+        "click",
+        "fill",
+        "execute",
+    ];
+    write_mock_claude_script_for(path, &tools);
+}
+
+fn write_mock_claude_script_for(path: &std::path::Path, tools: &[&str]) {
+    let dossiers = tools
+        .iter()
+        .map(|name| {
+            format!(
+                r#"{{"name":"{name}","explanation":"Run {name}","recipe":["validate input","execute {name}","verify output"],"evidence":["runtime metadata"],"confidence":0.85,"contract_tests":[{{"probe":"happy-path","expected":"valid output","method":"run valid request","applicable":true}},{{"probe":"invalid-input","expected":"returns validation error","method":"run malformed request","applicable":true}},{{"probe":"side-effect-safety","expected":"requires confirmation for mutations","method":"run check/dry-run first","applicable":true}}]}}"#,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let payload = format!(r#"{{"tool_dossiers":[{dossiers}]}}"#);
+    let body = format!(
+        r#"#!/bin/sh
+if [ "$1" = "--version" ] || [ "$1" = "-v" ] || [ "$1" = "version" ]; then
+  echo "mock-claude"
+  exit 0
+fi
+cat > /dev/null
+cat <<'JSON'
+{payload}
+JSON
+"#
+    );
+    write_agent_script(path, &body);
+}
+
+fn write_mock_mcp_no_schema_script(path: &std::path::Path, tool_name: &str) {
+    let body = format!(
+        r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":"2025-03-26","capabilities":{{}}}}}}\n'
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{{"jsonrpc":"2.0","id":2,"result":{{"tools":[{{"name":"{tool_name}"}}]}}}}\n'
+      ;;
+    *'"method":"tools/call"'*)
+      printf '{{"jsonrpc":"2.0","id":2,"result":{{"content":[{{"type":"text","text":"ok"}}],"isError":false}}}}\n'
+      ;;
+  esac
+done
+"#
+    );
+    write_agent_script(path, &body);
+}
+
+fn write_mock_mcp_id_schema_script(path: &std::path::Path, tool_name: &str) {
+    let body = format!(
+        r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":"2025-03-26","capabilities":{{}}}}}}\n'
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{{"jsonrpc":"2.0","id":2,"result":{{"tools":[{{"name":"{tool_name}","description":"delete item","inputSchema":{{"type":"object","required":["id"],"properties":{{"id":{{"type":"string"}}}}}}}}]}}}}\n'
+      ;;
+    *'"method":"tools/call"'*)
+      if echo "$line" | grep -q '"id":"'; then
+        printf '{{"jsonrpc":"2.0","id":2,"result":{{"content":[{{"type":"text","text":"ok"}}],"isError":false}}}}\n'
+      else
+        printf '{{"jsonrpc":"2.0","id":2,"error":{{"code":-32602,"message":"missing id"}}}}\n'
+      fi
+      ;;
+  esac
+done
+"#
+    );
+    write_agent_script(path, &body);
 }

@@ -89,6 +89,7 @@ pub fn build_config(answers: &OnboardingAnswers) -> Config {
         notifications: answers.notifications.clone(),
         notification_icon: None,
         sync_agents: SyncAgentsConfig::default(),
+        convert: crate::config::ConvertConfig::default(),
     }
 }
 

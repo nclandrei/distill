@@ -141,22 +141,22 @@ fn detect_terminal_image_protocol() -> Option<TerminalImageProtocol> {
         return None;
     }
 
-    if let Some(term) = tmux_client_termname() {
-        if let Some(protocol) = protocol_from_terminal_name(&term) {
-            return Some(protocol);
-        }
+    if let Some(term) = tmux_client_termname()
+        && let Some(protocol) = protocol_from_terminal_name(&term)
+    {
+        return Some(protocol);
     }
 
-    if let Ok(term_program) = std::env::var("TERM_PROGRAM") {
-        if let Some(protocol) = protocol_from_terminal_name(&term_program) {
-            return Some(protocol);
-        }
+    if let Ok(term_program) = std::env::var("TERM_PROGRAM")
+        && let Some(protocol) = protocol_from_terminal_name(&term_program)
+    {
+        return Some(protocol);
     }
 
-    if let Ok(term) = std::env::var("TERM") {
-        if let Some(protocol) = protocol_from_terminal_name(&term) {
-            return Some(protocol);
-        }
+    if let Ok(term) = std::env::var("TERM")
+        && let Some(protocol) = protocol_from_terminal_name(&term)
+    {
+        return Some(protocol);
     }
 
     None
@@ -222,20 +222,19 @@ fn icon_path_extension(path: &std::path::Path) -> Option<String> {
 fn terminal_image_bytes(icon_path: Option<&str>) -> Vec<u8> {
     if let Some(path) = resolve_icon_path(icon_path) {
         let path = PathBuf::from(path);
-        if let Ok(bytes) = std::fs::read(&path) {
-            if !bytes.is_empty() {
-                match icon_path_extension(&path).as_deref() {
-                    Some("png") => return bytes,
-                    Some("svg") => {
-                        if let Some(png) = rasterize_svg_to_png(&bytes, TERMINAL_IMAGE_MAX_EDGE_PX)
-                        {
-                            return png;
-                        }
+        if let Ok(bytes) = std::fs::read(&path)
+            && !bytes.is_empty()
+        {
+            match icon_path_extension(&path).as_deref() {
+                Some("png") => return bytes,
+                Some("svg") => {
+                    if let Some(png) = rasterize_svg_to_png(&bytes, TERMINAL_IMAGE_MAX_EDGE_PX) {
+                        return png;
                     }
-                    _ => {
-                        if let Some(png) = normalize_raster_to_png(&bytes) {
-                            return png;
-                        }
+                }
+                _ => {
+                    if let Some(png) = normalize_raster_to_png(&bytes) {
+                        return png;
                     }
                 }
             }
@@ -535,10 +534,8 @@ impl Notifier for MacOsNotifier {
     fn send(&self, title: &str, body: &str, icon_path: Option<&str>) -> Result<()> {
         if icon_path.is_some() {
             let notifier = MacOsTerminalNotifier;
-            if notifier.is_available() {
-                if notifier.send(title, body, icon_path).is_ok() {
-                    return Ok(());
-                }
+            if notifier.is_available() && notifier.send(title, body, icon_path).is_ok() {
+                return Ok(());
             }
         }
         MacOsScriptNotifier.send(title, body, None)

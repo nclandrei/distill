@@ -8,6 +8,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod v3;
+
+pub use v3::*;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum PermissionLevel {
@@ -166,10 +170,11 @@ struct SkillParityManifest {
     required_tool_hints: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct ToolSpec {
     name: String,
     description: Option<String>,
+    input_schema: Option<Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -599,10 +604,10 @@ fn verify_with_server_and_path(
             "Loaded parity manifest from {}.",
             manifest_path.display()
         ));
-        if let Some(orchestrator) = manifest.orchestrator_skill {
-            if let Some(parent) = skill_path.parent() {
-                orchestrator_skill_path = parent.join(orchestrator);
-            }
+        if let Some(orchestrator) = manifest.orchestrator_skill
+            && let Some(parent) = skill_path.parent()
+        {
+            orchestrator_skill_path = parent.join(orchestrator);
         }
         if !manifest.required_tools.is_empty() {
             required_tools = manifest
@@ -850,11 +855,11 @@ fn invoke_codex_structured_with_command(
         }
     };
 
-    if let Some(mut stdin) = child.stdin.take() {
-        if let Err(err) = stdin.write_all(prompt.as_bytes()) {
-            cleanup_temp_files(&temp_files);
-            return Err(err).context("Failed to write enrichment prompt to codex stdin");
-        }
+    if let Some(mut stdin) = child.stdin.take()
+        && let Err(err) = stdin.write_all(prompt.as_bytes())
+    {
+        cleanup_temp_files(&temp_files);
+        return Err(err).context("Failed to write enrichment prompt to codex stdin");
     }
 
     let output = match child.wait_with_output() {
@@ -1440,9 +1445,15 @@ fn introspect_tool_specs(server: &MCPServerProfile) -> Result<Vec<ToolSpec>> {
                     .map(str::trim)
                     .filter(|text| !text.is_empty())
                     .map(ToString::to_string);
+                let input_schema = item
+                    .get("inputSchema")
+                    .or_else(|| item.get("input_schema"))
+                    .filter(|schema| !schema.is_null())
+                    .cloned();
                 Some(ToolSpec {
                     name: normalize_tool_name(name),
                     description,
+                    input_schema,
                 })
             })
             .collect::<Vec<_>>();

@@ -71,26 +71,22 @@ One-shot AI review workflow:
 ";
 
 const CONVERT_LONG_ABOUT: &str = "\
-Inspect MCP server configurations and plan conversion to skills.
+Convert MCP servers into orchestrator + tool skills with an atomic per-server runtime gate.
 
 Default one-shot flow:
   distill convert <server>
 
-This runs inspect -> plan(auto) -> apply(hybrid by default) -> verify.
-Use --replace --yes if you explicitly want destructive config mutation.
+V4 pipeline:
+  discover -> build -> contract-test -> apply
 
-`apply` generates one orchestrator skill plus per-tool capability skills.
-`verify` checks parity for required tools and required generated skill files.
+Backend selection is backend-agnostic (Codex or Claude):
+  1) explicit --backend if provided
+  2) config convert.backend_preference when available
+  3) auto-detect installed backend (codex, then claude)
 
-For non-interactive automation, use:
-  distill convert <server> --json
-  distill convert list --json
-  distill convert inspect <server> --json
-  distill convert plan <server> --mode auto|hybrid|replace --json
-  distill convert apply <server> --mode auto|hybrid|replace --yes --json
-  distill convert verify <server> --json
-
-You can pass one or more --config <path> values to include extra MCP config files.
+Use --backend-health to print backend diagnostics.
+Use --allow-side-effects, --probe-timeout-seconds, and --probe-retries to control runtime probes.
+Use --config <path> to include extra MCP config files.
 ";
 
 const SYNC_AGENTS_LONG_ABOUT: &str = "\
@@ -144,20 +140,11 @@ enum Commands {
         #[arg(long, value_name = "PATH", conflicts_with = "write_json")]
         apply_json: Option<PathBuf>,
     },
-    /// Inspect MCP servers and plan conversion to skills
-    #[command(long_about = CONVERT_LONG_ABOUT, args_conflicts_with_subcommands = true)]
+    /// Inspect MCP servers and convert to skills
+    #[command(long_about = CONVERT_LONG_ABOUT)]
     Convert {
         /// Server id (source:name) or unique server name
         server: Option<String>,
-        /// Allow destructive replace mode instead of safe hybrid default
-        #[arg(long)]
-        replace: bool,
-        /// Required when --replace is set
-        #[arg(long)]
-        yes: bool,
-        /// Enrich generated capability skills with optional Codex-authored hints
-        #[arg(long)]
-        enrich_codex: bool,
         /// Emit machine-readable JSON output
         #[arg(long)]
         json: bool,
@@ -167,6 +154,24 @@ enum Commands {
         /// Override output directory for generated skills
         #[arg(long = "skills-dir", value_name = "PATH")]
         skills_dir: Option<PathBuf>,
+        /// Force backend selection to codex or claude
+        #[arg(long, value_parser = ["codex", "claude"])]
+        backend: Option<String>,
+        /// Enable backend auto-detect/fallback mode
+        #[arg(long)]
+        backend_auto: bool,
+        /// Print backend availability diagnostics
+        #[arg(long)]
+        backend_health: bool,
+        /// Allow executing explicit side-effectful probes during contract testing
+        #[arg(long, global = true)]
+        allow_side_effects: bool,
+        /// Runtime probe timeout in seconds
+        #[arg(long = "probe-timeout-seconds", value_name = "N", global = true)]
+        probe_timeout_seconds: Option<u64>,
+        /// Number of retries for failed runtime probes
+        #[arg(long = "probe-retries", value_name = "N", global = true)]
+        probe_retries: Option<u32>,
         #[command(subcommand)]
         command: Option<ConvertCommands>,
     },
@@ -231,6 +236,62 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum ConvertCommands {
+    /// Discover runtime tools and generate backend-neutral dossiers
+    Discover {
+        /// Server id (source:name) or unique server name
+        server: Option<String>,
+        /// Discover all servers from config sources
+        #[arg(long, conflicts_with = "server")]
+        all: bool,
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+        /// Optional path to write dossier JSON
+        #[arg(long = "out", value_name = "PATH")]
+        out: Option<PathBuf>,
+        /// Additional MCP config file paths to inspect
+        #[arg(long = "config", value_name = "PATH")]
+        config: Vec<PathBuf>,
+    },
+    /// Build skill files from an existing dossier JSON
+    Build {
+        /// Input dossier JSON path
+        #[arg(long = "from-dossier", value_name = "PATH")]
+        from_dossier: PathBuf,
+        /// Override output directory for generated skills
+        #[arg(long = "skills-dir", value_name = "PATH")]
+        skills_dir: Option<PathBuf>,
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run contract tests from an existing dossier JSON
+    ContractTest {
+        /// Input dossier JSON path
+        #[arg(long = "from-dossier", value_name = "PATH")]
+        from_dossier: PathBuf,
+        /// Optional path to write contract-test report JSON
+        #[arg(long = "report", value_name = "PATH")]
+        report: Option<PathBuf>,
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Apply a fully passing dossier: write skills and remove MCP config entry
+    Apply {
+        /// Input dossier JSON path
+        #[arg(long = "from-dossier", value_name = "PATH")]
+        from_dossier: PathBuf,
+        /// Required confirmation because this mutates MCP config
+        #[arg(long)]
+        yes: bool,
+        /// Override output directory for generated skills
+        #[arg(long = "skills-dir", value_name = "PATH")]
+        skills_dir: Option<PathBuf>,
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
     /// List discovered MCP servers
     List {
         /// Emit machine-readable JSON output
@@ -267,29 +328,6 @@ enum ConvertCommands {
         /// Additional MCP config file paths to inspect
         #[arg(long = "config", value_name = "PATH")]
         config: Vec<PathBuf>,
-    },
-    /// Apply a conversion plan and generate a skill file
-    Apply {
-        /// Server id (source:name) or unique server name
-        server: String,
-        /// Conversion mode (auto resolves from recommendation)
-        #[arg(long, default_value = "auto", value_parser = ["auto", "hybrid", "replace"])]
-        mode: String,
-        /// Required confirmation for replace mode
-        #[arg(long)]
-        yes: bool,
-        /// Enrich generated capability skills with optional Codex-authored hints
-        #[arg(long)]
-        enrich_codex: bool,
-        /// Emit machine-readable JSON output
-        #[arg(long)]
-        json: bool,
-        /// Additional MCP config file paths to inspect
-        #[arg(long = "config", value_name = "PATH")]
-        config: Vec<PathBuf>,
-        /// Override output directory for generated skills
-        #[arg(long = "skills-dir", value_name = "PATH")]
-        skills_dir: Option<PathBuf>,
     },
     /// Verify parity coverage between generated skill and live MCP tool list
     Verify {
@@ -338,76 +376,133 @@ fn main() -> anyhow::Result<()> {
         }
         Some(Commands::Convert {
             server,
-            replace,
-            yes,
-            enrich_codex,
             json,
             config,
             skills_dir,
+            backend,
+            backend_auto,
+            backend_health,
+            allow_side_effects,
+            probe_timeout_seconds,
+            probe_retries,
             command,
-        }) => match command {
-            Some(ConvertCommands::List { json, config }) => {
-                commands::convert::run_list(json, &config)?;
-            }
-            Some(ConvertCommands::Inspect {
-                server,
-                json,
-                config,
-            }) => {
-                commands::convert::run_inspect(&server, json, &config)?;
-            }
-            Some(ConvertCommands::Plan {
-                server,
-                mode,
-                dry_run,
-                json,
-                config,
-            }) => {
-                commands::convert::run_plan(&server, &mode, dry_run, json, &config)?;
-            }
-            Some(ConvertCommands::Apply {
-                server,
-                mode,
-                yes,
-                enrich_codex,
-                json,
-                config,
-                skills_dir,
-            }) => {
-                commands::convert::run_apply(
-                    &server,
-                    &mode,
-                    yes,
+        }) => {
+            let app_config = config::Config::load().unwrap_or_default();
+            match command {
+                Some(ConvertCommands::Discover {
+                    server,
+                    all,
                     json,
-                    &config,
-                    skills_dir,
-                    enrich_codex,
-                )?;
-            }
-            Some(ConvertCommands::Verify {
-                server,
-                json,
-                config,
-                skills_dir,
-            }) => {
-                commands::convert::run_verify(&server, json, &config, skills_dir)?;
-            }
-            None => {
-                if let Some(server) = server {
-                    commands::convert::run_one_shot(
-                        &server,
-                        replace,
-                        yes,
+                    out,
+                    config,
+                }) => {
+                    commands::convert::run_discover_v3(
+                        server.as_deref(),
+                        all,
                         json,
+                        out,
                         &config,
-                        skills_dir,
-                        enrich_codex,
+                        backend.as_deref(),
+                        backend_auto,
+                        backend_health,
+                        &app_config,
                     )?;
-                } else {
-                    commands::convert::run_overview(&[])?;
+                }
+                Some(ConvertCommands::Build {
+                    from_dossier,
+                    skills_dir,
+                    json,
+                }) => {
+                    commands::convert::run_build_v3(
+                        &from_dossier,
+                        skills_dir,
+                        json,
+                        backend_health,
+                        &app_config,
+                    )?;
+                }
+                Some(ConvertCommands::ContractTest {
+                    from_dossier,
+                    report,
+                    json,
+                }) => {
+                    commands::convert::run_contract_test_v3(
+                        &from_dossier,
+                        report.as_deref(),
+                        json,
+                        backend_health,
+                        allow_side_effects,
+                        probe_timeout_seconds,
+                        probe_retries,
+                        &app_config,
+                    )?;
+                }
+                Some(ConvertCommands::Apply {
+                    from_dossier,
+                    yes,
+                    skills_dir,
+                    json,
+                }) => {
+                    commands::convert::run_apply_v3(
+                        &from_dossier,
+                        yes,
+                        skills_dir,
+                        json,
+                        backend_health,
+                        allow_side_effects,
+                        probe_timeout_seconds,
+                        probe_retries,
+                        &app_config,
+                    )?;
+                }
+                Some(ConvertCommands::List { json, config }) => {
+                    commands::convert::run_list(json, &config)?;
+                }
+                Some(ConvertCommands::Inspect {
+                    server,
+                    json,
+                    config,
+                }) => {
+                    commands::convert::run_inspect(&server, json, &config)?;
+                }
+                Some(ConvertCommands::Plan {
+                    server,
+                    mode,
+                    dry_run,
+                    json,
+                    config,
+                }) => {
+                    commands::convert::run_plan(&server, &mode, dry_run, json, &config)?;
+                }
+                Some(ConvertCommands::Verify {
+                    server,
+                    json,
+                    config,
+                    skills_dir,
+                }) => {
+                    commands::convert::run_verify(&server, json, &config, skills_dir)?;
+                }
+                None => {
+                    if let Some(server) = server {
+                        commands::convert::run_one_shot_v3(
+                            &server,
+                            json,
+                            &config,
+                            skills_dir,
+                            backend.as_deref(),
+                            backend_auto,
+                            backend_health,
+                            allow_side_effects,
+                            probe_timeout_seconds,
+                            probe_retries,
+                            &app_config,
+                        )?;
+                    } else {
+                        commands::convert::run_overview_v3(&config)?;
+                    }
                 }
             }
-        },
+        }
         Some(Commands::Dedupe { dry_run }) => {
             commands::dedupe::run(dry_run)?;
         }

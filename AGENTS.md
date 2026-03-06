@@ -134,14 +134,22 @@ screencapture -x -i /absolute/path/selection.png
 - To enforce the same checks at commit time, run `make hooks-install` once per clone (installs Git `pre-commit` plus `jj safe-commit` / `jj safe-describe` aliases).
 - For test/demo review runs, prefer an isolated home (`HOME="$TMPDIR/...")` so real `~/.distill` data is not modified.
 - For `distill convert` verification, use a temporary MCP fixture JSON and pass it with `--config` to keep checks deterministic:
-  - `distill convert <server> --config "$TMPDIR/distill-mcp.json"`
+  - `distill convert <server> --config "$TMPDIR/distill-mcp.json"` (one-shot V4 runtime gate)
+  - `distill convert discover <server> --out "$TMPDIR/dossier.json" --config "$TMPDIR/distill-mcp.json"`
+  - `distill convert build --from-dossier "$TMPDIR/dossier.json"`
+  - `distill convert contract-test --from-dossier "$TMPDIR/dossier.json" --report "$TMPDIR/contract.json"`
+  - `distill convert contract-test --from-dossier "$TMPDIR/dossier.json" --allow-side-effects --probe-timeout-seconds 45 --probe-retries 1`
+  - `distill convert apply --from-dossier "$TMPDIR/dossier.json" --yes`
+  - `distill convert discover <server> --backend codex --backend-health --config "$TMPDIR/distill-mcp.json"`
+  - `distill convert discover <server> --backend claude --backend-health --config "$TMPDIR/distill-mcp.json"`
+- Legacy troubleshooting commands are still available:
   - `distill convert list --config "$TMPDIR/distill-mcp.json"`
   - `distill convert inspect <server> --config "$TMPDIR/distill-mcp.json"`
   - `distill convert plan <server> --mode auto --config "$TMPDIR/distill-mcp.json"`
-  - `distill convert apply <server> --mode auto --config "$TMPDIR/distill-mcp.json"`
   - `distill convert verify <server> --config "$TMPDIR/distill-mcp.json"`
-- For replace-mode verification, require explicit `--yes` and assert both:
-  - generated orchestrator skill plus capability skills exist under `~/.distill/skills/`
+- For V4 apply verification, require explicit `--yes` and assert all:
+  - runtime contract tests were executed and passed (`happy-path`, `invalid-input`, `side-effect-safety`)
+  - generated orchestrator skill plus capability skills exist under `~/.agents/skills/`
   - MCP config backup file (`*.bak-<timestamp>`) is created before config mutation
 - For one-proposal review flows, pressing `a` can immediately complete the app and stop tmux.
 - If tmux exits right after action, treat that as expected completion and verify outcomes via filesystem artifacts:
