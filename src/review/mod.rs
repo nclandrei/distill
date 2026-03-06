@@ -46,6 +46,12 @@ pub struct HistoryEntry {
     pub proposal_filename: String,
     pub decision: String, // "accepted" or "rejected"
     pub decided_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal_type: Option<ProposalType>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 /// Summary of a completed review session.
@@ -181,6 +187,150 @@ fn proposal_affects_skill(proposal: &Proposal) -> bool {
     )
 }
 
+fn proposal_type_slug(proposal_type: &ProposalType) -> &'static str {
+    match proposal_type {
+        ProposalType::New => "new",
+        ProposalType::Improve => "improve",
+        ProposalType::Edit => "edit",
+        ProposalType::Remove => "remove",
+    }
+}
+
+fn proposal_target_kind(proposal: &Proposal) -> &'static str {
+    match proposal.frontmatter.resolved_target() {
+        Some(ProposalTarget::File { .. }) => "file",
+        _ => "skill",
+    }
+}
+
+fn normalize_for_tag_matching(input: &str) -> String {
+    input
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+}
+
+fn keyword_matches(
+    keyword: &str,
+    normalized: &str,
+    words: &std::collections::BTreeSet<&str>,
+) -> bool {
+    if keyword.contains(' ') {
+        normalized.contains(keyword)
+    } else {
+        words.contains(keyword)
+    }
+}
+
+fn derive_preference_tags(proposal: &Proposal) -> Vec<String> {
+    const TOPIC_KEYWORDS: &[(&str, &[&str])] = &[
+        (
+            "git",
+            &[
+                "git",
+                "rebase",
+                "merge",
+                "commit",
+                "branch",
+                "stash",
+                "cherry pick",
+            ],
+        ),
+        (
+            "testing",
+            &[
+                "test",
+                "tests",
+                "testing",
+                "pytest",
+                "jest",
+                "unittest",
+                "integration test",
+            ],
+        ),
+        (
+            "ci-cd",
+            &["ci", "pipeline", "circleci", "github actions", "workflow"],
+        ),
+        (
+            "debugging",
+            &["debug", "debugger", "lldb", "gdb", "stack trace", "trace"],
+        ),
+        (
+            "deployment",
+            &[
+                "deploy",
+                "deployment",
+                "release",
+                "rollout",
+                "kubernetes",
+                "k8s",
+            ],
+        ),
+        (
+            "docs",
+            &["docs", "documentation", "readme", "agents md", "guide"],
+        ),
+        (
+            "refactoring",
+            &[
+                "refactor", "cleanup", "lint", "format", "clippy", "prettier",
+            ],
+        ),
+        (
+            "database",
+            &["database", "sql", "query", "postgres", "migration"],
+        ),
+    ];
+
+    let mut tags = std::collections::BTreeSet::new();
+    tags.insert(format!(
+        "type:{}",
+        proposal_type_slug(&proposal.frontmatter.proposal_type)
+    ));
+    tags.insert(format!("target:{}", proposal_target_kind(proposal)));
+
+    let mut context = proposal.body.clone();
+    for evidence in &proposal.frontmatter.evidence {
+        context.push(' ');
+        context.push_str(&evidence.pattern);
+    }
+    if let Some(target) = proposal.frontmatter.resolved_target() {
+        match target {
+            ProposalTarget::Skill { name } => {
+                context.push(' ');
+                context.push_str(&name);
+            }
+            ProposalTarget::File { path } => {
+                context.push(' ');
+                context.push_str(&path);
+            }
+        }
+    }
+
+    let normalized = normalize_for_tag_matching(&context);
+    let words = normalized
+        .split_whitespace()
+        .collect::<std::collections::BTreeSet<_>>();
+
+    for (tag, keywords) in TOPIC_KEYWORDS {
+        if keywords
+            .iter()
+            .any(|keyword| keyword_matches(keyword, &normalized, &words))
+        {
+            tags.insert((*tag).to_string());
+        }
+    }
+
+    tags.into_iter().take(12).collect()
+}
+
 /// Accept a proposal: write its body as a skill, log the decision, and delete the proposal file.
 pub fn accept_proposal(
     proposal: &Proposal,
@@ -256,6 +406,9 @@ pub fn accept_proposal(
         proposal_filename: proposal_filename.clone(),
         decision: "accepted".to_string(),
         decided_at: Utc::now(),
+        proposal_type: Some(proposal.frontmatter.proposal_type.clone()),
+        target_kind: Some(proposal_target_kind(proposal).to_string()),
+        tags: derive_preference_tags(proposal),
     };
     log_decision(history_dir, &entry)?;
 
@@ -285,6 +438,9 @@ pub fn reject_proposal(
         proposal_filename: proposal_filename.clone(),
         decision: "rejected".to_string(),
         decided_at: Utc::now(),
+        proposal_type: Some(proposal.frontmatter.proposal_type.clone()),
+        target_kind: Some(proposal_target_kind(proposal).to_string()),
+        tags: derive_preference_tags(proposal),
     };
     log_decision(history_dir, &entry)?;
 
@@ -1641,6 +1797,14 @@ mod tests {
             content.contains("logged.md"),
             "should include proposal filename"
         );
+        assert!(
+            content.contains("\"target_kind\":\"skill\""),
+            "should include structured target kind metadata"
+        );
+        assert!(
+            content.contains("\"type:new\""),
+            "should include derived preference tags"
+        );
     }
 
     #[test]
@@ -1909,6 +2073,10 @@ mod tests {
             content.contains("reject-log.md"),
             "should include proposal filename"
         );
+        assert!(
+            content.contains("\"target_kind\":\"skill\""),
+            "should include structured target kind metadata"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1924,11 +2092,17 @@ mod tests {
             proposal_filename: "first.md".to_string(),
             decision: "accepted".to_string(),
             decided_at: Utc::now(),
+            proposal_type: None,
+            target_kind: None,
+            tags: vec![],
         };
         let entry2 = HistoryEntry {
             proposal_filename: "second.md".to_string(),
             decision: "rejected".to_string(),
             decided_at: Utc::now(),
+            proposal_type: None,
+            target_kind: None,
+            tags: vec![],
         };
 
         log_decision(&history_dir, &entry1).unwrap();
@@ -1955,6 +2129,9 @@ mod tests {
             proposal_filename: "p.md".to_string(),
             decision: "accepted".to_string(),
             decided_at: Utc::now(),
+            proposal_type: None,
+            target_kind: None,
+            tags: vec![],
         };
 
         log_decision(&history_dir, &entry).unwrap();
@@ -1973,6 +2150,9 @@ mod tests {
             proposal_filename: "valid-json.md".to_string(),
             decision: "accepted".to_string(),
             decided_at: Utc::now(),
+            proposal_type: None,
+            target_kind: None,
+            tags: vec![],
         };
 
         log_decision(&history_dir, &entry).unwrap();
@@ -1988,6 +2168,20 @@ mod tests {
             );
             assert_eq!(parsed["decision"].as_str().unwrap(), "accepted");
         }
+    }
+
+    #[test]
+    fn test_derive_preference_tags_includes_type_target_and_topic() {
+        let proposal = make_proposal(
+            "git-skill.md",
+            Some("git-workflow"),
+            "# Git Workflow\n\nUse git rebase before merge.",
+        );
+
+        let tags = derive_preference_tags(&proposal);
+        assert!(tags.contains(&"type:new".to_string()));
+        assert!(tags.contains(&"target:skill".to_string()));
+        assert!(tags.contains(&"git".to_string()));
     }
 
     // -----------------------------------------------------------------------

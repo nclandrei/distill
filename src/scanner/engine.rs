@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::agents::{Agent, Session, Skill};
 use crate::config::Config;
+use crate::preferences::PreferenceProfile;
 use crate::proposals::{
     Confidence, Evidence, Proposal, ProposalFrontmatter, ProposalTarget, ProposalType,
 };
@@ -64,6 +65,8 @@ pub struct ScanConfig {
     pub proposals_dir: PathBuf,
     /// Path to last-scan.json.
     pub last_scan_path: PathBuf,
+    /// Directory containing historical review decisions.
+    pub history_dir: PathBuf,
 }
 
 impl ScanConfig {
@@ -76,6 +79,7 @@ impl ScanConfig {
             skills_dir: Config::skills_dir(),
             proposals_dir: Config::proposals_dir(),
             last_scan_path: Config::last_scan_path(),
+            history_dir: Config::history_dir(),
         }
     }
 }
@@ -229,8 +233,24 @@ pub fn run_scan(agents: &[Box<dyn Agent>], scan_config: &ScanConfig) -> Result<V
     let skills = load_skills(&scan_config.skills_dir)?;
     println!("Loaded {} existing skill(s).", skills.len());
 
+    // Step 3.5: Load preference profile from prior review decisions.
+    let preferences = match PreferenceProfile::load(&scan_config.history_dir) {
+        Ok(profile) => profile,
+        Err(err) => {
+            eprintln!("Warning: failed to load preference history (continuing without it): {err}");
+            PreferenceProfile::default()
+        }
+    };
+    if preferences.reviewed > 0 {
+        println!(
+            "Loaded preference history: {} reviewed decision(s), {} strong signal(s).",
+            preferences.reviewed,
+            preferences.signal_count()
+        );
+    }
+
     // Step 4: Build prompt and invoke agent
-    let prompt = build_prompt(&sessions, &skills);
+    let prompt = build_prompt(&sessions, &skills, &preferences);
     println!(
         "Sending {} session path(s) to `{}` for analysis (prompt: {} bytes)...",
         sessions.len(),
@@ -334,7 +354,11 @@ fn load_skills(skills_dir: &Path) -> Result<Vec<Skill>> {
 ///
 /// Instead of inlining session content (which can be enormous), the prompt
 /// points the agent at the session file paths and lets it read them directly.
-fn build_prompt(sessions: &[Session], existing_skills: &[Skill]) -> String {
+fn build_prompt(
+    sessions: &[Session],
+    existing_skills: &[Skill],
+    preferences: &PreferenceProfile,
+) -> String {
     let mut prompt = String::new();
 
     prompt.push_str(
@@ -376,6 +400,8 @@ fn build_prompt(sessions: &[Session], existing_skills: &[Skill]) -> String {
             ));
         }
     }
+
+    prompt.push_str(&preferences.to_prompt_block());
 
     // Include parsed excerpts from session files so proposal agents don't need
     // to run tool calls just to inspect local JSONL logs.
@@ -872,7 +898,7 @@ mod tests {
             content: "# Deploy\nRun deploy.sh".into(),
         }];
 
-        let prompt = build_prompt(&sessions, &skills);
+        let prompt = build_prompt(&sessions, &skills, &PreferenceProfile::default());
         assert!(prompt.contains("Session Excerpts"));
         assert!(prompt.contains("/fake/s1.jsonl"));
         assert!(prompt.contains("Existing Skills"));
@@ -891,8 +917,36 @@ mod tests {
             content: String::new(),
         }];
 
-        let prompt = build_prompt(&sessions, &[]);
+        let prompt = build_prompt(&sessions, &[], &PreferenceProfile::default());
         assert!(prompt.contains("None yet"));
+    }
+
+    #[test]
+    fn test_build_prompt_includes_preference_section() {
+        let sessions = vec![Session {
+            id: "s1".into(),
+            agent: AgentKind::Claude,
+            path: PathBuf::from("/fake/s1.jsonl"),
+            timestamp: Utc::now(),
+            content: String::new(),
+        }];
+
+        let preferences = PreferenceProfile {
+            reviewed: 5,
+            accepted: 4,
+            rejected: 1,
+            prefer: vec![crate::preferences::PreferenceSignal {
+                tag: "git".to_string(),
+                accepted: 3,
+                rejected: 0,
+            }],
+            avoid: vec![],
+        };
+
+        let prompt = build_prompt(&sessions, &[], &preferences);
+        assert!(prompt.contains("Learned Preferences From Past Reviews"));
+        assert!(prompt.contains("git"));
+        assert!(prompt.contains("Decisions reviewed: 5"));
     }
 
     #[test]
@@ -979,6 +1033,7 @@ mod tests {
             skills_dir,
             proposals_dir: proposals_dir.clone(),
             last_scan_path: last_scan_path.clone(),
+            history_dir: dir.path().join("history"),
         };
 
         let result = run_scan(&agents, &scan_config).unwrap();
@@ -1029,6 +1084,7 @@ mod tests {
             skills_dir,
             proposals_dir,
             last_scan_path: last_scan_path.clone(),
+            history_dir: dir.path().join("history"),
         };
 
         let result = run_scan(&agents, &scan_config).unwrap();

@@ -4,6 +4,7 @@ mod config;
 mod convert;
 mod notify;
 mod onboard;
+mod preferences;
 mod proposals;
 mod review;
 mod scanner;
