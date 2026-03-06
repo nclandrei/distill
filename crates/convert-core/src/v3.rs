@@ -5,9 +5,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -610,7 +611,8 @@ pub fn contract_test_bundle(
                 missing_runtime_tools.push(normalized.clone());
             }
             let runtime_spec = runtime_map.get(&normalized);
-            let result = evaluate_tool_contract(tool, &dossier.server, runtime_spec, options);
+            let result =
+                evaluate_tool_contract(tool, &dossier.server, runtime_spec, &runtime_map, options);
             if !result.passed {
                 server_passed = false;
             }
@@ -960,18 +962,20 @@ fn discover_server_dossier(
                         ) {
                             Ok(generated) => dossiers = generated,
                             Err(fallback_err) => {
-                                gate_reasons.push(format!(
-                                    "Backend dossier generation failed on primary and fallback: {fallback_err}"
+                                diagnostics.push(format!(
+                                    "Warning: backend dossier generation failed on primary and fallback; using runtime fallback dossiers. fallback_error={fallback_err}"
                                 ));
                             }
                         }
                     } else {
-                        gate_reasons.push(format!(
-                            "Backend dossier generation failed and no fallback backend is available: {err}"
+                        diagnostics.push(format!(
+                            "Warning: backend dossier generation failed and no fallback backend is available; using runtime fallback dossiers. error={err}"
                         ));
                     }
                 } else {
-                    gate_reasons.push(format!("Backend dossier generation failed: {err}"));
+                    diagnostics.push(format!(
+                        "Warning: backend dossier generation failed; using runtime fallback dossiers. error={err}"
+                    ));
                 }
             }
         }
@@ -986,15 +990,6 @@ fn discover_server_dossier(
         .into_iter()
         .map(|tool| (normalize_tool_name(&tool.name), tool))
         .collect::<BTreeMap<_, _>>();
-
-    for runtime_tool in runtime_map.keys() {
-        if !dossier_map.contains_key(runtime_tool) {
-            gate_reasons.push(format!(
-                "Missing dossier entry for runtime tool '{}'.",
-                runtime_tool
-            ));
-        }
-    }
 
     let mut tool_dossiers = vec![];
     for name in runtime_map.keys() {
@@ -1220,6 +1215,7 @@ fn evaluate_tool_contract(
     tool: &ToolDossier,
     server: &MCPServerProfile,
     runtime_tool: Option<&RuntimeTool>,
+    runtime_tools: &BTreeMap<String, RuntimeTool>,
     options: ContractTestOptions,
 ) -> ContractToolResult {
     let mut probes = vec![];
@@ -1293,9 +1289,14 @@ fn evaluate_tool_contract(
                 }
 
                 let result = match probe {
-                    "happy-path" => {
-                        run_happy_probe(server, &tool_name, happy_probe_args.clone(), options)
-                    }
+                    "happy-path" => run_happy_probe(
+                        server,
+                        runtime_tools,
+                        &tool_name,
+                        &tool.name,
+                        happy_probe_args.clone(),
+                        options,
+                    ),
                     "invalid-input" => run_invalid_probe(
                         server,
                         runtime_tool,
@@ -1348,20 +1349,62 @@ fn evaluate_tool_contract(
 
 fn run_happy_probe(
     server: &MCPServerProfile,
+    runtime_tools: &BTreeMap<String, RuntimeTool>,
     tool_name: &str,
+    original_tool_name: &str,
     happy_probe_args: std::result::Result<(Value, ProbeInputSource), ProbeFailure>,
     options: ContractTestOptions,
 ) -> ContractProbeResult {
     match happy_probe_args {
-        Ok((args, source)) => execute_probe_expect_success(
-            server,
-            tool_name,
-            "happy-path",
-            args,
-            source,
-            options,
-            false,
-        ),
+        Ok((args, source)) => {
+            let baseline = execute_probe_expect_success(
+                server,
+                tool_name,
+                "happy-path",
+                args.clone(),
+                source,
+                options,
+                false,
+                &[],
+            );
+            if baseline.passed {
+                return baseline;
+            }
+
+            let retryable_not_found = baseline.error_kind == Some(ProbeErrorKind::McpError)
+                && baseline
+                    .response_preview
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase()
+                    .contains("not found");
+            if !retryable_not_found {
+                return baseline;
+            }
+
+            let setup_calls = derive_setup_calls(runtime_tools, original_tool_name, &args);
+            if setup_calls.is_empty() {
+                return baseline;
+            }
+
+            let retried = execute_probe_expect_success(
+                server,
+                tool_name,
+                "happy-path",
+                args,
+                source,
+                options,
+                false,
+                &setup_calls,
+            );
+            if retried.passed {
+                return ContractProbeResult {
+                    details: format!("{} (after deterministic setup prelude).", retried.details),
+                    ..retried
+                };
+            }
+            baseline
+        }
         Err(err) => probe_failure_result("happy-path", false, None, err),
     }
 }
@@ -1440,6 +1483,7 @@ fn run_side_effect_probe(
             source,
             options,
             true,
+            &[],
         );
     }
 
@@ -1453,11 +1497,13 @@ fn run_side_effect_probe(
             source,
             options,
             false,
+            &[],
         ),
         Err(err) => probe_failure_result("side-effect-safety", false, None, err),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_probe_expect_success(
     server: &MCPServerProfile,
     tool_name: &str,
@@ -1466,9 +1512,10 @@ fn execute_probe_expect_success(
     source: ProbeInputSource,
     options: ContractTestOptions,
     side_effectful: bool,
+    setup_calls: &[(String, Value)],
 ) -> ContractProbeResult {
     let request_preview = Some(clipped_preview(&value_to_compact_json(&args), 220));
-    match execute_mcp_tool_probe(server, tool_name, &args, options) {
+    match execute_mcp_tool_probe(server, tool_name, &args, options, setup_calls) {
         Ok(call) if !call.is_error => ContractProbeResult {
             probe: probe.to_string(),
             passed: true,
@@ -1514,7 +1561,7 @@ fn execute_probe_expect_error(
     options: ContractTestOptions,
 ) -> ContractProbeResult {
     let request_preview = Some(clipped_preview(&value_to_compact_json(&args), 220));
-    match execute_mcp_tool_probe(server, tool_name, &args, options) {
+    match execute_mcp_tool_probe(server, tool_name, &args, options, &[]) {
         Ok(call) if call.is_error => ContractProbeResult {
             probe: probe.to_string(),
             passed: true,
@@ -1668,6 +1715,72 @@ fn resolve_guarded_side_effect_args(
         message: "No safe guard path found for side-effect probe (dry_run/check/preview/noop/confirm=false/force=false).".to_string(),
         response_preview: None,
     })
+}
+
+fn derive_setup_calls(
+    runtime_tools: &BTreeMap<String, RuntimeTool>,
+    tool_name: &str,
+    args: &Value,
+) -> Vec<(String, Value)> {
+    let normalized = normalize_tool_name(tool_name).to_ascii_lowercase();
+    let mut calls = vec![];
+
+    if runtime_tools.contains_key("create_entities") {
+        let entity_names = collect_entity_names(args);
+        if !entity_names.is_empty()
+            && (normalized.contains("observation")
+                || normalized.contains("relation")
+                || normalized.contains("entity"))
+        {
+            let entities = entity_names
+                .into_iter()
+                .map(|name| {
+                    serde_json::json!({
+                        "name": name,
+                        "entityType": "sample",
+                        "observations": ["sample"]
+                    })
+                })
+                .collect::<Vec<_>>();
+            calls.push((
+                "create_entities".to_string(),
+                serde_json::json!({ "entities": entities }),
+            ));
+        }
+    }
+
+    calls
+}
+
+fn collect_entity_names(root: &Value) -> Vec<String> {
+    let mut out = BTreeSet::new();
+    collect_entity_names_recursive(root, &mut out);
+    out.into_iter().collect()
+}
+
+fn collect_entity_names_recursive(value: &Value, out: &mut BTreeSet<String>) {
+    match value {
+        Value::Object(map) => {
+            for (key, entry) in map {
+                let key_lower = key.to_ascii_lowercase();
+                if matches!(key_lower.as_str(), "entityname" | "name" | "from" | "to")
+                    && let Some(name) = entry.as_str()
+                {
+                    let trimmed = name.trim();
+                    if !trimmed.is_empty() {
+                        out.insert(trimmed.to_string());
+                    }
+                }
+                collect_entity_names_recursive(entry, out);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_entity_names_recursive(item, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn is_likely_side_effect_tool(
@@ -1932,10 +2045,17 @@ fn execute_mcp_tool_probe(
     tool_name: &str,
     args: &Value,
     options: ContractTestOptions,
+    setup_calls: &[(String, Value)],
 ) -> std::result::Result<McpToolCallOutcome, ProbeFailure> {
     let mut last_err: Option<ProbeFailure> = None;
     for _attempt in 0..=options.probe_retries {
-        match execute_mcp_tool_probe_once(server, tool_name, args, options.probe_timeout_seconds) {
+        match execute_mcp_tool_probe_once(
+            server,
+            tool_name,
+            args,
+            options.probe_timeout_seconds,
+            setup_calls,
+        ) {
             Ok(outcome) => return Ok(outcome),
             Err(err) => last_err = Some(err),
         }
@@ -1952,6 +2072,7 @@ fn execute_mcp_tool_probe_once(
     tool_name: &str,
     args: &Value,
     timeout_seconds: u64,
+    setup_calls: &[(String, Value)],
 ) -> std::result::Result<McpToolCallOutcome, ProbeFailure> {
     let command = server.command.as_deref().ok_or_else(|| ProbeFailure {
         kind: ProbeErrorKind::Transport,
@@ -1959,7 +2080,7 @@ fn execute_mcp_tool_probe_once(
         response_preview: None,
     })?;
 
-    let child = Command::new(command)
+    let mut child = Command::new(command)
         .args(&server.args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1971,6 +2092,38 @@ fn execute_mcp_tool_probe_once(
             response_preview: None,
         })?;
 
+    let mut stdin = child.stdin.take().ok_or_else(|| ProbeFailure {
+        kind: ProbeErrorKind::Transport,
+        message: "Failed to open MCP stdin.".to_string(),
+        response_preview: None,
+    })?;
+    let stdout = child.stdout.take().ok_or_else(|| ProbeFailure {
+        kind: ProbeErrorKind::Transport,
+        message: "Failed to open MCP stdout.".to_string(),
+        response_preview: None,
+    })?;
+    let mut stderr = child.stderr.take().ok_or_else(|| ProbeFailure {
+        kind: ProbeErrorKind::Transport,
+        message: "Failed to open MCP stderr.".to_string(),
+        response_preview: None,
+    })?;
+
+    let (tx, rx) = mpsc::channel::<String>();
+    let reader_handle = thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    let _ = tx.send(line.trim_end().to_string());
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
     let init = serde_json::json!({
         "jsonrpc":"2.0",
         "id":1,
@@ -1981,57 +2134,93 @@ fn execute_mcp_tool_probe_once(
             "clientInfo":{"name":"distill","version":"0.1"}
         }
     });
-    let call = serde_json::json!({
-        "jsonrpc":"2.0",
-        "id":2,
-        "method":"tools/call",
-        "params":{"name":tool_name,"arguments":args}
-    });
-    let payload = format!("{init}\n{call}\n");
-
     let started = Instant::now();
-    let output =
-        run_command_with_timeout(child, payload.as_bytes(), timeout_seconds).map_err(|err| {
-            let message = format!("{err:#}");
-            let kind = if message.contains("timed out") {
-                ProbeErrorKind::Timeout
-            } else {
-                ProbeErrorKind::Transport
-            };
-            ProbeFailure {
-                kind,
-                message: format!("MCP probe execution failed: {message}"),
-                response_preview: None,
-            }
+    let deadline = started + Duration::from_secs(timeout_seconds.max(1));
+    let mut buffered = BTreeMap::<i64, Value>::new();
+
+    writeln!(stdin, "{init}").map_err(|err| ProbeFailure {
+        kind: ProbeErrorKind::Transport,
+        message: format!("Failed to write MCP initialize request: {err}"),
+        response_preview: None,
+    })?;
+    let _ = wait_for_jsonrpc_response(1, &rx, &mut buffered, deadline);
+
+    let mut next_setup_id = 100_i64;
+    for (setup_tool, setup_args) in setup_calls {
+        let setup_id = next_setup_id;
+        next_setup_id += 1;
+        let setup_call = serde_json::json!({
+            "jsonrpc":"2.0",
+            "id":setup_id,
+            "method":"tools/call",
+            "params":{"name":setup_tool,"arguments":setup_args}
+        });
+        writeln!(stdin, "{setup_call}").map_err(|err| ProbeFailure {
+            kind: ProbeErrorKind::Transport,
+            message: format!(
+                "Failed to write setup tools/call for '{}': {err}",
+                setup_tool
+            ),
+            response_preview: None,
         })?;
-    let duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    let mut response: Option<Value> = None;
-    for line in stdout.lines() {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        let Some(id) = value.get("id").and_then(Value::as_i64) else {
-            continue;
-        };
-        if id == 2 {
-            response = Some(value);
+        let setup_response = wait_for_jsonrpc_response(setup_id, &rx, &mut buffered, deadline)
+            .map_err(|mut err| {
+                err.message = format!(
+                    "Setup call '{}' failed before '{}' execution: {}",
+                    setup_tool, tool_name, err.message
+                );
+                err
+            })?;
+        if setup_response.get("error").is_some()
+            || setup_response
+                .get("result")
+                .and_then(|v| v.get("isError"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            || setup_response
+                .get("result")
+                .and_then(|v| v.get("is_error"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        {
+            drop(stdin);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(ProbeFailure {
+                kind: ProbeErrorKind::McpError,
+                message: format!(
+                    "Setup probe call for tool '{}' failed before '{}' execution.",
+                    setup_tool, tool_name
+                ),
+                response_preview: Some(clipped_preview(
+                    &value_to_compact_json(&setup_response),
+                    260,
+                )),
+            });
         }
     }
 
-    let Some(response) = response else {
-        return Err(ProbeFailure {
-            kind: ProbeErrorKind::Transport,
-            message: format!(
-                "MCP probe did not return tools/call response. stderr={}",
-                clipped_preview(stderr.trim(), 260)
-            ),
-            response_preview: Some(clipped_preview(stdout.trim(), 260)),
-        });
-    };
+    let target_call_id = 2_i64;
+    let call = serde_json::json!({
+        "jsonrpc":"2.0",
+        "id":target_call_id,
+        "method":"tools/call",
+        "params":{"name":tool_name,"arguments":args}
+    });
+    writeln!(stdin, "{call}").map_err(|err| ProbeFailure {
+        kind: ProbeErrorKind::Transport,
+        message: format!("Failed to write MCP tools/call request: {err}"),
+        response_preview: None,
+    })?;
+    let response = wait_for_jsonrpc_response(target_call_id, &rx, &mut buffered, deadline)?;
+
+    drop(stdin);
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = reader_handle.join();
+    let mut _stderr_text = String::new();
+    let _ = stderr.read_to_string(&mut _stderr_text);
+    let duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
 
     let response_preview = clipped_preview(&value_to_compact_json(&response), 260);
     if let Some(error) = response.get("error") {
@@ -2074,6 +2263,54 @@ fn execute_mcp_tool_probe_once(
         response_preview,
         duration_ms,
     })
+}
+
+fn wait_for_jsonrpc_response(
+    expected_id: i64,
+    rx: &mpsc::Receiver<String>,
+    buffered: &mut BTreeMap<i64, Value>,
+    deadline: Instant,
+) -> std::result::Result<Value, ProbeFailure> {
+    if let Some(found) = buffered.remove(&expected_id) {
+        return Ok(found);
+    }
+
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(ProbeFailure {
+                kind: ProbeErrorKind::Timeout,
+                message: format!("Timed out waiting for MCP response id={expected_id}."),
+                response_preview: None,
+            });
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        let wait = remaining.min(Duration::from_millis(200));
+        match rx.recv_timeout(wait) {
+            Ok(line) => {
+                let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let Some(id) = value.get("id").and_then(Value::as_i64) else {
+                    continue;
+                };
+                if id == expected_id {
+                    return Ok(value);
+                }
+                buffered.insert(id, value);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(ProbeFailure {
+                    kind: ProbeErrorKind::Transport,
+                    message: format!(
+                        "MCP process closed before response id={expected_id} was received."
+                    ),
+                    response_preview: None,
+                });
+            }
+        }
+    }
 }
 
 fn value_to_compact_json(value: &Value) -> String {
@@ -2890,9 +3127,45 @@ mod tests {
                 method: "run".to_string(),
                 applicable: true,
             }],
+            probe_inputs: ProbeInputs::default(),
+            probe_input_source: ProbeInputSource::Synthesized,
         };
 
-        let result = evaluate_tool_contract(&tool, true);
+        let server = MCPServerProfile {
+            id: "custom:playwright".to_string(),
+            name: "playwright".to_string(),
+            source_label: "custom".to_string(),
+            source_path: PathBuf::from("/tmp/settings.json"),
+            purpose: "browser".to_string(),
+            command: None,
+            args: vec![],
+            url: None,
+            env_keys: vec![],
+            declared_tool_count: 1,
+            permission_hints: vec![],
+            inferred_permission: PermissionLevel::ReadOnly,
+            recommendation: ConversionRecommendation::Hybrid,
+            recommendation_reason: "read-only".to_string(),
+        };
+        let runtime_tool = RuntimeTool {
+            name: "navigate".to_string(),
+            description: Some("navigate".to_string()),
+            input_schema: Some(serde_json::json!({
+                "type":"object",
+                "required":["query"],
+                "properties":{"query":{"type":"string"}}
+            })),
+        };
+        let mut runtime_tools = BTreeMap::new();
+        runtime_tools.insert("navigate".to_string(), runtime_tool.clone());
+
+        let result = evaluate_tool_contract(
+            &tool,
+            &server,
+            Some(&runtime_tool),
+            &runtime_tools,
+            ContractTestOptions::default(),
+        );
         assert!(!result.passed);
         assert!(
             result
@@ -3072,5 +3345,133 @@ JSON
             std::env::remove_var("DISTILL_CONVERT_CODEX_COMMAND");
             std::env::remove_var("DISTILL_CONVERT_CLAUDE_COMMAND");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_v3_uses_runtime_fallback_when_all_backends_fail() {
+        let _guard = env_lock().lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let mcp = dir.path().join("mock-mcp.sh");
+        let codex = dir.path().join("mock-codex-fail.sh");
+        let claude = dir.path().join("mock-claude-fail.sh");
+        let config_path = dir.path().join("settings.json");
+
+        write_executable(
+            &mcp,
+            "#!/bin/sh\nread _\nread _\nprintf '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{}}}\\n'\nprintf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"execute\",\"inputSchema\":{\"type\":\"object\",\"required\":[\"query\"],\"properties\":{\"query\":{\"type\":\"string\"}}}}]}}\\n'\n",
+        );
+        write_executable(
+            &codex,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ] || [ \"$1\" = \"-v\" ] || [ \"$1\" = \"version\" ]; then echo v; exit 0; fi\nexit 31\n",
+        );
+        write_executable(
+            &claude,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ] || [ \"$1\" = \"-v\" ] || [ \"$1\" = \"version\" ]; then echo v; exit 0; fi\nexit 32\n",
+        );
+        fs::write(
+            &config_path,
+            format!(
+                r#"{{
+  "mcpServers": {{
+    "playwright": {{
+      "command": "{}",
+      "readOnly": true
+    }}
+  }}
+}}"#,
+                mcp.display()
+            ),
+        )
+        .unwrap();
+
+        // SAFETY: Tests serialize env mutation using env_lock().
+        unsafe {
+            std::env::set_var("DISTILL_CONVERT_CODEX_COMMAND", codex.as_os_str());
+            std::env::set_var("DISTILL_CONVERT_CLAUDE_COMMAND", claude.as_os_str());
+        }
+
+        let options = ConvertV3Options::default();
+        let bundle = discover_v3(Some("playwright"), false, &[config_path], &options).unwrap();
+        let dossier = &bundle.dossiers[0];
+        assert_eq!(dossier.server_gate, ServerGate::Ready);
+        assert!(dossier.gate_reasons.is_empty());
+        assert_eq!(dossier.tool_dossiers.len(), 1);
+        assert!(dossier.backend_fallback_used);
+
+        // SAFETY: Tests serialize env mutation using env_lock().
+        unsafe {
+            std::env::remove_var("DISTILL_CONVERT_CODEX_COMMAND");
+            std::env::remove_var("DISTILL_CONVERT_CLAUDE_COMMAND");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_mcp_tool_probe_supports_sequential_setup_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let mcp = dir.path().join("mock-memory-state.sh");
+        write_executable(
+            &mcp,
+            r#"#!/bin/sh
+created=0
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{}}}\n'
+      ;;
+    *'"method":"tools/call"'*)
+      if echo "$line" | grep -q '"name":"create_entities"'; then
+        created=1
+        printf '{"jsonrpc":"2.0","id":100,"result":{"content":[{"type":"text","text":"created"}],"isError":false}}\n'
+      elif echo "$line" | grep -q '"name":"add_observations"'; then
+        if [ "$created" -eq 1 ]; then
+          printf '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"ok"}],"isError":false}}\n'
+        else
+          printf '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"Entity with name sample not found"}],"isError":true}}\n'
+        fi
+      fi
+      ;;
+  esac
+done
+"#,
+        );
+
+        let server = MCPServerProfile {
+            id: "fixture:memory".to_string(),
+            name: "memory".to_string(),
+            source_label: "fixture".to_string(),
+            source_path: PathBuf::from("/tmp/settings.json"),
+            purpose: "memory".to_string(),
+            command: Some(mcp.to_string_lossy().to_string()),
+            args: vec![],
+            url: None,
+            env_keys: vec![],
+            declared_tool_count: 2,
+            permission_hints: vec![],
+            inferred_permission: PermissionLevel::Write,
+            recommendation: ConversionRecommendation::Hybrid,
+            recommendation_reason: "write".to_string(),
+        };
+        let args = serde_json::json!({
+            "observations":[{"entityName":"sample","contents":["sample"]}]
+        });
+        let options = ContractTestOptions::default();
+
+        let no_setup = execute_mcp_tool_probe(&server, "add_observations", &args, options, &[])
+            .expect("probe without setup should return response");
+        assert!(no_setup.is_error);
+
+        let setup = vec![(
+            "create_entities".to_string(),
+            serde_json::json!({
+                "entities":[{"name":"sample","entityType":"sample","observations":["sample"]}]
+            }),
+        )];
+        let with_setup =
+            execute_mcp_tool_probe(&server, "add_observations", &args, options, &setup)
+                .expect("probe with setup should return response");
+        assert!(!with_setup.is_error);
     }
 }
