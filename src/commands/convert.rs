@@ -78,9 +78,19 @@ pub fn run_apply(
     json: bool,
     config_paths: &[PathBuf],
     output_dir: Option<PathBuf>,
+    enrich_codex: bool,
 ) -> Result<()> {
     let mode = parse_mode(mode_raw)?;
-    let result = convert::apply(selector, mode, yes, config_paths, output_dir)?;
+    let result = convert::apply_with_options(
+        selector,
+        mode,
+        yes,
+        config_paths,
+        convert::ApplyOptions {
+            output_dir,
+            enrichment_agent: enrich_codex.then_some(convert::EnrichmentAgent::Codex),
+        },
+    )?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&result)?);
@@ -113,6 +123,7 @@ pub fn run_one_shot(
     json: bool,
     config_paths: &[PathBuf],
     skills_dir: Option<PathBuf>,
+    enrich_codex: bool,
 ) -> Result<()> {
     if replace && !yes {
         bail!("--replace requires --yes because this mutates MCP config.");
@@ -137,12 +148,15 @@ pub fn run_one_shot(
         );
     }
 
-    let apply = convert::apply(
+    let apply = convert::apply_with_options(
         selector,
         applied_mode,
         yes,
         config_paths,
-        skills_dir.clone(),
+        convert::ApplyOptions {
+            output_dir: skills_dir.clone(),
+            enrichment_agent: enrich_codex.then_some(convert::EnrichmentAgent::Codex),
+        },
     )?;
     let (verify, verified_in_apply, verify_passed) = if apply.effective_mode == PlanMode::Replace {
         // replace-mode already gates config mutation on live verification inside apply()

@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -61,6 +62,18 @@ impl std::fmt::Display for PlanMode {
             PlanMode::Replace => write!(f, "replace"),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum EnrichmentAgent {
+    Codex,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ApplyOptions {
+    pub output_dir: Option<PathBuf>,
+    pub enrichment_agent: Option<EnrichmentAgent>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -157,6 +170,35 @@ struct SkillParityManifest {
 struct ToolSpec {
     name: String,
     description: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct ToolEnrichmentResponse {
+    tools: Vec<ToolEnrichmentEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct ToolEnrichmentEntry {
+    name: String,
+    #[serde(default)]
+    what_it_does: Option<String>,
+    #[serde(default)]
+    when_to_use: Option<String>,
+    #[serde(default)]
+    inputs_hint: Vec<String>,
+    #[serde(default)]
+    success_signals: Vec<String>,
+    #[serde(default)]
+    pitfalls: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct ToolSkillHint {
+    what_it_does: Option<String>,
+    when_to_use: Option<String>,
+    inputs_hint: Vec<String>,
+    success_signals: Vec<String>,
+    pitfalls: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -276,6 +318,25 @@ pub fn apply(
     additional_paths: &[PathBuf],
     output_dir: Option<PathBuf>,
 ) -> Result<ConvertApplyResult> {
+    apply_with_options(
+        server_selector,
+        requested_mode,
+        confirm_replace,
+        additional_paths,
+        ApplyOptions {
+            output_dir,
+            enrichment_agent: None,
+        },
+    )
+}
+
+pub fn apply_with_options(
+    server_selector: &str,
+    requested_mode: PlanMode,
+    confirm_replace: bool,
+    additional_paths: &[PathBuf],
+    options: ApplyOptions,
+) -> Result<ConvertApplyResult> {
     let conversion_plan = plan(server_selector, requested_mode, additional_paths)?;
 
     if conversion_plan.blocked {
@@ -290,7 +351,7 @@ pub fn apply(
         bail!("Replace mode requires explicit confirmation via --yes.");
     }
 
-    let skills_dir = output_dir.unwrap_or_else(default_skills_dir);
+    let skills_dir = options.output_dir.unwrap_or_else(default_skills_dir);
     std::fs::create_dir_all(&skills_dir)
         .with_context(|| format!("Failed to create skills directory {}", skills_dir.display()))?;
 
@@ -319,6 +380,28 @@ pub fn apply(
         })
         .unwrap_or_default();
 
+    let mut notes = vec![];
+    let enrichment_hints = match options.enrichment_agent {
+        Some(EnrichmentAgent::Codex) => {
+            match codex_enrichment_hints(&conversion_plan.server, &required_tools, &spec_by_name) {
+                Ok(hints) => {
+                    notes.push(format!(
+                        "Codex enrichment added optional hints for {} capability skill(s).",
+                        hints.len()
+                    ));
+                    hints
+                }
+                Err(err) => {
+                    notes.push(format!(
+                        "Codex enrichment unavailable; used deterministic templates only ({err})."
+                    ));
+                    BTreeMap::new()
+                }
+            }
+        }
+        None => BTreeMap::new(),
+    };
+
     let server_slug = sanitize_slug(&conversion_plan.server.name);
     let mut slug_counts: BTreeMap<String, usize> = BTreeMap::new();
     let mut tool_skills = Vec::new();
@@ -340,7 +423,12 @@ pub fn apply(
             .and_then(|item| item.description.as_deref());
         std::fs::write(
             &skill_path,
-            render_capability_skill_markdown(&conversion_plan.server, tool_name, description),
+            render_capability_skill_markdown(
+                &conversion_plan.server,
+                tool_name,
+                description,
+                enrichment_hints.get(tool_name),
+            ),
         )
         .with_context(|| format!("Failed to write capability skill {}", skill_path.display()))?;
         tool_skills.push(ManifestToolSkill {
@@ -374,10 +462,10 @@ pub fn apply(
     };
     write_skill_manifest(&skill_path, &manifest)?;
 
-    let mut notes = vec![format!(
+    notes.push(format!(
         "Generated 1 orchestrator skill and {} capability skills.",
         tool_skills.len()
-    )];
+    ));
     notes.push("Wrote internal parity manifest for verify checks.".to_string());
     let mut mcp_config_backup = None;
     let mut mcp_config_updated = false;
@@ -633,6 +721,262 @@ fn verify_with_server_and_path(
     })
 }
 
+const TOOL_ENRICHMENT_SCHEMA: &str = r#"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["tools"],
+  "properties": {
+    "tools": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "what_it_does",
+          "when_to_use",
+          "inputs_hint",
+          "success_signals",
+          "pitfalls"
+        ],
+        "properties": {
+          "name": { "type": "string" },
+          "what_it_does": { "type": ["string", "null"] },
+          "when_to_use": { "type": ["string", "null"] },
+          "inputs_hint": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "success_signals": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "pitfalls": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      }
+    }
+  }
+}"#;
+
+fn codex_enrichment_hints(
+    server: &MCPServerProfile,
+    required_tools: &[String],
+    spec_by_name: &BTreeMap<String, ToolSpec>,
+) -> Result<BTreeMap<String, ToolSkillHint>> {
+    if required_tools.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
+    #[derive(Serialize)]
+    struct PromptTool<'a> {
+        name: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        description: Option<&'a str>,
+    }
+
+    let tools = required_tools
+        .iter()
+        .map(|tool_name| PromptTool {
+            name: tool_name,
+            description: spec_by_name
+                .get(tool_name)
+                .and_then(|item| item.description.as_deref()),
+        })
+        .collect::<Vec<_>>();
+    let tools_json = serde_json::to_string_pretty(&tools)
+        .context("Failed to serialize tool list for Codex enrichment prompt")?;
+
+    let prompt = format!(
+        "You are writing OPTIONAL hint text for agent skills.\n\
+Do not invent capabilities that are not implied by the tool name/description.\n\
+If unknown, leave fields empty.\n\
+Keep each string concise (one sentence or short phrase).\n\n\
+Server: {}\n\
+Purpose: {}\n\
+Tools (JSON):\n{}\n\n\
+Return ONLY JSON matching the provided schema.\n\
+Use normalized tool names exactly as provided in the tool list.\n",
+        server.name, server.purpose, tools_json
+    );
+
+    let raw = invoke_codex_structured(&prompt, TOOL_ENRICHMENT_SCHEMA)?;
+    let required_set = required_tools
+        .iter()
+        .map(|tool| normalize_tool_name(tool))
+        .collect::<BTreeSet<_>>();
+    parse_codex_enrichment_response(&raw, &required_set)
+}
+
+fn codex_command() -> String {
+    std::env::var("DISTILL_CONVERT_CODEX_COMMAND").unwrap_or_else(|_| "codex".to_string())
+}
+
+fn invoke_codex_structured(prompt: &str, schema_json: &str) -> Result<String> {
+    invoke_codex_structured_with_command(&codex_command(), prompt, schema_json)
+}
+
+fn invoke_codex_structured_with_command(
+    command: &str,
+    prompt: &str,
+    schema_json: &str,
+) -> Result<String> {
+    let schema_path = create_temp_file_path("distill-convert-codex-schema", "json")?;
+    let output_path = create_temp_file_path("distill-convert-codex-output", "txt")?;
+    std::fs::write(&schema_path, schema_json)
+        .with_context(|| format!("Failed to write {}", schema_path.display()))?;
+    let temp_files = vec![schema_path.clone(), output_path.clone()];
+
+    let mut child = match Command::new(command)
+        .args([
+            "exec",
+            "--ephemeral",
+            "--output-schema",
+            schema_path.to_string_lossy().as_ref(),
+            "--output-last-message",
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(err) => {
+            cleanup_temp_files(&temp_files);
+            return Err(err).with_context(|| format!("Failed to spawn `{command} exec`"));
+        }
+    };
+
+    if let Some(mut stdin) = child.stdin.take() {
+        if let Err(err) = stdin.write_all(prompt.as_bytes()) {
+            cleanup_temp_files(&temp_files);
+            return Err(err).context("Failed to write enrichment prompt to codex stdin");
+        }
+    }
+
+    let output = match child.wait_with_output() {
+        Ok(output) => output,
+        Err(err) => {
+            cleanup_temp_files(&temp_files);
+            return Err(err).context("Failed while waiting for codex enrichment output");
+        }
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        cleanup_temp_files(&temp_files);
+        bail!(
+            "Codex enrichment failed with status {}: {}",
+            output.status,
+            clipped_preview(stderr.trim(), 220)
+        );
+    }
+
+    let stdout = String::from_utf8(output.stdout).unwrap_or_default();
+    let final_output = std::fs::read_to_string(&output_path)
+        .ok()
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or(stdout);
+
+    cleanup_temp_files(&temp_files);
+    Ok(final_output)
+}
+
+fn create_temp_file_path(prefix: &str, extension: &str) -> Result<PathBuf> {
+    let tmp_dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let mut attempt = 0u32;
+    loop {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = tmp_dir.join(format!("{prefix}-{pid}-{nanos}-{attempt}.{extension}"));
+        match std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+        {
+            Ok(_) => return Ok(path),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                attempt += 1;
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("Failed to create temporary file {}", path.display())
+                });
+            }
+        }
+    }
+}
+
+fn cleanup_temp_files(paths: &[PathBuf]) {
+    for path in paths {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+fn parse_codex_enrichment_response(
+    raw: &str,
+    required_tools: &BTreeSet<String>,
+) -> Result<BTreeMap<String, ToolSkillHint>> {
+    let response: ToolEnrichmentResponse = serde_json::from_str(raw.trim()).with_context(|| {
+        format!(
+            "Codex enrichment response is not valid JSON: {}",
+            clipped_preview(raw.trim(), 220)
+        )
+    })?;
+
+    let mut hints = BTreeMap::new();
+    for entry in response.tools {
+        let name = normalize_tool_name(&entry.name);
+        if !required_tools.contains(&name) {
+            continue;
+        }
+        hints.insert(
+            name,
+            ToolSkillHint {
+                what_it_does: clean_optional_text(entry.what_it_does),
+                when_to_use: clean_optional_text(entry.when_to_use),
+                inputs_hint: clean_hint_list(entry.inputs_hint),
+                success_signals: clean_hint_list(entry.success_signals),
+                pitfalls: clean_hint_list(entry.pitfalls),
+            },
+        );
+    }
+    Ok(hints)
+}
+
+fn clean_optional_text(value: Option<String>) -> Option<String> {
+    value
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+}
+
+fn clean_hint_list(items: Vec<String>) -> Vec<String> {
+    let mut out = items
+        .into_iter()
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty())
+        .collect::<Vec<_>>();
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn clipped_preview(input: &str, max_chars: usize) -> String {
+    let mut chars = input.chars();
+    let clipped: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{clipped}...")
+    } else {
+        clipped
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct CapabilityPlaybook {
@@ -693,6 +1037,7 @@ fn render_capability_skill_markdown(
     server: &MCPServerProfile,
     tool_name: &str,
     description: Option<&str>,
+    hint: Option<&ToolSkillHint>,
 ) -> String {
     let mut out = String::new();
     out.push_str(&format!("# Capability: {tool_name}\n\n"));
@@ -718,6 +1063,35 @@ fn render_capability_skill_markdown(
     out.push_str("## Safety\n\n");
     out.push_str("- Ask for confirmation before destructive or irreversible actions.\n");
     out.push_str("- If arguments are unclear, run a non-destructive check first.\n");
+
+    if let Some(hint) = hint {
+        let has_hint = hint.what_it_does.is_some()
+            || hint.when_to_use.is_some()
+            || !hint.inputs_hint.is_empty()
+            || !hint.success_signals.is_empty()
+            || !hint.pitfalls.is_empty();
+        if has_hint {
+            out.push_str("\n## Optional Hints\n\n");
+            if let Some(what_it_does) = &hint.what_it_does {
+                out.push_str(&format!("- What it does: {what_it_does}\n"));
+            }
+            if let Some(when_to_use) = &hint.when_to_use {
+                out.push_str(&format!("- When to use: {when_to_use}\n"));
+            }
+            if !hint.inputs_hint.is_empty() {
+                out.push_str(&format!("- Input hints: {}\n", hint.inputs_hint.join("; ")));
+            }
+            if !hint.success_signals.is_empty() {
+                out.push_str(&format!(
+                    "- Success signals: {}\n",
+                    hint.success_signals.join("; ")
+                ));
+            }
+            if !hint.pitfalls.is_empty() {
+                out.push_str(&format!("- Pitfalls: {}\n", hint.pitfalls.join("; ")));
+            }
+        }
+    }
 
     out
 }
@@ -2185,5 +2559,130 @@ Steps:
         assert!(report.missing_in_skill.is_empty());
         assert!(report.missing_skill_files.is_empty());
         assert!(report.passed);
+    }
+
+    #[test]
+    fn test_parse_codex_enrichment_response_filters_and_normalizes() {
+        let raw = r#"{
+  "tools": [
+    {
+      "name": "mcp__playwright__navigate",
+      "what_it_does": " Open pages ",
+      "when_to_use": "Before interacting",
+      "inputs_hint": ["url", "url", " "],
+      "success_signals": ["page loaded"],
+      "pitfalls": ["missing auth"]
+    },
+    {
+      "name": "mcp__unknown__tool",
+      "what_it_does": "ignore me"
+    }
+  ]
+}"#;
+
+        let required = ["navigate".to_string()]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let parsed = parse_codex_enrichment_response(raw, &required).unwrap();
+        assert_eq!(parsed.len(), 1);
+
+        let hint = parsed.get("navigate").unwrap();
+        assert_eq!(hint.what_it_does.as_deref(), Some("Open pages"));
+        assert_eq!(hint.when_to_use.as_deref(), Some("Before interacting"));
+        assert_eq!(hint.inputs_hint, vec!["url"]);
+        assert_eq!(hint.success_signals, vec!["page loaded"]);
+        assert_eq!(hint.pitfalls, vec!["missing auth"]);
+    }
+
+    #[test]
+    fn test_render_capability_skill_markdown_includes_optional_hints_section() {
+        let server = MCPServerProfile {
+            id: "fixture:playwright".to_string(),
+            name: "playwright".to_string(),
+            source_label: "fixture".to_string(),
+            source_path: PathBuf::from("settings.json"),
+            purpose: "Browser automation".to_string(),
+            command: Some("npx".to_string()),
+            args: vec![],
+            url: None,
+            env_keys: vec![],
+            declared_tool_count: 0,
+            permission_hints: vec![],
+            inferred_permission: PermissionLevel::ReadOnly,
+            recommendation: ConversionRecommendation::ReplaceCandidate,
+            recommendation_reason: "read-only".to_string(),
+        };
+        let hint = ToolSkillHint {
+            what_it_does: Some("Loads target page".to_string()),
+            when_to_use: Some("Start of any browser workflow".to_string()),
+            inputs_hint: vec!["url".to_string()],
+            success_signals: vec!["page response 200".to_string()],
+            pitfalls: vec!["unauthorized redirects".to_string()],
+        };
+
+        let md = render_capability_skill_markdown(
+            &server,
+            "navigate",
+            Some("Navigate to a URL"),
+            Some(&hint),
+        );
+        assert!(md.contains("## Optional Hints"));
+        assert!(md.contains("What it does: Loads target page"));
+        assert!(md.contains("When to use: Start of any browser workflow"));
+        assert!(md.contains("Input hints: url"));
+        assert!(md.contains("Success signals: page response 200"));
+        assert!(md.contains("Pitfalls: unauthorized redirects"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_invoke_codex_structured_with_command_reads_last_message_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let codex = dir.path().join("mock-codex.sh");
+        let script = r#"#!/bin/sh
+schema_file=""
+last_message_file=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    exec)
+      shift
+      ;;
+    --ephemeral)
+      shift
+      ;;
+    --output-schema)
+      schema_file="$2"
+      shift 2
+      ;;
+    --output-last-message|-o)
+      last_message_file="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+cat > /dev/null
+[ -f "$schema_file" ] || exit 21
+grep -q '"tools"' "$schema_file" || exit 22
+[ -n "$last_message_file" ] || exit 23
+printf '%s' '{"tools":[{"name":"navigate","what_it_does":"Loads pages"}]}' > "$last_message_file"
+printf '%s' 'ignored-stdout'
+"#;
+        std::fs::write(&codex, script).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let raw = invoke_codex_structured_with_command(
+            codex.to_str().unwrap(),
+            "prompt",
+            TOOL_ENRICHMENT_SCHEMA,
+        )
+        .unwrap();
+        assert!(raw.contains("\"tools\""));
+        assert!(raw.contains("\"navigate\""));
     }
 }

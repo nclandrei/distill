@@ -155,6 +155,9 @@ enum Commands {
         /// Required when --replace is set
         #[arg(long)]
         yes: bool,
+        /// Enrich generated capability skills with optional Codex-authored hints
+        #[arg(long)]
+        enrich_codex: bool,
         /// Emit machine-readable JSON output
         #[arg(long)]
         json: bool,
@@ -275,6 +278,9 @@ enum ConvertCommands {
         /// Required confirmation for replace mode
         #[arg(long)]
         yes: bool,
+        /// Enrich generated capability skills with optional Codex-authored hints
+        #[arg(long)]
+        enrich_codex: bool,
         /// Emit machine-readable JSON output
         #[arg(long)]
         json: bool,
@@ -334,6 +340,7 @@ fn main() -> anyhow::Result<()> {
             server,
             replace,
             yes,
+            enrich_codex,
             json,
             config,
             skills_dir,
@@ -362,11 +369,20 @@ fn main() -> anyhow::Result<()> {
                 server,
                 mode,
                 yes,
+                enrich_codex,
                 json,
                 config,
                 skills_dir,
             }) => {
-                commands::convert::run_apply(&server, &mode, yes, json, &config, skills_dir)?;
+                commands::convert::run_apply(
+                    &server,
+                    &mode,
+                    yes,
+                    json,
+                    &config,
+                    skills_dir,
+                    enrich_codex,
+                )?;
             }
             Some(ConvertCommands::Verify {
                 server,
@@ -379,7 +395,13 @@ fn main() -> anyhow::Result<()> {
             None => {
                 if let Some(server) = server {
                     commands::convert::run_one_shot(
-                        &server, replace, yes, json, &config, skills_dir,
+                        &server,
+                        replace,
+                        yes,
+                        json,
+                        &config,
+                        skills_dir,
+                        enrich_codex,
                     )?;
                 } else {
                     commands::convert::run_overview(&[])?;
