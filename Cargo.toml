@@ -11,11 +11,15 @@ authors = ["Andrei Nicolae"]
 keywords = ["ai", "automation", "agent", "cli", "workflow"]
 categories = ["command-line-utilities", "development-tools"]
 
+[workspace]
+members = ["crates/convert-core"]
+
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
+convert-core = { path = "crates/convert-core" }
 crossterm = "0.29"
 image = { version = "0.25", default-features = false, features = ["png"] }
 ratatui = "0.30"

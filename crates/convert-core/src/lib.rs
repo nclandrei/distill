@@ -7,8 +7,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::config::Config;
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum PermissionLevel {
@@ -292,7 +290,7 @@ pub fn apply(
         bail!("Replace mode requires explicit confirmation via --yes.");
     }
 
-    let skills_dir = output_dir.unwrap_or_else(Config::skills_dir);
+    let skills_dir = output_dir.unwrap_or_else(default_skills_dir);
     std::fs::create_dir_all(&skills_dir)
         .with_context(|| format!("Failed to create skills directory {}", skills_dir.display()))?;
 
@@ -445,11 +443,18 @@ pub fn verify(
     skills_dir: Option<PathBuf>,
 ) -> Result<ConvertVerifyReport> {
     let server = inspect(server_selector, additional_paths)?;
-    let skills_dir = skills_dir.unwrap_or_else(Config::skills_dir);
+    let skills_dir = skills_dir.unwrap_or_else(default_skills_dir);
     let skill_path = skills_dir.join(format!("mcp-{}.md", sanitize_slug(&server.name)));
 
     let introspected = introspect_tools(&server).ok();
     verify_with_server_and_path(&server, &skill_path, introspected.as_deref())
+}
+
+fn default_skills_dir() -> PathBuf {
+    let home = std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."));
+    home.join(".distill").join("skills")
 }
 
 fn verify_with_server_and_path(

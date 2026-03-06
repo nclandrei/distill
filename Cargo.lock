@@ -313,6 +313,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "convert-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
 name = "convert_case"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -503,6 +515,7 @@ dependencies = [
  "base64",
  "chrono",
  "clap",
+ "convert-core",
  "crossterm",
  "image",
  "predicates",

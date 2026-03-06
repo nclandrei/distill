@@ -1,7 +1,6 @@
 mod agents;
 mod commands;
 mod config;
-mod convert;
 mod notify;
 mod onboard;
 mod preferences;

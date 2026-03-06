@@ -1,11 +1,11 @@
 use anyhow::{Result, bail};
-use serde::Serialize;
-use std::path::PathBuf;
-
-use crate::convert::{
-    self, ConvertApplyResult, ConvertInventory, ConvertPlan, ConvertVerifyReport, MCPServerProfile,
+use convert_core as convert;
+use convert_core::{
+    ConvertApplyResult, ConvertInventory, ConvertPlan, ConvertVerifyReport, MCPServerProfile,
     PlanMode,
 };
+use serde::Serialize;
+use std::path::PathBuf;
 
 pub fn parse_mode(raw: &str) -> Result<PlanMode> {
     match raw.trim().to_ascii_lowercase().as_str() {
