@@ -174,3 +174,30 @@ Behavior notes:
 - `apply` writes one orchestrator skill (`mcp-<server>.md`) plus capability skills (`mcp-<server>-tool-<tool>.md`) into `~/.distill/skills/` by default, and stores parity metadata in `~/.distill/skills/.distill-manifests/`.
 - `apply --mode replace` requires `--yes`, creates a backup of the MCP config, and removes the target server entry when safe.
 - `verify` checks required tool coverage and generated file presence, and reports parity gaps (`missing_in_server`, `missing_in_skill`, `missing_skill_files`).
+
+### 5) Live MCP smoke harness
+
+Run reusable end-to-end conversion checks against live MCP packages using isolated HOME/config:
+
+```bash
+make convert-live-smoke
+```
+
+By default this runs:
+- `memory=@modelcontextprotocol/server-memory`
+- `chrome-devtools=chrome-devtools-mcp@latest`
+
+Custom matrix example:
+
+```bash
+./scripts/convert-live-mcp-smoke.sh \
+  --servers "memory=@modelcontextprotocol/server-memory,chrome-devtools=chrome-devtools-mcp@latest" \
+  --keep
+```
+
+What it validates per server:
+- `convert inspect`
+- `convert plan --mode auto`
+- `convert apply --mode auto`
+- `convert verify`
+- one-shot `convert <server>`

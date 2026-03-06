@@ -1,4 +1,4 @@
-.PHONY: build test lint fmt check local-checks hooks-install clean
+.PHONY: build test lint fmt check local-checks hooks-install convert-live-smoke clean
 
 build:
 	cargo build
@@ -20,6 +20,9 @@ local-checks:
 
 hooks-install:
 	./scripts/install-hooks.sh
+
+convert-live-smoke:
+	./scripts/convert-live-mcp-smoke.sh
 
 clean:
 	cargo clean
