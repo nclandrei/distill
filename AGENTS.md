@@ -130,6 +130,8 @@ screencapture -x -i /absolute/path/selection.png
 
 ## Verification Notes
 
+- For repository code changes, run `make local-checks` before committing.
+- To enforce the same checks at commit time, run `make hooks-install` once per clone (installs Git `pre-commit` plus `jj safe-commit` / `jj safe-describe` aliases).
 - For test/demo review runs, prefer an isolated home (`HOME="$TMPDIR/...")` so real `~/.distill` data is not modified.
 - For `distill convert` verification, use a temporary MCP fixture JSON and pass it with `--config` to keep checks deterministic:
   - `distill convert <server> --config "$TMPDIR/distill-mcp.json"`
