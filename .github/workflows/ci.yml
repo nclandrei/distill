@@ -32,6 +32,9 @@ jobs:
       - name: cargo clippy
         run: cargo clippy -- -D warnings
 
+      - name: cargo package --locked
+        run: cargo package --locked
+
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -56,7 +59,7 @@ jobs:
         run: cargo test
 
   build:
-    name: Build release (${{ matrix.os }})
+    name: Build and smoke release (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -77,3 +80,6 @@ jobs:
 
       - name: cargo build --release
         run: cargo build --release
+
+      - name: Smoke test installed binary
+        run: ./scripts/smoke-test-installed-distill.sh target/release/distill

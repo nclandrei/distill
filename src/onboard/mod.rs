@@ -23,9 +23,9 @@ use std::io::{self, IsTerminal};
 use std::path::Path;
 use std::time::Duration;
 
-use crate::agents::{AgentKind, from_kind};
 #[cfg(test)]
 use crate::agents::find_agent_command_in_path;
+use crate::agents::{AgentKind, from_kind};
 use crate::config::{AgentEntry, Config, Interval, NotificationPref, ShellType, SyncAgentsConfig};
 use crate::schedule;
 use crate::shell::{self, HookStatus};

@@ -46,6 +46,15 @@ jobs:
       - name: Save local dist manifest
         run: cp dist-local.json target/distrib/${{ matrix.target }}-dist-manifest.json
 
+      - name: Smoke test local dist artifact
+        run: |
+          artifact="$(find target/distrib -maxdepth 1 -name 'distill-*.tar.xz' | head -n 1)"
+          if [ -z "$artifact" ]; then
+            echo "::error::No dist tarball found for smoke test."
+            exit 1
+          fi
+          ./scripts/smoke-test-installed-distill.sh "$artifact"
+
       - name: Upload local artifacts to GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
