@@ -3,7 +3,7 @@ use chrono::Utc;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::agents::{Agent, Session, Skill};
 use crate::config::Config;
@@ -52,6 +52,9 @@ const PROPOSAL_SCHEMA: &str = r#"{
   },
   "required": ["proposals"]
 }"#;
+
+const DEFAULT_AGENT_TIMEOUT_SECS: u64 = 15 * 60;
+const AGENT_POLL_INTERVAL_MS: u64 = 250;
 
 /// Configuration for the scan engine, allowing dependency injection for testing.
 pub struct ScanConfig {
@@ -194,6 +197,33 @@ fn prepare_codex_invocation(
 fn cleanup_temp_files(paths: &[PathBuf]) {
     for path in paths {
         let _ = std::fs::remove_file(path);
+    }
+}
+
+fn agent_timeout_from_env(raw: Option<&str>) -> Result<Duration> {
+    match raw {
+        Some(raw) => {
+            let secs: u64 = raw.parse().with_context(|| {
+                format!(
+                    "Failed to parse DISTILL_AGENT_TIMEOUT_SECS={raw:?} as an integer number of seconds"
+                )
+            })?;
+            if secs == 0 {
+                bail!("DISTILL_AGENT_TIMEOUT_SECS must be greater than 0.");
+            }
+            Ok(Duration::from_secs(secs))
+        }
+        None => Ok(Duration::from_secs(DEFAULT_AGENT_TIMEOUT_SECS)),
+    }
+}
+
+fn agent_timeout() -> Result<Duration> {
+    match std::env::var("DISTILL_AGENT_TIMEOUT_SECS") {
+        Ok(raw) => agent_timeout_from_env(Some(&raw)),
+        Err(std::env::VarError::NotPresent) => agent_timeout_from_env(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            bail!("DISTILL_AGENT_TIMEOUT_SECS must be valid Unicode.")
+        }
     }
 }
 
@@ -551,6 +581,15 @@ fn clipped_text(input: &str, max_chars: usize) -> String {
 /// The prompt is piped via stdin rather than passed as a command-line argument
 /// to avoid hitting the OS `ARG_MAX` limit (`E2BIG` / "Argument list too long").
 fn invoke_agent(command: &str, args: &[String], prompt: &str) -> Result<String> {
+    invoke_agent_with_timeout(command, args, prompt, agent_timeout()?)
+}
+
+fn invoke_agent_with_timeout(
+    command: &str,
+    args: &[String],
+    prompt: &str,
+    timeout: Duration,
+) -> Result<String> {
     let (effective_args, codex_output_path, temp_files) = prepare_codex_invocation(command, args)?;
 
     let mut child = Command::new(command)
@@ -586,12 +625,55 @@ fn invoke_agent(command: &str, args: &[String], prompt: &str) -> Result<String> 
         eprint!("\r                            \r"); // clear the line
     });
 
-    let output = match child.wait_with_output() {
-        Ok(output) => output,
-        Err(err) => {
-            cleanup_temp_files(&temp_files);
-            return Err(err)
-                .with_context(|| format!("Failed to wait for agent command: {command}"));
+    let wait_started = Instant::now();
+    let output = loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => match child.wait_with_output() {
+                Ok(output) => break output,
+                Err(err) => {
+                    cleanup_temp_files(&temp_files);
+                    return Err(err).with_context(|| {
+                        format!("Failed to collect output from agent command: {command}")
+                    });
+                }
+            },
+            Ok(None) => {
+                if wait_started.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let timed_out_output = child.wait_with_output().ok();
+                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                    let _ = heartbeat.join();
+
+                    let stderr = timed_out_output
+                        .as_ref()
+                        .map(|output| String::from_utf8_lossy(&output.stderr).trim().to_string())
+                        .unwrap_or_default();
+                    let stdout = timed_out_output
+                        .as_ref()
+                        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+                        .unwrap_or_default();
+                    let details = match (stderr.is_empty(), stdout.is_empty()) {
+                        (true, true) => String::new(),
+                        (false, true) => format!("\nAgent stderr before timeout:\n{stderr}"),
+                        (true, false) => format!("\nAgent stdout before timeout:\n{stdout}"),
+                        (false, false) => format!(
+                            "\nAgent stderr before timeout:\n{stderr}\nAgent stdout before timeout:\n{stdout}"
+                        ),
+                    };
+
+                    cleanup_temp_files(&temp_files);
+                    bail!(
+                        "Agent command `{command}` timed out after {}s. Verify the CLI is installed and authenticated, or raise DISTILL_AGENT_TIMEOUT_SECS for slower runs.{details}",
+                        timeout.as_secs()
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(AGENT_POLL_INTERVAL_MS));
+            }
+            Err(err) => {
+                cleanup_temp_files(&temp_files);
+                return Err(err)
+                    .with_context(|| format!("Failed to wait for agent command: {command}"));
+            }
         }
     };
 
@@ -1205,6 +1287,61 @@ exit 42
             .to_string();
         assert!(err.contains("status"));
         assert!(err.contains("simulated stderr failure"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_invoke_agent_timeout_kills_process_and_surfaces_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let hanging = dir.path().join("hanging-agent.sh");
+        let script = r#"#!/bin/sh
+cat > /dev/null
+echo "starting slow work" 1>&2
+sleep 5
+printf '%s' '{"proposals":[]}'
+"#;
+        std::fs::write(&hanging, script).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hanging, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let err = invoke_agent_with_timeout(
+            hanging.to_str().unwrap(),
+            &[],
+            "ignored prompt",
+            Duration::from_millis(100),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("timed out"));
+        assert!(err.contains("DISTILL_AGENT_TIMEOUT_SECS"));
+        assert!(err.contains("Verify the CLI is installed and authenticated"));
+    }
+
+    #[test]
+    fn test_agent_timeout_defaults_to_fifteen_minutes() {
+        assert_eq!(
+            agent_timeout_from_env(None).unwrap(),
+            Duration::from_secs(DEFAULT_AGENT_TIMEOUT_SECS)
+        );
+    }
+
+    #[test]
+    fn test_agent_timeout_reads_positive_override() {
+        assert_eq!(
+            agent_timeout_from_env(Some("42")).unwrap(),
+            Duration::from_secs(42)
+        );
+    }
+
+    #[test]
+    fn test_agent_timeout_rejects_invalid_values() {
+        let err = agent_timeout_from_env(Some("abc")).unwrap_err().to_string();
+        assert!(err.contains("DISTILL_AGENT_TIMEOUT_SECS"));
+
+        let err = agent_timeout_from_env(Some("0")).unwrap_err().to_string();
+        assert!(err.contains("greater than 0"));
     }
 
     #[test]
