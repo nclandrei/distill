@@ -17,11 +17,15 @@ use ratatui::{
         Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, Tabs, Wrap,
     },
 };
+#[cfg(test)]
+use std::ffi::OsStr;
 use std::io::{self, IsTerminal};
 use std::path::Path;
 use std::time::Duration;
 
 use crate::agents::{AgentKind, from_kind};
+#[cfg(test)]
+use crate::agents::find_agent_command_in_path;
 use crate::config::{AgentEntry, Config, Interval, NotificationPref, ShellType, SyncAgentsConfig};
 use crate::schedule;
 use crate::shell::{self, HookStatus};
@@ -34,7 +38,7 @@ use crate::shell::{self, HookStatus};
 /// The struct is deliberately decoupled from I/O so that `build_config` can be
 /// exercised in unit tests without any stdin/stdout interaction.
 pub struct OnboardingAnswers {
-    /// Every known agent paired with whether its config directory was found on disk.
+    /// Every known agent paired with whether its CLI was found on PATH.
     pub detected_agents: Vec<(AgentKind, bool)>,
     /// Subset of agents the user chose to enable.
     pub enabled_agents: Vec<AgentKind>,
@@ -52,16 +56,27 @@ pub struct OnboardingAnswers {
 // Pure logic functions (testable without I/O)
 // ---------------------------------------------------------------------------
 
-/// Detect which agents are installed by checking whether their config
-/// directories exist under `home`.
+/// Detect which agents are installed by checking whether their CLI binaries are
+/// available on PATH.
 ///
-/// Returns a `Vec<(AgentKind, bool)>` where `bool` is `true` when the
-/// agent's config directory is present.
-pub fn detect_agents(home: &Path) -> Vec<(AgentKind, bool)> {
+/// Returns a `Vec<(AgentKind, bool)>` where `bool` is `true` when the agent
+/// CLI is present.
+pub fn detect_agents(_home: &Path) -> Vec<(AgentKind, bool)> {
     AgentKind::all()
         .into_iter()
         .map(|kind| {
-            let installed = from_kind(kind, home.to_path_buf()).is_installed();
+            let installed = from_kind(kind, _home.to_path_buf()).is_installed();
+            (kind, installed)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn detect_agents_with_path(path_env: Option<&OsStr>) -> Vec<(AgentKind, bool)> {
+    AgentKind::all()
+        .into_iter()
+        .map(|kind| {
+            let installed = find_agent_command_in_path(kind, path_env).is_some();
             (kind, installed)
         })
         .collect()
@@ -1365,14 +1380,19 @@ mod tests {
     use super::*;
     use crate::config::{Config, Interval, NotificationPref, ShellType};
 
+    #[cfg(unix)]
+    fn make_fake_agent_bin(dir: &tempfile::TempDir, name: &str) {
+        let path = dir.path().join(name);
+        std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     // --- detect_agents ---
 
     #[test]
     fn test_detect_agents_none_installed() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().to_path_buf();
-        // Neither .claude nor .codex exists.
-        let detected = detect_agents(&home);
+        let detected = detect_agents_with_path(None);
         assert_eq!(
             detected.len(),
             2,
@@ -1386,10 +1406,9 @@ mod tests {
     #[test]
     fn test_detect_agents_claude_only() {
         let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().to_path_buf();
-        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        make_fake_agent_bin(&dir, "claude");
 
-        let detected = detect_agents(&home);
+        let detected = detect_agents_with_path(Some(dir.path().as_os_str()));
         let claude = detected
             .iter()
             .find(|(k, _)| *k == AgentKind::Claude)
@@ -1405,10 +1424,9 @@ mod tests {
     #[test]
     fn test_detect_agents_codex_only() {
         let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().to_path_buf();
-        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        make_fake_agent_bin(&dir, "codex");
 
-        let detected = detect_agents(&home);
+        let detected = detect_agents_with_path(Some(dir.path().as_os_str()));
         let claude = detected
             .iter()
             .find(|(k, _)| *k == AgentKind::Claude)
@@ -1424,11 +1442,10 @@ mod tests {
     #[test]
     fn test_detect_agents_both_installed() {
         let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().to_path_buf();
-        std::fs::create_dir_all(home.join(".claude")).unwrap();
-        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        make_fake_agent_bin(&dir, "claude");
+        make_fake_agent_bin(&dir, "codex");
 
-        let detected = detect_agents(&home);
+        let detected = detect_agents_with_path(Some(dir.path().as_os_str()));
         assert_eq!(detected.len(), 2);
         for (_, installed) in &detected {
             assert!(installed, "both agents should be detected");
@@ -1439,8 +1456,7 @@ mod tests {
 
     #[test]
     fn test_build_config_default_answers() {
-        let dir = tempfile::tempdir().unwrap();
-        let detected = detect_agents(dir.path());
+        let detected = detect_agents_with_path(None);
 
         let answers = OnboardingAnswers {
             detected_agents: detected,
@@ -1462,8 +1478,7 @@ mod tests {
 
     #[test]
     fn test_build_config_default_interval_is_weekly() {
-        let dir = tempfile::tempdir().unwrap();
-        let detected = detect_agents(dir.path());
+        let detected = detect_agents_with_path(None);
 
         let answers = OnboardingAnswers {
             detected_agents: detected,
@@ -1483,11 +1498,10 @@ mod tests {
     #[test]
     fn test_build_config_enables_only_selected_agents() {
         let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().to_path_buf();
-        std::fs::create_dir_all(home.join(".claude")).unwrap();
-        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        make_fake_agent_bin(&dir, "claude");
+        make_fake_agent_bin(&dir, "codex");
 
-        let detected = detect_agents(&home);
+        let detected = detect_agents_with_path(Some(dir.path().as_os_str()));
         let answers = OnboardingAnswers {
             detected_agents: detected,
             enabled_agents: vec![AgentKind::Claude], // only Claude enabled
@@ -1509,11 +1523,10 @@ mod tests {
     #[test]
     fn test_build_config_agent_entries_match_detected() {
         let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().to_path_buf();
-        // Only Claude dir exists, but user enables both.
-        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        // Only Claude CLI is detected, but user enables both.
+        make_fake_agent_bin(&dir, "claude");
 
-        let detected = detect_agents(&home);
+        let detected = detect_agents_with_path(Some(dir.path().as_os_str()));
         let answers = OnboardingAnswers {
             detected_agents: detected,
             enabled_agents: vec![AgentKind::Claude, AgentKind::Codex],
@@ -1539,8 +1552,7 @@ mod tests {
 
     #[test]
     fn test_build_config_daily_interval() {
-        let dir = tempfile::tempdir().unwrap();
-        let detected = detect_agents(dir.path());
+        let detected = detect_agents_with_path(None);
 
         let answers = OnboardingAnswers {
             detected_agents: detected,
@@ -1557,8 +1569,7 @@ mod tests {
 
     #[test]
     fn test_build_config_monthly_interval_and_native_notifications() {
-        let dir = tempfile::tempdir().unwrap();
-        let detected = detect_agents(dir.path());
+        let detected = detect_agents_with_path(None);
 
         let answers = OnboardingAnswers {
             detected_agents: detected,
@@ -1580,8 +1591,7 @@ mod tests {
 
     #[test]
     fn test_build_config_shell_detection_used() {
-        let dir = tempfile::tempdir().unwrap();
-        let detected = detect_agents(dir.path());
+        let detected = detect_agents_with_path(None);
 
         let detected_shell = ShellType::detect();
         let answers = OnboardingAnswers {
@@ -1602,10 +1612,9 @@ mod tests {
     #[test]
     fn test_build_config_proposal_agent_codex() {
         let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().to_path_buf();
-        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        make_fake_agent_bin(&dir, "codex");
 
-        let detected = detect_agents(&home);
+        let detected = detect_agents_with_path(Some(dir.path().as_os_str()));
         let answers = OnboardingAnswers {
             detected_agents: detected,
             enabled_agents: vec![AgentKind::Claude, AgentKind::Codex],
@@ -1622,8 +1631,7 @@ mod tests {
 
     #[test]
     fn test_step_sequence_hides_hook_for_other_shell() {
-        let dir = tempfile::tempdir().unwrap();
-        let detected = detect_agents(dir.path());
+        let detected = detect_agents_with_path(None);
         let mut state = OnboardingUiState::new(detected);
         state.shell_cursor = shell_to_index(&ShellType::Other);
 
@@ -1634,8 +1642,7 @@ mod tests {
 
     #[test]
     fn test_jump_to_step_number_with_other_shell_skips_hook_slot() {
-        let dir = tempfile::tempdir().unwrap();
-        let detected = detect_agents(dir.path());
+        let detected = detect_agents_with_path(None);
         let mut state = OnboardingUiState::new(detected);
         state.shell_cursor = shell_to_index(&ShellType::Other);
 
@@ -1648,8 +1655,7 @@ mod tests {
 
     #[test]
     fn test_confirm_action_cycles_in_expected_order() {
-        let dir = tempfile::tempdir().unwrap();
-        let detected = detect_agents(dir.path());
+        let detected = detect_agents_with_path(None);
         let mut state = OnboardingUiState::new(detected);
 
         state.step = OnboardingStep::Confirm;
@@ -1664,8 +1670,7 @@ mod tests {
 
     #[test]
     fn test_jump_to_confirm_resets_action_to_save() {
-        let dir = tempfile::tempdir().unwrap();
-        let detected = detect_agents(dir.path());
+        let detected = detect_agents_with_path(None);
         let mut state = OnboardingUiState::new(detected);
 
         state.confirm_action = ConfirmAction::Cancel;

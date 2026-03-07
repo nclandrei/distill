@@ -1,7 +1,8 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 
 /// Represents a single session from an AI agent
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -33,6 +34,14 @@ impl AgentKind {
     pub fn all() -> Vec<AgentKind> {
         vec![AgentKind::Claude, AgentKind::Codex]
     }
+
+    /// Return the expected CLI name for this agent.
+    pub fn command_name(&self) -> &'static str {
+        match self {
+            AgentKind::Claude => "claude",
+            AgentKind::Codex => "codex",
+        }
+    }
 }
 
 impl std::fmt::Display for AgentKind {
@@ -58,9 +67,9 @@ pub trait Agent {
     /// Return the base directory for this agent's config
     fn config_dir(&self) -> PathBuf;
 
-    /// Check if this agent is installed (config dir exists)
+    /// Check if this agent's CLI is installed and available on PATH.
     fn is_installed(&self) -> bool {
-        self.config_dir().exists()
+        find_agent_command(self.kind()).is_some()
     }
 }
 
@@ -100,6 +109,31 @@ fn collect_jsonl_recursive(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
             out.push(path);
         }
     }
+}
+
+fn command_on_path(command: &str, path_env: Option<&OsStr>) -> Option<PathBuf> {
+    let candidate = Path::new(command);
+    if candidate.components().count() > 1 {
+        return candidate.is_file().then(|| candidate.to_path_buf());
+    }
+
+    let path_env = path_env?;
+    for entry in std::env::split_paths(path_env) {
+        let path = entry.join(command);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+pub fn find_agent_command_in_path(kind: AgentKind, path_env: Option<&OsStr>) -> Option<PathBuf> {
+    command_on_path(kind.command_name(), path_env)
+}
+
+pub fn find_agent_command(kind: AgentKind) -> Option<PathBuf> {
+    let path_env = std::env::var_os("PATH");
+    find_agent_command_in_path(kind, path_env.as_deref())
 }
 
 /// Convert a `std::time::SystemTime` to `DateTime<Utc>`.
@@ -163,7 +197,7 @@ impl Agent for ClaudeAdapter {
     }
 
     fn read_sessions(&self, since: DateTime<Utc>) -> Result<Vec<Session>> {
-        let projects_dir = self.home.join(".claude").join("projects");
+        let projects_dir = self.config_dir().join("projects");
         let files = collect_jsonl_files(&projects_dir);
         let mut sessions = Vec::new();
         for path in files {
@@ -178,8 +212,7 @@ impl Agent for ClaudeAdapter {
 
     fn write_skill(&self, skill: &Skill) -> Result<()> {
         let target = self
-            .home
-            .join(".claude")
+            .config_dir()
             .join("skills")
             .join(&skill.name)
             .join("SKILL.md");
@@ -231,7 +264,7 @@ impl Agent for CodexAdapter {
     }
 
     fn read_sessions(&self, since: DateTime<Utc>) -> Result<Vec<Session>> {
-        let sessions_dir = self.home.join(".codex").join("sessions");
+        let sessions_dir = self.config_dir().join("sessions");
         let files = collect_jsonl_files(&sessions_dir);
         let mut sessions = Vec::new();
         for path in files {
@@ -297,6 +330,12 @@ mod tests {
     fn test_agent_kind_display() {
         assert_eq!(AgentKind::Claude.to_string(), "claude");
         assert_eq!(AgentKind::Codex.to_string(), "codex");
+    }
+
+    #[test]
+    fn test_agent_kind_command_name() {
+        assert_eq!(AgentKind::Claude.command_name(), "claude");
+        assert_eq!(AgentKind::Codex.command_name(), "codex");
     }
 
     #[test]
@@ -412,6 +451,28 @@ mod tests {
         let agent = from_kind(AgentKind::Codex, home.clone());
         assert_eq!(agent.kind(), AgentKind::Codex);
         assert_eq!(agent.config_dir(), home.join(".codex"));
+    }
+
+    #[test]
+    fn test_find_agent_command_in_path_returns_none_when_missing() {
+        let path = std::ffi::OsString::from("/definitely/not/present");
+        assert!(find_agent_command_in_path(AgentKind::Claude, Some(&path)).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_find_agent_command_in_path_finds_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude = dir.path().join("claude");
+        std::fs::write(&claude, "#!/bin/sh\nexit 0\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let found =
+            find_agent_command_in_path(AgentKind::Claude, Some(dir.path().as_os_str())).unwrap();
+        assert_eq!(found, claude);
     }
 
     // --- read_sessions: directory does not exist ---
