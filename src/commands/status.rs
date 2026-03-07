@@ -346,7 +346,6 @@ mod tests {
                 enabled: true,
             }],
             sync_agents: SyncAgentsConfig::default(),
-            convert: crate::config::ConvertConfig::default(),
         };
 
         let info = collect_status_info(&config, base).unwrap();

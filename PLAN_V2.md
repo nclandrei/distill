@@ -7,56 +7,9 @@ Ideas and features planned after V1 ships.
 - Completed: global-only skill deduplication shipped as `distill dedupe [--dry-run]`.
 - Completed: dedupe flow writes standard `remove` proposals and preserves existing review/apply workflow.
 - Completed: duplicate detection normalizes markdown content and skips targets that already have pending remove proposals.
+- Completed: MCP-to-skill workflow was extracted into `mcpsmith`; keep `distill` focused on session distillation and review.
 - Removed from current scope: project-level skills implementation and project-over-global precedence behavior.
 - Current product direction: keep skills global (`~/.distill/skills/`) and reduce noise via dedupe.
-
----
-
-## `distill convert` — MCP to Skills
-
-### Problem
-
-MCP (Model Context Protocol) servers dump their full tool schemas into the agent's context window on every invocation. An agent with 5 MCPs connected can burn thousands of tokens on tool definitions before it does anything useful — and most of those tools aren't relevant to the current task.
-
-Skills are the opposite: markdown files loaded on-demand, only when the agent determines they're contextually relevant. Same capabilities, fraction of the context cost.
-
-### Solution
-
-```
-distill convert --mcp <server-name>
-```
-
-This would:
-
-1. **Introspect** the MCP server — read its tool definitions, JSON schemas, descriptions, and examples
-2. **Group** related tools into logical skill units (e.g., a Jira MCP with 15 tools becomes 3-4 focused skills)
-3. **Generate** skill markdown files that teach the agent how to accomplish the same tasks
-4. **Output** to `~/.distill/skills/` and sync to all agents
-
-### Example
-
-A Playwright MCP exposing tools like `navigate`, `click`, `fill`, `screenshot`, `evaluate` becomes:
-
-- `browser-navigation.md` — how to navigate and interact with pages
-- `browser-testing.md` — how to run assertions and capture screenshots
-- `browser-form-automation.md` — how to fill and submit forms
-
-Each skill contains the knowledge of *when* and *how* to use those tools, without loading all tool schemas into context at all times.
-
-### Subcommands
-
-| Command | Purpose |
-|---|---|
-| `distill convert --mcp <name>` | Convert a single MCP server to skills |
-| `distill convert --mcp-all` | Convert all configured MCP servers |
-| `distill convert --list-mcps` | List detected MCP servers and their tool counts |
-| `distill convert --dry-run --mcp <name>` | Preview what skills would be generated |
-
-### Where to read MCP configs from
-
-- Claude Code: `~/.claude/mcp.json` or project-level `.claude/mcp.json`
-- Codex: wherever Codex stores MCP config
-- Generic: allow `--mcp-config <path>` for arbitrary configs
 
 ---
 
@@ -265,10 +218,9 @@ Roughly ordered by value and implementation complexity:
 
 | # | Feature | Notes | Done |
 |---|---------|-------|------|
-| 1 | **`distill convert` (MCP to skills)** | high value, addresses a real pain point now | |
-| 2 | **Project-level skills** | de-scoped/reverted for now; keep as future idea only | removed |
-| 3 | **`distill sync-agents` (AGENTS.md drift detection)** | keeps project instructions current with real workflows | |
-| 4 | **Skill deduplication** | global-only `distill dedupe` shipped | done |
-| 5 | **Team sync** | multiplier feature, makes distill valuable for teams | |
-| 6 | **`distill publish`** | community feature, needs critical mass first | |
-| 7 | **Preference learning** | refinement, improves quality over time | |
+| 1 | **Project-level skills** | de-scoped/reverted for now; keep as future idea only | removed |
+| 2 | **`distill sync-agents` (AGENTS.md drift detection)** | keeps project instructions current with real workflows | |
+| 3 | **Skill deduplication** | global-only `distill dedupe` shipped | done |
+| 4 | **Team sync** | multiplier feature, makes distill valuable for teams | |
+| 5 | **`distill publish`** | community feature, needs critical mass first | |
+| 6 | **Preference learning** | refinement, improves quality over time | |

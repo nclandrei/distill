@@ -93,60 +93,6 @@ pub struct SyncAgentsConfig {
     pub projects: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum ConvertBackendPreference {
-    #[default]
-    Auto,
-    Codex,
-    Claude,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ConvertConfig {
-    #[serde(default)]
-    pub backend_preference: ConvertBackendPreference,
-    #[serde(default = "default_convert_backend_timeout_seconds")]
-    pub backend_timeout_seconds: u64,
-    #[serde(default = "default_convert_backend_chunk_size")]
-    pub backend_chunk_size: usize,
-    #[serde(default = "default_convert_probe_timeout_seconds")]
-    pub probe_timeout_seconds: u64,
-    #[serde(default = "default_convert_probe_retries")]
-    pub probe_retries: u32,
-    #[serde(default)]
-    pub allow_side_effect_probes: bool,
-}
-
-impl Default for ConvertConfig {
-    fn default() -> Self {
-        Self {
-            backend_preference: ConvertBackendPreference::Auto,
-            backend_timeout_seconds: 90,
-            backend_chunk_size: 8,
-            probe_timeout_seconds: 30,
-            probe_retries: 0,
-            allow_side_effect_probes: false,
-        }
-    }
-}
-
-fn default_convert_backend_timeout_seconds() -> u64 {
-    90
-}
-
-fn default_convert_backend_chunk_size() -> usize {
-    8
-}
-
-fn default_convert_probe_timeout_seconds() -> u64 {
-    30
-}
-
-fn default_convert_probe_retries() -> u32 {
-    0
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Config {
     pub agents: Vec<AgentEntry>,
@@ -160,8 +106,6 @@ pub struct Config {
     pub notification_icon: Option<String>,
     #[serde(default)]
     pub sync_agents: SyncAgentsConfig,
-    #[serde(default)]
-    pub convert: ConvertConfig,
 }
 
 impl Default for Config {
@@ -183,7 +127,6 @@ impl Default for Config {
             notifications: NotificationPref::default(),
             notification_icon: None,
             sync_agents: SyncAgentsConfig::default(),
-            convert: ConvertConfig::default(),
         }
     }
 }
@@ -301,12 +244,6 @@ mod tests {
         assert_eq!(config.notifications, NotificationPref::Both);
         assert_eq!(config.notification_icon, None);
         assert!(config.sync_agents.projects.is_empty());
-        assert_eq!(
-            config.convert.backend_preference,
-            ConvertBackendPreference::Auto
-        );
-        assert_eq!(config.convert.backend_timeout_seconds, 90);
-        assert_eq!(config.convert.backend_chunk_size, 8);
         assert_eq!(config.proposal_agent, "claude");
         assert_eq!(config.agents.len(), 2);
     }
@@ -335,10 +272,6 @@ notification_icon: /tmp/distill.png
 sync_agents:
   projects:
     - /tmp/project-a
-convert:
-  backend_preference: claude
-  backend_timeout_seconds: 120
-  backend_chunk_size: 4
 "#;
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.scan_interval, Interval::Daily);
@@ -351,12 +284,6 @@ convert:
             config.sync_agents.projects,
             vec!["/tmp/project-a".to_string()]
         );
-        assert_eq!(
-            config.convert.backend_preference,
-            ConvertBackendPreference::Claude
-        );
-        assert_eq!(config.convert.backend_timeout_seconds, 120);
-        assert_eq!(config.convert.backend_chunk_size, 4);
         assert_eq!(config.shell, ShellType::Bash);
         assert!(!config.agents[1].enabled);
     }
@@ -388,10 +315,6 @@ notifications: both
 "#;
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         assert!(config.sync_agents.projects.is_empty());
-        assert_eq!(
-            config.convert.backend_preference,
-            ConvertBackendPreference::Auto
-        );
     }
 
     // ── new tests ─────────────────────────────────────────────────────────────
@@ -540,14 +463,6 @@ shell: zsh
             sync_agents: SyncAgentsConfig {
                 projects: vec!["/tmp/project-a".into(), "/tmp/project-b".into()],
             },
-            convert: ConvertConfig {
-                backend_preference: ConvertBackendPreference::Codex,
-                backend_timeout_seconds: 45,
-                backend_chunk_size: 3,
-                probe_timeout_seconds: 21,
-                probe_retries: 2,
-                allow_side_effect_probes: true,
-            },
         };
 
         config.save_to(&path).unwrap();
@@ -565,15 +480,6 @@ shell: zsh
             loaded.sync_agents.projects,
             vec!["/tmp/project-a".to_string(), "/tmp/project-b".to_string()]
         );
-        assert_eq!(
-            loaded.convert.backend_preference,
-            ConvertBackendPreference::Codex
-        );
-        assert_eq!(loaded.convert.backend_timeout_seconds, 45);
-        assert_eq!(loaded.convert.backend_chunk_size, 3);
-        assert_eq!(loaded.convert.probe_timeout_seconds, 21);
-        assert_eq!(loaded.convert.probe_retries, 2);
-        assert!(loaded.convert.allow_side_effect_probes);
         assert!(!loaded.agents[1].enabled);
     }
 }

@@ -4,30 +4,14 @@
 ## Preferred for AI agents: one-shot JSON flows (non-interactive)
 - Onboarding: `distill onboard --write-json onboarding.json` then `distill onboard --apply-json onboarding.json`
 - Review: `distill review --write-json review.json` then `distill review --apply-json review.json`
-- MCP convert V4 (backend-agnostic Codex/Claude, real runtime probes):
-  - `distill convert <server-id|server-name> --json`
-  - `distill convert discover <server-id|server-name> --out dossier.json --json [--backend codex|claude] [--backend-auto] [--backend-health] [--config <path>]`
-  - `distill convert build --from-dossier dossier.json --json [--skills-dir <path>]`
-  - `distill convert contract-test --from-dossier dossier.json --json [--report <path>] [--allow-side-effects] [--probe-timeout-seconds <N>] [--probe-retries <N>]`
-  - `distill convert apply --from-dossier dossier.json --yes --json [--skills-dir <path>]`
-  - legacy diagnostics still available: `distill convert list|inspect|plan|verify ...`
-- Backend health/selection checks:
-  - `distill convert discover <server> --backend-health --backend codex --json`
-  - `distill convert discover <server> --backend-health --backend claude --json`
-- Backend config keys in `~/.distill/config.yaml`:
-  - `convert.backend_preference: auto|codex|claude`
-  - `convert.backend_timeout_seconds`
-  - `convert.backend_chunk_size`
-  - `convert.probe_timeout_seconds`
-  - `convert.probe_retries`
-  - `convert.allow_side_effect_probes`
 - In `review.json`, set each proposal `decision` to `accept`, `reject`, or `skip` (missing decisions default to `skip`)
 - Use `-` as path for stdio: `--write-json -` (stdout), `--apply-json -` (stdin)
 
 ## Other useful commands
 - `distill scan --now` to generate proposal files immediately
-- `distill convert <server>` for full one-shot V4 conversion (discover -> build -> runtime contract-test -> apply)
+- `distill dedupe --dry-run` to preview duplicate global skills
 - `distill status` to inspect config, pending proposals, and last scan
+- `distill sync-agents --dry-run` to preview `AGENTS.md` updates
 - `distill watch --install|--uninstall` to manage scheduled scans
 - `distill notify --check` for shell-hook notification checks
 
@@ -41,4 +25,3 @@
 - `~/.distill/proposals/`
 - `~/.distill/skills/`
 - `~/.distill/history/decisions.jsonl`
-- V3 convert skill target default: `~/.agents/skills/`

@@ -192,7 +192,6 @@ fn default_config_from_detected(detected: &[(AgentKind, bool)]) -> Config {
         notifications: NotificationPref::Both,
         notification_icon: None,
         sync_agents: SyncAgentsConfig::default(),
-        convert: crate::config::ConvertConfig::default(),
     }
 }
 
@@ -205,7 +204,6 @@ fn config_from_spec(spec: &OnboardingSpec) -> Config {
         notifications: spec.notifications.clone(),
         notification_icon: spec.notification_icon.clone(),
         sync_agents: SyncAgentsConfig::default(),
-        convert: crate::config::ConvertConfig::default(),
     }
 }
 
@@ -478,7 +476,6 @@ mod tests {
             notifications: NotificationPref::Both,
             notification_icon: None,
             sync_agents: SyncAgentsConfig::default(),
-            convert: crate::config::ConvertConfig::default(),
         };
         config.save_to(&config_path).unwrap();
 
@@ -505,7 +502,6 @@ mod tests {
             notifications: NotificationPref::Both,
             notification_icon: None,
             sync_agents: SyncAgentsConfig::default(),
-            convert: crate::config::ConvertConfig::default(),
         };
         config.save_to(&config_path).unwrap();
 
