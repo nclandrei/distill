@@ -6,7 +6,7 @@ use std::path::PathBuf;
 /// Build a distill command with HOME set to a temp dir so tests
 /// don't interact with the real ~/.distill config.
 fn distill_cmd(home: &std::path::Path) -> Command {
-    let mut cmd = Command::cargo_bin("distill").unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_distill"));
     cmd.env("HOME", home);
     cmd.env("DISTILL_SYSTEMCTL_PATH", "true");
     cmd.env("DISTILL_LAUNCHCTL_PATH", "true");
@@ -732,7 +732,7 @@ fn test_convert_v3_discover_build_contract_apply() {
 
     std::fs::write(
         &config_path,
-        &format!(
+        format!(
             r#"{{
   "mcpServers": {{
     "playwright": {{
@@ -817,7 +817,7 @@ fn test_convert_v3_apply_requires_yes() {
     write_mock_codex_script(&mock_codex);
     std::fs::write(
         &config_path,
-        &format!(
+        format!(
             r#"{{
   "mcpServers": {{
     "playwright": {{
@@ -862,7 +862,7 @@ fn test_convert_one_shot_v3_mutates_config_on_full_pass() {
     write_mock_codex_script(&mock_codex);
     std::fs::write(
         &config_path,
-        &format!(
+        format!(
             r#"{{
   "mcpServers": {{
     "playwright": {{
@@ -907,7 +907,7 @@ fn test_convert_one_shot_v3_works_with_claude_only() {
     write_mock_claude_script(&mock_claude);
     std::fs::write(
         &config_path,
-        &format!(
+        format!(
             r#"{{
   "mcpServers": {{
     "playwright": {{
@@ -948,7 +948,7 @@ fn test_convert_discover_v3_fails_cleanly_when_no_backend_installed() {
     write_mock_mcp_script(&mock_mcp, &["execute"]);
     std::fs::write(
         &config_path,
-        &format!(
+        format!(
             r#"{{
   "mcpServers": {{
     "playwright": {{

@@ -423,8 +423,10 @@ mod tests {
         )
         .unwrap();
 
-        let mut config = Config::default();
-        config.scan_interval = Interval::Monthly;
+        let config = Config {
+            scan_interval: Interval::Monthly,
+            ..Config::default()
+        };
         let info = collect_status_info(&config, base).unwrap();
 
         assert_eq!(

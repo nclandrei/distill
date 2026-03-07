@@ -9,7 +9,7 @@ use std::fs;
 /// Build a distill command with HOME set to a temp dir so tests
 /// don't interact with the real ~/.distill config.
 fn distill_cmd(home: &std::path::Path) -> Command {
-    let mut cmd = Command::cargo_bin("distill").unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_distill"));
     cmd.env("HOME", home);
     cmd.env("DISTILL_SYSTEMCTL_PATH", "true");
     cmd.env("DISTILL_LAUNCHCTL_PATH", "true");
