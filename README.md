@@ -11,16 +11,29 @@
 brew install nclandrei/homebrew-tap/distill
 
 # crates.io
-cargo install distill
+cargo install distill --locked
 ```
 
 Icon assets used by notifications and docs:
 - SVG: `assets/icons/distill-icon.svg`
 - PNG: `assets/icons/png/color/distill-color-256.png`
 
+## Requirements
+
+- Distill needs at least one supported agent CLI on `PATH`:
+  - Claude Code via `claude`
+  - Codex CLI via `codex`
+- Onboarding marks an agent as detected only when its CLI is discoverable on `PATH`.
+- Scans require the configured `proposal_agent` CLI to be installed and already authenticated.
+- Distill reads local session logs from:
+  - Claude: `~/.claude/projects/**/*.jsonl`
+  - Codex: `~/.codex/sessions/**/*.jsonl`
+- If a scan stalls because the upstream agent is slow, raise `DISTILL_AGENT_TIMEOUT_SECS` (default: 900 seconds).
+
 ## Quick Start
 
 ```bash
+which claude || which codex
 distill              # First-run onboarding (interactive TUI)
 distill scan --now   # Scan sessions for new skill proposals
 distill review       # Review proposals (accept/reject/edit/snooze/batch)
@@ -92,6 +105,12 @@ Notes:
 - SVG `notification_icon` values are rasterized to PNG for terminal inline rendering.
 - On Linux native notifications, `notification_icon: null` falls back to the built-in project icon automatically.
 - On macOS native notifications, distill tries `terminal-notifier -appIcon <icon>` first and falls back to AppleScript notification if that path fails.
+
+## Platform Notes
+
+- Scheduled scans use `launchd` on macOS and `systemd --user` on Linux.
+- Native notifications use `terminal-notifier` on macOS and `notify-send` on Linux when available.
+- If those native notifier tools are missing, terminal notifications still work when `notifications` is `terminal` or `both`.
 
 ## For AI Agents
 
