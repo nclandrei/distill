@@ -55,6 +55,29 @@ fn seed_proposals(home: &std::path::Path, count: usize) {
     }
 }
 
+fn seed_preference_proposals(home: &std::path::Path, count: usize) {
+    let proposals_dir = home.join(".distill").join("proposals");
+    fs::create_dir_all(&proposals_dir).unwrap();
+    for i in 0..count {
+        fs::write(
+            proposals_dir.join(format!("git-pref-{i}.md")),
+            format!(
+                "---\ntype: new\nconfidence: high\ntarget_skill: null\nevidence:\n  - session: /tmp/session-{i}.jsonl\n    pattern: Repeated git rebase workflow\ncreated: 2026-03-02T00:00:00Z\n---\n\n# Git Rebase Workflow {i}\n\n## When to use\nWhen cleaning feature branches.\n\n## Steps\n1. Fetch latest main.\n2. Rebase your branch.\n\n## Verification\nEnsure branch history looks linear.\n\n## Pitfalls\nAvoid rebasing shared branches.\n"
+            ),
+        )
+        .unwrap();
+    }
+}
+
+#[cfg(unix)]
+fn write_executable_script(path: &std::path::Path, body: &str) {
+    fs::write(path, body).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = fs::metadata(path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms).unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // Test 1 — status output includes configured agents and scan interval
 // ---------------------------------------------------------------------------
@@ -296,6 +319,86 @@ printf '%s' '{"proposals":[{"type":"new","confidence":"high","target_skill":null
 
     let watermark = fs::read_to_string(dir.path().join(".distill").join("last-scan.json")).unwrap();
     assert!(watermark.contains("session-1"));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_e2e_preference_learning_roundtrip_review_to_scan_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin_dir = dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+
+    let fake_agent = bin_dir.join("fake-proposal-agent.sh");
+    write_executable_script(
+        &fake_agent,
+        r#"#!/bin/sh
+prompt_file="$HOME/.distill/last-scan-prompt.txt"
+cat > "$prompt_file"
+printf '%s' '{"proposals":[]}'
+"#,
+    );
+
+    seed_config_with(
+        dir.path(),
+        fake_agent.to_string_lossy().as_ref(),
+        true,
+        false,
+    );
+    seed_preference_proposals(dir.path(), 3);
+
+    let review_json = dir.path().join("review.json");
+    distill_cmd(dir.path())
+        .args(["review", "--write-json"])
+        .arg(&review_json)
+        .assert()
+        .success();
+
+    let mut spec: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&review_json).unwrap()).unwrap();
+    let proposals = spec["proposals"]
+        .as_array_mut()
+        .expect("review json must contain proposals array");
+    for proposal in proposals {
+        proposal["decision"] = serde_json::Value::String("accept".to_string());
+    }
+    fs::write(&review_json, serde_json::to_string_pretty(&spec).unwrap()).unwrap();
+
+    distill_cmd(dir.path())
+        .args(["review", "--apply-json"])
+        .arg(&review_json)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Accepted : 3"));
+
+    let history = fs::read_to_string(dir.path().join(".distill/history/decisions.jsonl")).unwrap();
+    assert!(history.contains("\"proposal_type\":\"new\""));
+    assert!(history.contains("\"target_kind\":\"skill\""));
+    assert!(history.contains("\"git\""));
+
+    let sessions_dir = dir
+        .path()
+        .join(".claude")
+        .join("projects")
+        .join("project-a");
+    fs::create_dir_all(&sessions_dir).unwrap();
+    fs::write(
+        sessions_dir.join("session-1.jsonl"),
+        r#"{"timestamp":"2026-03-06T10:00:00Z","role":"user","text":"reuse git rebase flow"}"#,
+    )
+    .unwrap();
+
+    distill_cmd(dir.path())
+        .args(["scan", "--now"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Loaded preference history: 3 reviewed decision(s)",
+        ));
+
+    let prompt = fs::read_to_string(dir.path().join(".distill/last-scan-prompt.txt")).unwrap();
+    assert!(prompt.contains("Learned Preferences From Past Reviews"));
+    assert!(prompt.contains("Prioritize categories the user usually accepts"));
+    assert!(prompt.contains("git (accepted 3, rejected 0)"));
 }
 // ---------------------------------------------------------------------------
 // Test 5 — full flow: seed config → verify status → verify proposals → verify notify
