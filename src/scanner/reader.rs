@@ -39,9 +39,9 @@ impl LastScan {
     }
 }
 
-/// Collect sessions from all agents since `since`, deduplicated by session ID.
+/// Collect sessions from all agents since `since`, deduplicated by session path.
 pub fn collect_sessions(agents: &[Box<dyn Agent>], since: DateTime<Utc>) -> Result<Vec<Session>> {
-    let mut seen_ids = HashSet::new();
+    let mut seen_paths = HashSet::new();
     let mut all_sessions = Vec::new();
 
     for agent in agents {
@@ -50,7 +50,7 @@ pub fn collect_sessions(agents: &[Box<dyn Agent>], since: DateTime<Utc>) -> Resu
             .with_context(|| format!("Failed to read sessions from {} agent", agent.kind()))?;
 
         for session in sessions {
-            if seen_ids.insert(session.id.clone()) {
+            if seen_paths.insert(session.path.clone()) {
                 all_sessions.push(session);
             }
         }
@@ -137,6 +137,34 @@ mod tests {
         let result = collect_sessions(&[agent], Utc::now() - chrono::Duration::days(1)).unwrap();
         assert_eq!(result[0].id, "older");
         assert_eq!(result[1].id, "newer");
+    }
+
+    #[test]
+    fn test_collect_sessions_keeps_same_basename_from_different_paths() {
+        let first = Session {
+            id: "session-1".to_string(),
+            agent: AgentKind::Claude,
+            path: PathBuf::from("/fake/project-a/session-1.jsonl"),
+            timestamp: Utc::now() - chrono::Duration::hours(2),
+            content: "first".to_string(),
+        };
+        let second = Session {
+            id: "session-1".to_string(),
+            agent: AgentKind::Claude,
+            path: PathBuf::from("/fake/project-b/session-1.jsonl"),
+            timestamp: Utc::now() - chrono::Duration::hours(1),
+            content: "second".to_string(),
+        };
+
+        let agent: Box<dyn Agent> = Box::new(MockAgent {
+            kind: AgentKind::Claude,
+            sessions: vec![first, second],
+        });
+
+        let result = collect_sessions(&[agent], Utc::now() - chrono::Duration::days(1)).unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].path, PathBuf::from("/fake/project-a/session-1.jsonl"));
+        assert_eq!(result[1].path, PathBuf::from("/fake/project-b/session-1.jsonl"));
     }
 
     #[test]

@@ -468,7 +468,7 @@ fn collect_project_session_evidence(
         };
 
         for session in sessions {
-            if !seen.insert(session.id.clone()) {
+            if !seen.insert(session.path.clone()) {
                 continue;
             }
 
