@@ -318,6 +318,7 @@ jobs:
       - name: Publish the GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           gh release edit "${{ needs.prepare-release.outputs.release_tag }}" --draft=false
