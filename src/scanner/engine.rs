@@ -239,18 +239,22 @@ fn agent_timeout() -> Result<Duration> {
 pub fn run_scan(agents: &[Box<dyn Agent>], scan_config: &ScanConfig) -> Result<Vec<Proposal>> {
     // Step 1: Determine the "since" timestamp
     let last_scan = LastScan::load(&scan_config.last_scan_path)?;
+    let scan_started_at = Utc::now();
     let since = last_scan
         .as_ref()
         .map(|ls| ls.timestamp)
-        .unwrap_or_else(|| Utc::now() - chrono::Duration::days(30));
+        .unwrap_or_else(|| scan_started_at - chrono::Duration::days(30));
 
     // Step 2: Collect sessions
-    let sessions = filter_distill_scan_artifacts(reader::collect_sessions(agents, since)?);
+    let sessions = filter_previously_processed_sessions(
+        filter_distill_scan_artifacts(reader::collect_sessions(agents, since)?),
+        last_scan.as_ref(),
+    );
     if sessions.is_empty() {
         println!("No new sessions found since last scan.");
         // Still update the watermark so we don't re-scan the same window
         let watermark = LastScan {
-            timestamp: Utc::now(),
+            timestamp: scan_started_at,
             session_ids: vec![],
         };
         watermark.save(&scan_config.last_scan_path)?;
@@ -308,9 +312,18 @@ pub fn run_scan(agents: &[Box<dyn Agent>], scan_config: &ScanConfig) -> Result<V
     }
 
     // Step 7: Update watermark
+    let watermark_timestamp = sessions
+        .iter()
+        .map(|session| session.timestamp)
+        .max()
+        .unwrap_or(scan_started_at);
     let watermark = LastScan {
-        timestamp: Utc::now(),
-        session_ids: sessions.iter().map(|s| s.id.clone()).collect(),
+        timestamp: watermark_timestamp,
+        session_ids: sessions
+            .iter()
+            .filter(|session| session.timestamp == watermark_timestamp)
+            .map(|session| session.id.clone())
+            .collect(),
     };
     watermark.save(&scan_config.last_scan_path)?;
 
@@ -324,6 +337,22 @@ fn filter_distill_scan_artifacts(sessions: Vec<Session>) -> Vec<Session> {
     sessions
         .into_iter()
         .filter(|session| !is_distill_scan_artifact(&session.path))
+        .collect()
+}
+
+fn filter_previously_processed_sessions(
+    sessions: Vec<Session>,
+    last_scan: Option<&LastScan>,
+) -> Vec<Session> {
+    let Some(last_scan) = last_scan else {
+        return sessions;
+    };
+
+    sessions
+        .into_iter()
+        .filter(|session| {
+            session.timestamp > last_scan.timestamp || !last_scan.session_ids.contains(&session.id)
+        })
         .collect()
 }
 
@@ -1174,6 +1203,122 @@ mod tests {
 
         // Watermark should still be saved
         assert!(LastScan::load(&last_scan_path).unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_run_scan_picks_up_session_created_during_previous_scan() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct FsAgent {
+            sessions_dir: PathBuf,
+        }
+
+        impl Agent for FsAgent {
+            fn kind(&self) -> AgentKind {
+                AgentKind::Codex
+            }
+
+            fn read_sessions(&self, since: chrono::DateTime<Utc>) -> Result<Vec<Session>> {
+                let mut sessions = std::fs::read_dir(&self.sessions_dir)?
+                    .filter_map(|entry| entry.ok())
+                    .map(|entry| entry.path())
+                    .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+                    .filter_map(|path| {
+                        let timestamp = std::fs::metadata(&path)
+                            .ok()
+                            .and_then(|meta| meta.modified().ok())
+                            .map(chrono::DateTime::<Utc>::from)?;
+                        (timestamp >= since).then(|| Session {
+                            id: path
+                                .file_stem()
+                                .and_then(|stem| stem.to_str())
+                                .unwrap_or("unknown")
+                                .to_string(),
+                            agent: AgentKind::Codex,
+                            path,
+                            timestamp,
+                            content: String::new(),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                sessions.sort_by_key(|session| session.timestamp);
+                Ok(sessions)
+            }
+
+            fn write_skill(&self, _skill: &Skill) -> Result<()> {
+                Ok(())
+            }
+
+            fn config_dir(&self) -> PathBuf {
+                self.sessions_dir.clone()
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join("sessions");
+        let proposals_dir = dir.path().join("proposals");
+        let skills_dir = dir.path().join("skills");
+        let last_scan_path = dir.path().join("last-scan.json");
+        let history_dir = dir.path().join("history");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::create_dir_all(&skills_dir).unwrap();
+
+        let initial_session = sessions_dir.join("initial.jsonl");
+        std::fs::write(
+            &initial_session,
+            r#"{"timestamp":"2026-03-08T10:00:00Z","role":"user","text":"initial session"}"#,
+        )
+        .unwrap();
+
+        let mock_script = dir.path().join("mock-agent.sh");
+        let prompt_dir = dir.path().join("prompts");
+        std::fs::create_dir_all(&prompt_dir).unwrap();
+        let script_content = format!(
+            "#!/bin/sh\ncount_file=\"{count_file}\"\nprompt_dir=\"{prompt_dir}\"\ncount=$(cat \"$count_file\" 2>/dev/null || echo 0)\ncount=$((count + 1))\nprintf '%s' \"$count\" > \"$count_file\"\nsleep 2\ncat > \"$prompt_dir/prompt-$count.txt\"\nprintf '%s' '{{\"proposals\":[]}}'\n",
+            count_file = dir.path().join("call-count.txt").display(),
+            prompt_dir = prompt_dir.display(),
+        );
+        std::fs::write(&mock_script, script_content).unwrap();
+        std::fs::set_permissions(&mock_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let late_session = sessions_dir.join("late.jsonl");
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(1));
+            std::fs::write(
+                &late_session,
+                r#"{"timestamp":"2026-03-08T10:00:01Z","role":"user","text":"late session"}"#,
+            )
+            .unwrap();
+        });
+
+        let agents: Vec<Box<dyn Agent>> = vec![Box::new(FsAgent {
+            sessions_dir: sessions_dir.clone(),
+        })];
+        let scan_config = ScanConfig {
+            agent_command: mock_script.to_string_lossy().to_string(),
+            agent_args: vec![],
+            skills_dir,
+            proposals_dir,
+            last_scan_path,
+            history_dir,
+        };
+
+        run_scan(&agents, &scan_config).unwrap();
+        writer.join().unwrap();
+        run_scan(&agents, &scan_config).unwrap();
+
+        let prompt1 = std::fs::read_to_string(prompt_dir.join("prompt-1.txt")).unwrap();
+        assert!(prompt1.contains("initial.jsonl"));
+        assert!(!prompt1.contains("late.jsonl"));
+
+        let prompt2_path = prompt_dir.join("prompt-2.txt");
+        assert!(
+            prompt2_path.exists(),
+            "second scan should analyze the late-created session instead of skipping it"
+        );
+        let prompt2 = std::fs::read_to_string(prompt2_path).unwrap();
+        assert!(prompt2.contains("late.jsonl"));
     }
 
     #[test]
