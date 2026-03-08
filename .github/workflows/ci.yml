@@ -7,6 +7,23 @@ on:
     branches: [main]
 
 jobs:
+  release-config:
+    name: Release config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-dist
+        run: curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.31.0/cargo-dist-installer.sh | sh
+
+      - name: Check generated release workflow
+        run: $HOME/.cargo/bin/dist generate --mode ci --check --allow-dirty
+
+      - name: Check release manifest
+        run: $HOME/.cargo/bin/dist manifest --artifacts=all --output-format=json --no-local-paths --allow-dirty >/dev/null
+
   check:
     name: Check (fmt + clippy)
     runs-on: ubuntu-latest

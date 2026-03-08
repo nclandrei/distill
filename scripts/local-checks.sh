@@ -7,8 +7,8 @@ cd "$repo_root"
 echo "[local-checks] cargo fmt --all"
 cargo fmt --all
 
-echo "[local-checks] cargo clippy --fix --allow-dirty --allow-staged -- -D warnings"
-cargo clippy --fix --allow-dirty --allow-staged -- -D warnings
+echo "[local-checks] cargo clippy --fix --allow-dirty --allow-staged --allow-no-vcs -- -D warnings"
+cargo clippy --fix --allow-dirty --allow-staged --allow-no-vcs -- -D warnings
 
 echo "[local-checks] cargo fmt --all"
 cargo fmt --all

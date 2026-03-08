@@ -163,8 +163,14 @@ mod tests {
 
         let result = collect_sessions(&[agent], Utc::now() - chrono::Duration::days(1)).unwrap();
         assert_eq!(result.len(), 2);
-        assert_eq!(result[0].path, PathBuf::from("/fake/project-a/session-1.jsonl"));
-        assert_eq!(result[1].path, PathBuf::from("/fake/project-b/session-1.jsonl"));
+        assert_eq!(
+            result[0].path,
+            PathBuf::from("/fake/project-a/session-1.jsonl")
+        );
+        assert_eq!(
+            result[1].path,
+            PathBuf::from("/fake/project-b/session-1.jsonl")
+        );
     }
 
     #[test]

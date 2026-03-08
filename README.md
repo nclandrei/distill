@@ -8,11 +8,13 @@
 
 ```bash
 # Homebrew (recommended)
-brew install nclandrei/homebrew-tap/distill
+brew install nclandrei/tap/distill
 
 # crates.io
-cargo install distill --locked
+cargo install distill-cli --locked
 ```
+
+The installed command is still `distill`.
 
 Icon assets used by notifications and docs:
 - SVG: `assets/icons/distill-icon.svg`
@@ -67,6 +69,28 @@ cargo test
 Notes:
 - `jj` currently does not have native commit hooks, so the practical equivalent is using the `safe-*` aliases for commit-time enforcement.
 - You can run the same pipeline anytime with `make local-checks`.
+
+## Release Automation
+
+Pushing to `main` triggers the release workflow. When the version in `Cargo.toml` has not been released yet, the workflow will:
+- publishes release artifacts to GitHub Releases
+- publishes the crate to crates.io as `distill-cli`
+- updates the Homebrew formula in `nclandrei/homebrew-tap`
+
+The workflow creates the `v<version>` tag automatically. You do not need to push tags manually.
+If the current version is already released, the workflow exits without publishing again.
+For a retry of the current version, use GitHub Actions `workflow_dispatch` on the `Release` workflow.
+
+Required GitHub Actions secrets:
+- `CARGO_REGISTRY_TOKEN`: crates.io API token with publish access for `distill-cli`
+- `HOMEBREW_TAP_TOKEN`: GitHub token with push access to `nclandrei/homebrew-tap`
+
+Release process:
+
+```bash
+# bump Cargo.toml version first
+git push origin main
+```
 
 ## Commands
 

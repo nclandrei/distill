@@ -513,8 +513,8 @@ mod tests {
 
         assert_eq!(sessions.len(), 2);
         let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
-        assert!(ids.contains(&"session-alpha"));
-        assert!(ids.contains(&"session-beta"));
+        assert!(ids.iter().any(|id| id.ends_with("session-alpha.jsonl")));
+        assert!(ids.iter().any(|id| id.ends_with("session-beta.jsonl")));
         for s in &sessions {
             assert_eq!(s.agent, AgentKind::Claude);
         }
@@ -532,7 +532,7 @@ mod tests {
         let sessions = adapter.read_sessions(DateTime::UNIX_EPOCH).unwrap();
 
         assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].id, "sess-1");
+        assert!(sessions[0].id.ends_with("sess-1.jsonl"));
         assert_eq!(sessions[0].agent, AgentKind::Codex);
     }
 
@@ -553,7 +553,7 @@ mod tests {
         let sessions = adapter.read_sessions(DateTime::UNIX_EPOCH).unwrap();
 
         assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].id, "real");
+        assert!(sessions[0].id.ends_with("real.jsonl"));
     }
 
     // --- read_sessions: nested project sub-directories are walked ---
@@ -574,8 +574,8 @@ mod tests {
 
         assert_eq!(sessions.len(), 2);
         let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
-        assert!(ids.contains(&"s1"));
-        assert!(ids.contains(&"s2"));
+        assert!(ids.iter().any(|id| id.ends_with("s1.jsonl")));
+        assert!(ids.iter().any(|id| id.ends_with("s2.jsonl")));
     }
 
     // --- read_sessions: `since` filter removes old files ---
@@ -623,7 +623,7 @@ mod tests {
         let sessions = adapter.read_sessions(one_hour_ago).unwrap();
 
         assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].id, "fresh");
+        assert!(sessions[0].id.ends_with("fresh.jsonl"));
     }
 
     // --- write_skill: creates parent directory if missing ---

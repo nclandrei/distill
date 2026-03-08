@@ -1,6 +1,6 @@
 [package]
-name = "distill"
-version = "0.1.3"
+name = "distill-cli"
+version = "0.1.4"
 edition = "2024"
 description = "CLI tool that monitors AI agent sessions, identifies patterns, and proposes skills"
 license = "MIT"
@@ -10,6 +10,10 @@ readme = "README.md"
 authors = ["Andrei Nicolae"]
 keywords = ["ai", "automation", "agent", "cli", "workflow"]
 categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "distill"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
