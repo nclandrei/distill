@@ -132,6 +132,7 @@ screencapture -x -i /absolute/path/selection.png
 
 - For repository code changes, run `make local-checks` before committing.
 - To enforce the same checks at commit time, run `make hooks-install` once per clone (installs Git `pre-commit` plus `jj safe-commit` / `jj safe-describe` aliases).
+- CI also validates `cargo package --locked` and smoke-tests release artifacts via `scripts/smoke-test-installed-distill.sh`; run the smoke script locally when changing packaging/release flow.
 - For test/demo review runs, prefer an isolated home (`HOME="$TMPDIR/...")` so real `~/.distill` data is not modified.
 - For one-proposal review flows, pressing `a` can immediately complete the app and stop tmux.
 - If tmux exits right after action, treat that as expected completion and verify outcomes via filesystem artifacts:
@@ -139,3 +140,9 @@ screencapture -x -i /absolute/path/selection.png
   - skill written in `.distill/skills`
   - decision appended to `.distill/history/decisions.jsonl`
 - The helper stores reusable runtime state (socket/session/window-id) in `.distill-runtime/verify-session.env` and reuses it across screenshots/inputs.
+
+## Release Workflow Notes
+
+- `Release` workflow runs on push to `main` (and `workflow_dispatch`) and auto-manages the `v<version>` tag from `Cargo.toml`.
+- If a non-draft GitHub release exists and the crate version is already on crates.io, the workflow skips duplicate publishing.
+- Successful runs publish artifacts to GitHub Releases, publish `distill-cli` to crates.io, and update `nclandrei/homebrew-tap`.

@@ -10,6 +10,8 @@ fn distill_cmd(home: &std::path::Path) -> Command {
     cmd.env("HOME", home);
     cmd.env("DISTILL_SYSTEMCTL_PATH", "true");
     cmd.env("DISTILL_LAUNCHCTL_PATH", "true");
+    cmd.env_remove("GIT_DIR");
+    cmd.env_remove("GIT_WORK_TREE");
     cmd
 }
 
@@ -28,6 +30,8 @@ fn write_minimal_config(home: &std::path::Path, proposal_agent: &str) {
 fn init_git_repo(path: &std::path::Path) {
     std::fs::create_dir_all(path).unwrap();
     let status = std::process::Command::new("git")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
         .arg("init")
         .arg(path)
         .status()

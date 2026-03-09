@@ -376,7 +376,7 @@ fn resolve_since(
 }
 
 fn is_git_repo(path: &Path) -> Result<bool> {
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(path)
         .arg("rev-parse")
@@ -390,7 +390,7 @@ fn is_git_repo(path: &Path) -> Result<bool> {
 fn collect_git_evidence(project: &Path, since: DateTime<Utc>) -> Result<GitEvidence> {
     let since_arg = since.to_rfc3339();
 
-    let commits_output = Command::new("git")
+    let commits_output = git_command()
         .arg("-C")
         .arg(project)
         .args([
@@ -408,7 +408,7 @@ fn collect_git_evidence(project: &Path, since: DateTime<Utc>) -> Result<GitEvide
         bail!("Failed to read git commits for {}", project.display());
     }
 
-    let files_output = Command::new("git")
+    let files_output = git_command()
         .arg("-C")
         .arg(project)
         .args([
@@ -451,6 +451,15 @@ fn collect_git_evidence(project: &Path, since: DateTime<Utc>) -> Result<GitEvide
     }
 
     Ok(GitEvidence { commits, files })
+}
+
+fn git_command() -> Command {
+    let mut command = Command::new("git");
+    // Hooks set repository-scoped env vars; clear them so `git -C <path>` targets
+    // the explicit path instead of inheriting the parent repository context.
+    command.env_remove("GIT_DIR");
+    command.env_remove("GIT_WORK_TREE");
+    command
 }
 
 fn collect_project_session_evidence(
@@ -862,11 +871,7 @@ mod tests {
         let project = dir.path().join("repo");
         std::fs::create_dir_all(&project).unwrap();
 
-        let init = Command::new("git")
-            .arg("init")
-            .arg(&project)
-            .output()
-            .unwrap();
+        let init = git_command().arg("init").arg(&project).output().unwrap();
         assert!(init.status.success());
 
         let projects = vec![project.display().to_string(), project.display().to_string()];
