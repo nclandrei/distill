@@ -55,6 +55,8 @@ const PROPOSAL_SCHEMA: &str = r#"{
 
 const DEFAULT_AGENT_TIMEOUT_SECS: u64 = 15 * 60;
 const AGENT_POLL_INTERVAL_MS: u64 = 250;
+const MAX_PROMPT_SESSIONS: usize = 200;
+const MAX_AGENT_DIAGNOSTIC_CHARS: usize = 4000;
 
 /// Configuration for the scan engine, allowing dependency injection for testing.
 pub struct ScanConfig {
@@ -200,9 +202,35 @@ fn cleanup_temp_files(paths: &[PathBuf]) {
     }
 }
 
-fn format_agent_failure(command: &str, output: &std::process::Output) -> String {
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+fn clipped_multiline(input: &str, max_chars: usize) -> String {
+    let trimmed = input.trim();
+    let mut chars = trimmed.chars();
+    let clipped: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{clipped}\n...[truncated]")
+    } else {
+        clipped
+    }
+}
+
+fn sanitize_agent_diagnostics(text: &str, prompt: &str) -> String {
+    if text.trim().is_empty() {
+        return String::new();
+    }
+
+    let prompt_placeholder = format!("[distill prompt omitted: {} bytes]", prompt.len());
+    let sanitized = if prompt.is_empty() {
+        text.trim().to_string()
+    } else {
+        text.trim().replace(prompt, &prompt_placeholder)
+    };
+
+    clipped_multiline(&sanitized, MAX_AGENT_DIAGNOSTIC_CHARS)
+}
+
+fn format_agent_failure(command: &str, output: &std::process::Output, prompt: &str) -> String {
+    let stdout = sanitize_agent_diagnostics(&String::from_utf8_lossy(&output.stdout), prompt);
+    let stderr = sanitize_agent_diagnostics(&String::from_utf8_lossy(&output.stderr), prompt);
     let details = match (stderr.is_empty(), stdout.is_empty()) {
         (true, true) => String::new(),
         (false, true) => format!(":\n{stderr}"),
@@ -261,10 +289,12 @@ pub fn run_scan(agents: &[Box<dyn Agent>], scan_config: &ScanConfig) -> Result<V
         .unwrap_or_else(|| scan_started_at - chrono::Duration::days(30));
 
     // Step 2: Collect sessions
-    let sessions = filter_previously_processed_sessions(
-        filter_distill_scan_artifacts(reader::collect_sessions(agents, since)?),
-        last_scan.as_ref(),
-    );
+    let collected_sessions = reader::collect_sessions(agents, since)?;
+    let collected_count = collected_sessions.len();
+    let candidate_sessions =
+        filter_low_signal_sessions(filter_distill_scan_artifacts(collected_sessions));
+    let skipped_internal = collected_count.saturating_sub(candidate_sessions.len());
+    let sessions = filter_previously_processed_sessions(candidate_sessions, last_scan.as_ref());
     if sessions.is_empty() {
         println!("No new sessions found since last scan.");
         // Still update the watermark so we don't re-scan the same window
@@ -276,7 +306,21 @@ pub fn run_scan(agents: &[Box<dyn Agent>], scan_config: &ScanConfig) -> Result<V
         return Ok(vec![]);
     }
 
+    if skipped_internal > 0 {
+        println!(
+            "Skipped {} low-signal/internal session(s).",
+            skipped_internal
+        );
+    }
     println!("Found {} session(s) to analyze.", sessions.len());
+
+    let prompt_sessions = select_sessions_for_prompt(&sessions);
+    if prompt_sessions.len() < sessions.len() {
+        println!(
+            "Capped this scan to {} oldest pending session(s); rerun scan to continue through the backlog.",
+            prompt_sessions.len()
+        );
+    }
 
     // Step 3: Load existing skills
     let skills = load_existing_skills(&scan_config.skill_dirs)?;
@@ -299,10 +343,10 @@ pub fn run_scan(agents: &[Box<dyn Agent>], scan_config: &ScanConfig) -> Result<V
     }
 
     // Step 4: Build prompt and invoke agent
-    let prompt = build_prompt(&sessions, &skills, &preferences);
+    let prompt = build_prompt(prompt_sessions, &skills, &preferences);
     println!(
         "Sending excerpts from {} session file(s) to `{}` for analysis (prompt: {} bytes)...",
-        sessions.len(),
+        prompt_sessions.len(),
         scan_config.agent_command,
         prompt.len()
     );
@@ -327,14 +371,14 @@ pub fn run_scan(agents: &[Box<dyn Agent>], scan_config: &ScanConfig) -> Result<V
     }
 
     // Step 7: Update watermark
-    let watermark_timestamp = sessions
+    let watermark_timestamp = prompt_sessions
         .iter()
         .map(|session| session.timestamp)
         .max()
         .unwrap_or(scan_started_at);
     let watermark = LastScan {
         timestamp: watermark_timestamp,
-        session_ids: sessions
+        session_ids: prompt_sessions
             .iter()
             .filter(|session| session.timestamp == watermark_timestamp)
             .map(|session| session.id.clone())
@@ -352,6 +396,13 @@ fn filter_distill_scan_artifacts(sessions: Vec<Session>) -> Vec<Session> {
     sessions
         .into_iter()
         .filter(|session| !is_distill_scan_artifact(&session.path))
+        .collect()
+}
+
+fn filter_low_signal_sessions(sessions: Vec<Session>) -> Vec<Session> {
+    sessions
+        .into_iter()
+        .filter(|session| !is_low_signal_session_artifact(&session.path))
         .collect()
 }
 
@@ -386,6 +437,22 @@ fn is_distill_scan_artifact(path: &Path) -> bool {
 
     content.contains("You are a skill extraction engine for the `distill` tool.")
         && content.contains("Analyze these session files and produce a JSON object")
+}
+
+fn is_low_signal_session_artifact(path: &Path) -> bool {
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    filename.starts_with("agent-aprompt_suggestion-")
+        || filename.starts_with("agent-prompt_suggestion-")
+        || filename.starts_with("agent-acompact-")
+        || filename.starts_with("agent-compact-")
+}
+
+fn select_sessions_for_prompt(sessions: &[Session]) -> &[Session] {
+    let end = sessions.len().min(MAX_PROMPT_SESSIONS);
+    &sessions[..end]
 }
 
 /// Generate a deterministic filename for a proposal.
@@ -636,7 +703,7 @@ fn invoke_agent_with_timeout(
                 Ok(output) if !output.status.success() => {
                     cleanup_temp_files(&temp_files);
                     Err::<String, std::io::Error>(write_err)
-                        .with_context(|| format_agent_failure(command, &output))
+                        .with_context(|| format_agent_failure(command, &output, prompt))
                 }
                 Ok(_output) => {
                     cleanup_temp_files(&temp_files);
@@ -697,11 +764,21 @@ fn invoke_agent_with_timeout(
 
                     let stderr = timed_out_output
                         .as_ref()
-                        .map(|output| String::from_utf8_lossy(&output.stderr).trim().to_string())
+                        .map(|output| {
+                            sanitize_agent_diagnostics(
+                                &String::from_utf8_lossy(&output.stderr),
+                                prompt,
+                            )
+                        })
                         .unwrap_or_default();
                     let stdout = timed_out_output
                         .as_ref()
-                        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+                        .map(|output| {
+                            sanitize_agent_diagnostics(
+                                &String::from_utf8_lossy(&output.stdout),
+                                prompt,
+                            )
+                        })
                         .unwrap_or_default();
                     let details = match (stderr.is_empty(), stdout.is_empty()) {
                         (true, true) => String::new(),
@@ -733,7 +810,7 @@ fn invoke_agent_with_timeout(
 
     if !output.status.success() {
         cleanup_temp_files(&temp_files);
-        bail!("{}", format_agent_failure(command, &output));
+        bail!("{}", format_agent_failure(command, &output, prompt));
     }
 
     let stdout_from_process =
@@ -1521,6 +1598,35 @@ printf '%s' '{"proposals":[]}'
         assert!(err.contains("Verify the CLI is installed and authenticated"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_invoke_agent_timeout_redacts_prompt_from_diagnostics() {
+        let dir = tempfile::tempdir().unwrap();
+        let hanging = dir.path().join("prompt-echo-agent.sh");
+        let script = r#"#!/bin/sh
+prompt=$(cat)
+printf '%s\n' "$prompt" 1>&2
+sleep 5
+"#;
+        std::fs::write(&hanging, script).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hanging, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let prompt = "top secret prompt payload";
+        let err = invoke_agent_with_timeout(
+            hanging.to_str().unwrap(),
+            &[],
+            prompt,
+            Duration::from_millis(100),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("timed out"));
+        assert!(!err.contains(prompt));
+    }
+
     #[test]
     fn test_agent_timeout_defaults_to_fifteen_minutes() {
         assert_eq!(
@@ -1634,5 +1740,166 @@ printf '%s' '{"proposals":[]}'
         let filtered = filter_distill_scan_artifacts(sessions);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].id, "keep");
+    }
+
+    #[test]
+    fn test_filter_low_signal_sessions_drops_suggestion_and_compact_artifacts() {
+        let now = Utc::now();
+        let sessions = vec![
+            Session {
+                id: "keep".into(),
+                agent: AgentKind::Claude,
+                path: PathBuf::from("/tmp/real-session.jsonl"),
+                timestamp: now,
+                content: String::new(),
+            },
+            Session {
+                id: "suggest".into(),
+                agent: AgentKind::Claude,
+                path: PathBuf::from("/tmp/agent-aprompt_suggestion-123.jsonl"),
+                timestamp: now,
+                content: String::new(),
+            },
+            Session {
+                id: "compact".into(),
+                agent: AgentKind::Claude,
+                path: PathBuf::from("/tmp/agent-acompact-123.jsonl"),
+                timestamp: now,
+                content: String::new(),
+            },
+        ];
+
+        let filtered = filter_low_signal_sessions(sessions);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, "keep");
+    }
+
+    #[test]
+    fn test_select_sessions_for_prompt_caps_to_oldest_pending_sessions() {
+        let sessions = (0..(MAX_PROMPT_SESSIONS + 2))
+            .map(|idx| Session {
+                id: format!("session-{idx:03}"),
+                agent: AgentKind::Claude,
+                path: PathBuf::from(format!("/tmp/session-{idx:03}.jsonl")),
+                timestamp: Utc::now() + chrono::Duration::seconds(idx as i64),
+                content: String::new(),
+            })
+            .collect::<Vec<_>>();
+
+        let selected = select_sessions_for_prompt(&sessions);
+        assert_eq!(selected.len(), MAX_PROMPT_SESSIONS);
+        assert_eq!(selected.first().unwrap().id, "session-000");
+        assert_eq!(
+            selected.last().unwrap().id,
+            format!("session-{:03}", MAX_PROMPT_SESSIONS - 1)
+        );
+    }
+
+    #[test]
+    fn test_sanitize_agent_diagnostics_redacts_prompt_and_clips_output() {
+        let prompt = "classified prompt";
+        let diagnostics = format!(
+            "before {prompt} after {}",
+            "x".repeat(MAX_AGENT_DIAGNOSTIC_CHARS)
+        );
+
+        let sanitized = sanitize_agent_diagnostics(&diagnostics, prompt);
+        assert!(!sanitized.contains(prompt));
+        assert!(sanitized.contains("[distill prompt omitted:"));
+        assert!(sanitized.contains("[truncated]"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_run_scan_processes_large_backlog_incrementally() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct FixedAgent {
+            sessions: Vec<Session>,
+        }
+
+        impl Agent for FixedAgent {
+            fn kind(&self) -> AgentKind {
+                AgentKind::Claude
+            }
+
+            fn read_sessions(&self, since: chrono::DateTime<Utc>) -> Result<Vec<Session>> {
+                Ok(self
+                    .sessions
+                    .iter()
+                    .filter(|session| session.timestamp >= since)
+                    .cloned()
+                    .collect())
+            }
+
+            fn write_skill(&self, _skill: &Skill) -> Result<()> {
+                Ok(())
+            }
+
+            fn config_dir(&self) -> PathBuf {
+                PathBuf::from("/fake")
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let proposals_dir = dir.path().join("proposals");
+        let skills_dir = dir.path().join("skills");
+        let last_scan_path = dir.path().join("last-scan.json");
+        let history_dir = dir.path().join("history");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+
+        let prompt_dir = dir.path().join("prompts");
+        std::fs::create_dir_all(&prompt_dir).unwrap();
+        let mock_script = dir.path().join("capture-agent.sh");
+        let script_content = format!(
+            "#!/bin/sh\ncount_file=\"{count_file}\"\nprompt_dir=\"{prompt_dir}\"\ncount=$(cat \"$count_file\" 2>/dev/null || echo 0)\ncount=$((count + 1))\nprintf '%s' \"$count\" > \"$count_file\"\ncat > \"$prompt_dir/prompt-$count.txt\"\nprintf '%s' '{{\"proposals\":[]}}'\n",
+            count_file = dir.path().join("call-count.txt").display(),
+            prompt_dir = prompt_dir.display(),
+        );
+        std::fs::write(&mock_script, script_content).unwrap();
+        std::fs::set_permissions(&mock_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let base = Utc::now() - chrono::Duration::days(1);
+        let sessions = (0..(MAX_PROMPT_SESSIONS + 2))
+            .map(|idx| {
+                let path = dir.path().join(format!("session-{idx:03}.jsonl"));
+                std::fs::write(
+                    &path,
+                    format!(
+                        "{{\"timestamp\":\"2026-03-10T10:{:02}:00Z\",\"role\":\"user\",\"text\":\"session {idx}\"}}\n",
+                        idx % 60
+                    ),
+                )
+                .unwrap();
+                Session {
+                    id: format!("session-{idx:03}"),
+                    agent: AgentKind::Claude,
+                    path,
+                    timestamp: base + chrono::Duration::seconds(idx as i64),
+                    content: String::new(),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let agents: Vec<Box<dyn Agent>> = vec![Box::new(FixedAgent { sessions })];
+        let scan_config = ScanConfig {
+            agent_command: mock_script.to_string_lossy().to_string(),
+            agent_args: vec![],
+            skill_dirs: vec![skills_dir],
+            proposals_dir,
+            last_scan_path: last_scan_path.clone(),
+            history_dir,
+        };
+
+        run_scan(&agents, &scan_config).unwrap();
+        run_scan(&agents, &scan_config).unwrap();
+
+        let prompt1 = std::fs::read_to_string(prompt_dir.join("prompt-1.txt")).unwrap();
+        let prompt2 = std::fs::read_to_string(prompt_dir.join("prompt-2.txt")).unwrap();
+        assert!(prompt1.contains("session-000.jsonl"));
+        assert!(prompt1.contains(&format!("session-{:03}.jsonl", MAX_PROMPT_SESSIONS - 1)));
+        assert!(!prompt1.contains(&format!("session-{:03}.jsonl", MAX_PROMPT_SESSIONS)));
+        assert!(prompt2.contains(&format!("session-{:03}.jsonl", MAX_PROMPT_SESSIONS)));
+        assert!(prompt2.contains(&format!("session-{:03}.jsonl", MAX_PROMPT_SESSIONS + 1)));
     }
 }
