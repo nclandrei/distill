@@ -323,6 +323,66 @@ printf '%s' '{"proposals":[{"type":"new","confidence":"high","target_skill":null
 
 #[cfg(unix)]
 #[test]
+fn test_e2e_scan_reports_existing_shared_skills_and_excerpt_flow() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_config_with(dir.path(), "fake-proposal-agent.sh", true, false);
+
+    let sessions_dir = dir.path().join(".claude").join("projects").join("demo");
+    fs::create_dir_all(&sessions_dir).unwrap();
+    fs::write(
+        sessions_dir.join("session-1.jsonl"),
+        r#"{"timestamp":"2026-03-10T12:00:00Z","role":"user","content":"extract workflow"}"#,
+    )
+    .unwrap();
+
+    let distill_skills_dir = dir.path().join(".distill").join("skills");
+    fs::create_dir_all(&distill_skills_dir).unwrap();
+    fs::write(
+        distill_skills_dir.join("debugging.md"),
+        "# Debugging\nRead the error carefully.",
+    )
+    .unwrap();
+
+    let shared_skill_dir = dir.path().join(".agents").join("skills").join("review");
+    fs::create_dir_all(&shared_skill_dir).unwrap();
+    fs::write(
+        shared_skill_dir.join("SKILL.md"),
+        "# Review\nLook for regressions first.",
+    )
+    .unwrap();
+
+    let bin_dir = dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let fake_agent = bin_dir.join("fake-proposal-agent.sh");
+    write_executable_script(
+        &fake_agent,
+        r#"#!/bin/sh
+cat > /dev/null
+printf '%s' '{"proposals":[]}'
+"#,
+    );
+
+    let path_env = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    distill_cmd(dir.path())
+        .env("PATH", path_env)
+        .args(["scan", "--now"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Found 1 session(s) to analyze."))
+        .stdout(predicate::str::contains("Loaded 2 existing skill(s)."))
+        .stdout(predicate::str::contains(
+            "Sending excerpts from 1 session file(s)",
+        ))
+        .stdout(predicate::str::contains("Agent proposed 0 skill(s)."));
+}
+
+#[cfg(unix)]
+#[test]
 fn test_e2e_preference_learning_roundtrip_review_to_scan_prompt() {
     let dir = tempfile::tempdir().unwrap();
     let bin_dir = dir.path().join("bin");

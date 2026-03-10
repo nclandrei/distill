@@ -8,7 +8,7 @@ use std::path::Path;
 pub struct StatusInfo {
     pub config: Config,
     pub pending_proposals: usize,
-    pub accepted_skills: usize,
+    pub existing_skills: usize,
     /// Human-readable timestamp string from `last-scan.json`, or `None` when
     /// the file does not exist (i.e. the tool has never run a scan).
     pub last_scan: Option<String>,
@@ -55,7 +55,7 @@ pub fn format_status(info: &StatusInfo) -> String {
     out.push('\n');
 
     out.push_str(&format!("Pending proposals: {}\n", info.pending_proposals));
-    out.push_str(&format!("Accepted skills:   {}\n", info.accepted_skills));
+    out.push_str(&format!("Existing skills:   {}\n", info.existing_skills));
 
     let last_scan_display = info.last_scan.as_deref().unwrap_or("never");
     out.push_str(&format!("Last scan:         {last_scan_display}\n"));
@@ -69,6 +69,14 @@ pub fn format_status(info: &StatusInfo) -> String {
 /// timestamp) from the given `base_dir` rather than the hard-coded default
 /// `~/.distill`.  This makes the function fully testable with `tempfile`.
 pub fn collect_status_info(config: &Config, base_dir: &Path) -> Result<StatusInfo> {
+    collect_status_info_with_shared_dir(config, base_dir, &Config::shared_skills_dir())
+}
+
+fn collect_status_info_with_shared_dir(
+    config: &Config,
+    base_dir: &Path,
+    shared_skills_dir: &Path,
+) -> Result<StatusInfo> {
     let proposals_dir = base_dir.join("proposals");
     let pending_proposals = if proposals_dir.exists() {
         std::fs::read_dir(&proposals_dir)?
@@ -79,15 +87,11 @@ pub fn collect_status_info(config: &Config, base_dir: &Path) -> Result<StatusInf
         0
     };
 
-    let skills_dir = base_dir.join("skills");
-    let accepted_skills = if skills_dir.exists() {
-        std::fs::read_dir(&skills_dir)?
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
-            .count()
-    } else {
-        0
-    };
+    let existing_skills = crate::sync::load_skills_from_dirs(&[
+        base_dir.join("skills"),
+        shared_skills_dir.to_path_buf(),
+    ])?
+    .len();
 
     let last_scan_path = base_dir.join("last-scan.json");
     let last_scan_data = LastScan::load(&last_scan_path)?;
@@ -104,7 +108,7 @@ pub fn collect_status_info(config: &Config, base_dir: &Path) -> Result<StatusInf
     Ok(StatusInfo {
         config: config.clone(),
         pending_proposals,
-        accepted_skills,
+        existing_skills,
         last_scan,
         next_scheduled_scan,
     })
@@ -139,7 +143,7 @@ mod tests {
         StatusInfo {
             config: Config::default(),
             pending_proposals: 0,
-            accepted_skills: 0,
+            existing_skills: 0,
             last_scan: None,
             next_scheduled_scan: None,
         }
@@ -181,11 +185,11 @@ mod tests {
     #[test]
     fn test_format_status_shows_skill_count() {
         let mut info = default_info();
-        info.accepted_skills = 4;
+        info.existing_skills = 4;
 
         let output = format_status(&info);
 
-        assert!(output.contains("Accepted skills:   4"));
+        assert!(output.contains("Existing skills:   4"));
     }
 
     #[test]
@@ -282,15 +286,35 @@ mod tests {
         .unwrap();
 
         let config = Config::default();
-        let info = collect_status_info(&config, base).unwrap();
+        let info =
+            collect_status_info_with_shared_dir(&config, base, &dir.path().join("shared")).unwrap();
 
         assert_eq!(info.pending_proposals, 2);
-        assert_eq!(info.accepted_skills, 3);
+        assert_eq!(info.existing_skills, 3);
         assert_eq!(info.last_scan.as_deref(), Some("2024-06-01T12:00:00Z"));
         assert_eq!(
             info.next_scheduled_scan.as_deref(),
             Some("2024-06-08T12:00:00Z")
         );
+    }
+
+    #[test]
+    fn test_collect_status_info_counts_shared_skill_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let shared = dir.path().join("shared");
+
+        std::fs::create_dir_all(shared.join("review")).unwrap();
+        std::fs::write(
+            shared.join("review").join("SKILL.md"),
+            "# Review\nShared skill",
+        )
+        .unwrap();
+
+        let config = Config::default();
+        let info = collect_status_info_with_shared_dir(&config, base, &shared).unwrap();
+
+        assert_eq!(info.existing_skills, 1);
     }
 
     #[test]
@@ -304,10 +328,11 @@ mod tests {
         // No last-scan.json
 
         let config = Config::default();
-        let info = collect_status_info(&config, base).unwrap();
+        let info =
+            collect_status_info_with_shared_dir(&config, base, &dir.path().join("shared")).unwrap();
 
         assert_eq!(info.pending_proposals, 0);
-        assert_eq!(info.accepted_skills, 0);
+        assert_eq!(info.existing_skills, 0);
         assert_eq!(info.last_scan, None);
         assert_eq!(info.next_scheduled_scan, None);
     }
@@ -321,10 +346,11 @@ mod tests {
         // Deliberately do NOT create proposals/ or skills/
 
         let config = Config::default();
-        let info = collect_status_info(&config, base).unwrap();
+        let info =
+            collect_status_info_with_shared_dir(&config, base, &dir.path().join("shared")).unwrap();
 
         assert_eq!(info.pending_proposals, 0);
-        assert_eq!(info.accepted_skills, 0);
+        assert_eq!(info.existing_skills, 0);
         assert_eq!(info.last_scan, None);
         assert_eq!(info.next_scheduled_scan, None);
     }
@@ -348,7 +374,8 @@ mod tests {
             sync_agents: SyncAgentsConfig::default(),
         };
 
-        let info = collect_status_info(&config, base).unwrap();
+        let info =
+            collect_status_info_with_shared_dir(&config, base, &dir.path().join("shared")).unwrap();
 
         assert_eq!(info.config.scan_interval, Interval::Daily);
         assert_eq!(info.config.proposal_agent, "codex");
@@ -378,10 +405,11 @@ mod tests {
         std::fs::write(skills.join("meta.json"), "not a skill").unwrap();
 
         let config = Config::default();
-        let info = collect_status_info(&config, base).unwrap();
+        let info =
+            collect_status_info_with_shared_dir(&config, base, &dir.path().join("shared")).unwrap();
 
         assert_eq!(info.pending_proposals, 1);
-        assert_eq!(info.accepted_skills, 1);
+        assert_eq!(info.existing_skills, 1);
     }
 
     /// Parse the structured last-scan payload and expose only the timestamp.
@@ -402,7 +430,8 @@ mod tests {
         .unwrap();
 
         let config = Config::default();
-        let info = collect_status_info(&config, base).unwrap();
+        let info =
+            collect_status_info_with_shared_dir(&config, base, &dir.path().join("shared")).unwrap();
 
         assert_eq!(info.last_scan.as_deref(), Some("2025-01-10T09:00:00Z"));
         assert_eq!(
@@ -426,7 +455,8 @@ mod tests {
             scan_interval: Interval::Monthly,
             ..Config::default()
         };
-        let info = collect_status_info(&config, base).unwrap();
+        let info =
+            collect_status_info_with_shared_dir(&config, base, &dir.path().join("shared")).unwrap();
 
         assert_eq!(
             info.next_scheduled_scan.as_deref(),

@@ -62,8 +62,8 @@ pub struct ScanConfig {
     pub agent_command: String,
     /// Arguments to pass for non-interactive output (e.g. ["--print"] for claude).
     pub agent_args: Vec<String>,
-    /// Directory containing existing skills.
-    pub skills_dir: PathBuf,
+    /// Directories containing existing skills.
+    pub skill_dirs: Vec<PathBuf>,
     /// Directory to write proposals to.
     pub proposals_dir: PathBuf,
     /// Path to last-scan.json.
@@ -79,7 +79,7 @@ impl ScanConfig {
         Self {
             agent_command: command,
             agent_args: args,
-            skills_dir: Config::skills_dir(),
+            skill_dirs: vec![Config::skills_dir(), Config::shared_skills_dir()],
             proposals_dir: Config::proposals_dir(),
             last_scan_path: Config::last_scan_path(),
             history_dir: Config::history_dir(),
@@ -200,6 +200,21 @@ fn cleanup_temp_files(paths: &[PathBuf]) {
     }
 }
 
+fn format_agent_failure(command: &str, output: &std::process::Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let details = match (stderr.is_empty(), stdout.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => format!(":\n{stderr}"),
+        (true, false) => format!(":\n{stdout}"),
+        (false, false) => format!(":\n{stderr}\n{stdout}"),
+    };
+    format!(
+        "Agent command `{command}` failed with status {}{}",
+        output.status, details
+    )
+}
+
 fn agent_timeout_from_env(raw: Option<&str>) -> Result<Duration> {
     match raw {
         Some(raw) => {
@@ -264,7 +279,7 @@ pub fn run_scan(agents: &[Box<dyn Agent>], scan_config: &ScanConfig) -> Result<V
     println!("Found {} session(s) to analyze.", sessions.len());
 
     // Step 3: Load existing skills
-    let skills = load_skills(&scan_config.skills_dir)?;
+    let skills = load_existing_skills(&scan_config.skill_dirs)?;
     println!("Loaded {} existing skill(s).", skills.len());
 
     // Step 3.5: Load preference profile from prior review decisions.
@@ -286,7 +301,7 @@ pub fn run_scan(agents: &[Box<dyn Agent>], scan_config: &ScanConfig) -> Result<V
     // Step 4: Build prompt and invoke agent
     let prompt = build_prompt(&sessions, &skills, &preferences);
     println!(
-        "Sending {} session path(s) to `{}` for analysis (prompt: {} bytes)...",
+        "Sending excerpts from {} session file(s) to `{}` for analysis (prompt: {} bytes)...",
         sessions.len(),
         scan_config.agent_command,
         prompt.len()
@@ -385,34 +400,16 @@ fn proposal_filename(proposal: &Proposal, index: usize) -> String {
     format!("{type_prefix}-{timestamp}-{index}.md")
 }
 
-/// Load all skills from the skills directory.
-fn load_skills(skills_dir: &Path) -> Result<Vec<Skill>> {
-    if !skills_dir.exists() {
-        return Ok(vec![]);
-    }
-
-    let mut skills = Vec::new();
-    for entry in std::fs::read_dir(skills_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "md") {
-            let name = path
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            let content = std::fs::read_to_string(&path)
-                .with_context(|| format!("Failed to read skill {}", path.display()))?;
-            skills.push(Skill { name, content });
-        }
-    }
-    Ok(skills)
+/// Load existing skills from Distill-managed storage plus shared agent skills.
+fn load_existing_skills(skill_dirs: &[PathBuf]) -> Result<Vec<Skill>> {
+    crate::sync::load_skills_from_dirs(skill_dirs)
 }
 
 /// Build the prompt sent to the generation agent.
 ///
-/// Instead of inlining session content (which can be enormous), the prompt
-/// points the agent at the session file paths and lets it read them directly.
+/// Distill parses the session logs itself and inlines clipped excerpts here so
+/// the proposal agent does not need direct filesystem access to `~/.claude` or
+/// `~/.codex` at scan time.
 fn build_prompt(
     sessions: &[Session],
     existing_skills: &[Skill],
@@ -631,12 +628,37 @@ fn invoke_agent_with_timeout(
         .spawn()
         .with_context(|| format!("Failed to execute agent command: {command}"))?;
 
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(prompt.as_bytes())
-            .with_context(|| format!("Failed to write prompt to {command} stdin"))?;
-        // stdin is dropped here, closing the pipe so the child sees EOF
+    if let Some(mut stdin) = child.stdin.take()
+        && let Err(write_err) = stdin.write_all(prompt.as_bytes())
+    {
+        if write_err.kind() == std::io::ErrorKind::BrokenPipe {
+            return match child.wait_with_output() {
+                Ok(output) if !output.status.success() => {
+                    cleanup_temp_files(&temp_files);
+                    Err::<String, std::io::Error>(write_err)
+                        .with_context(|| format_agent_failure(command, &output))
+                }
+                Ok(_output) => {
+                    cleanup_temp_files(&temp_files);
+                    Err::<String, std::io::Error>(write_err)
+                        .with_context(|| format!("Failed to write prompt to {command} stdin"))
+                }
+                Err(wait_err) => {
+                    cleanup_temp_files(&temp_files);
+                    Err(wait_err).with_context(|| {
+                            format!(
+                                "Failed to write prompt to {command} stdin, then failed to collect agent output"
+                            )
+                        })
+                }
+            };
+        }
+
+        cleanup_temp_files(&temp_files);
+        return Err(write_err)
+            .with_context(|| format!("Failed to write prompt to {command} stdin"));
     }
+    // stdin is dropped here, closing the pipe so the child sees EOF
 
     // Print a heartbeat every 30 s so the user knows we're not stuck.
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -710,20 +732,8 @@ fn invoke_agent_with_timeout(
     let _ = heartbeat.join();
 
     if !output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let details = match (stderr.is_empty(), stdout.is_empty()) {
-            (true, true) => String::new(),
-            (false, true) => format!(":\n{stderr}"),
-            (true, false) => format!(":\n{stdout}"),
-            (false, false) => format!(":\n{stderr}\n{stdout}"),
-        };
         cleanup_temp_files(&temp_files);
-        bail!(
-            "Agent command `{command}` failed with status {}{}",
-            output.status,
-            details
-        );
+        bail!("{}", format_agent_failure(command, &output));
     }
 
     let stdout_from_process =
@@ -1061,14 +1071,14 @@ mod tests {
     }
 
     #[test]
-    fn test_load_skills_empty_dir() {
+    fn test_load_existing_skills_empty_dir() {
         let dir = tempfile::tempdir().unwrap();
-        let skills = load_skills(dir.path()).unwrap();
+        let skills = load_existing_skills(&[dir.path().to_path_buf()]).unwrap();
         assert!(skills.is_empty());
     }
 
     #[test]
-    fn test_load_skills_reads_md_files() {
+    fn test_load_existing_skills_reads_md_files() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("git-workflow.md"),
@@ -1077,16 +1087,40 @@ mod tests {
         .unwrap();
         std::fs::write(dir.path().join("not-a-skill.txt"), "ignore me").unwrap();
 
-        let skills = load_skills(dir.path()).unwrap();
+        let skills = load_existing_skills(&[dir.path().to_path_buf()]).unwrap();
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "git-workflow");
         assert!(skills[0].content.contains("Git Workflow"));
     }
 
     #[test]
-    fn test_load_skills_nonexistent_dir() {
-        let skills = load_skills(Path::new("/nonexistent/skills")).unwrap();
+    fn test_load_existing_skills_nonexistent_dir() {
+        let skills = load_existing_skills(&[PathBuf::from("/nonexistent/skills")]).unwrap();
         assert!(skills.is_empty());
+    }
+
+    #[test]
+    fn test_load_existing_skills_merges_shared_skills() {
+        let dir = tempfile::tempdir().unwrap();
+        let distill_dir = dir.path().join("distill-skills");
+        let shared_dir = dir.path().join("shared-skills");
+        std::fs::create_dir_all(&distill_dir).unwrap();
+        std::fs::create_dir_all(shared_dir.join("review")).unwrap();
+        std::fs::write(
+            distill_dir.join("debugging.md"),
+            "# Debugging\nDistill copy",
+        )
+        .unwrap();
+        std::fs::write(
+            shared_dir.join("review").join("SKILL.md"),
+            "# Review\nShared copy",
+        )
+        .unwrap();
+
+        let skills = load_existing_skills(&[distill_dir, shared_dir]).unwrap();
+        assert_eq!(skills.len(), 2);
+        assert!(skills.iter().any(|skill| skill.name == "debugging"));
+        assert!(skills.iter().any(|skill| skill.name == "review"));
     }
 
     #[test]
@@ -1141,7 +1175,7 @@ mod tests {
         let scan_config = ScanConfig {
             agent_command: mock_script.to_string_lossy().to_string(),
             agent_args: vec![],
-            skills_dir,
+            skill_dirs: vec![skills_dir],
             proposals_dir: proposals_dir.clone(),
             last_scan_path: last_scan_path.clone(),
             history_dir: dir.path().join("history"),
@@ -1192,7 +1226,7 @@ mod tests {
         let scan_config = ScanConfig {
             agent_command: "unused".into(),
             agent_args: vec![],
-            skills_dir,
+            skill_dirs: vec![skills_dir],
             proposals_dir,
             last_scan_path: last_scan_path.clone(),
             history_dir: dir.path().join("history"),
@@ -1298,7 +1332,7 @@ mod tests {
         let scan_config = ScanConfig {
             agent_command: mock_script.to_string_lossy().to_string(),
             agent_args: vec![],
-            skills_dir,
+            skill_dirs: vec![skills_dir],
             proposals_dir,
             last_scan_path,
             history_dir,
@@ -1432,6 +1466,29 @@ exit 42
             .to_string();
         assert!(err.contains("status"));
         assert!(err.contains("simulated stderr failure"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_invoke_agent_early_exit_during_stdin_write_includes_stderr() {
+        let dir = tempfile::tempdir().unwrap();
+        let failing = dir.path().join("early-exit-agent.sh");
+        let script = r#"#!/bin/sh
+echo "simulated early exit" 1>&2
+exit 23
+"#;
+        std::fs::write(&failing, script).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&failing, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let prompt = "x".repeat(1024 * 1024);
+        let err = invoke_agent(failing.to_str().unwrap(), &[], &prompt)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("status"));
+        assert!(err.contains("simulated early exit"));
     }
 
     #[cfg(unix)]

@@ -143,12 +143,13 @@ fn system_time_to_utc(st: std::time::SystemTime) -> DateTime<Utc> {
         .unwrap_or_else(Utc::now)
 }
 
-/// Read metadata for a single `.jsonl` session file (without reading its content).
+/// Read metadata for a single `.jsonl` session file without parsing its body.
 ///
 /// The session `timestamp` is set to the file's modification time.
 /// The session `id` is the full file path so it remains unique across
 /// different projects that happen to use the same basename.
-/// The agent is given the file *path* so it can read the content itself.
+/// Distill keeps the file path so the scanner can later render clipped
+/// excerpts from the log.
 fn read_jsonl_session(path: &std::path::Path, kind: AgentKind) -> Result<Session> {
     let id = path.to_string_lossy().to_string();
     let mtime = std::fs::metadata(path)

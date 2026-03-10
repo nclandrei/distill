@@ -1,6 +1,7 @@
 // Skill sync — reads skills from ~/.distill/skills/ and syncs to all agents.
 
 use anyhow::Result;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::agents::{Agent, Skill};
@@ -16,42 +17,61 @@ pub struct SyncReport {
     pub errors: Vec<String>,
 }
 
-/// Read all `.md` files from `skills_dir`, returning a `Skill` for each.
-///
-/// - `name`    = file stem (e.g. `"git-workflow"` for `git-workflow.md`)
-/// - `content` = raw file contents
-///
-/// Returns an empty `Vec` (not an error) if the directory does not exist.
-pub fn load_skills(skills_dir: &Path) -> Result<Vec<Skill>> {
-    if !skills_dir.exists() {
-        return Ok(vec![]);
-    }
-
-    let mut skills = Vec::new();
-
-    for entry in std::fs::read_dir(skills_dir)?.flatten() {
-        let path = entry.path();
-
-        // Only process regular .md files (skip directories, etc.)
-        if !path.is_file() {
-            continue;
-        }
-        if path.extension().and_then(|e| e.to_str()) != Some("md") {
-            continue;
-        }
-
+fn read_skill_from_entry(path: &Path) -> Result<Option<Skill>> {
+    if path.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some("md") {
         let name = path
             .file_stem()
-            .and_then(|s| s.to_str())
+            .and_then(|stem| stem.to_str())
             .unwrap_or("unknown")
             .to_string();
-
-        let content = std::fs::read_to_string(&path)?;
-
-        skills.push(Skill { name, content });
+        let content = std::fs::read_to_string(path)?;
+        return Ok(Some(Skill { name, content }));
     }
 
-    Ok(skills)
+    if path.is_dir() {
+        let skill_file = path.join("SKILL.md");
+        if skill_file.is_file() {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let content = std::fs::read_to_string(&skill_file)?;
+            return Ok(Some(Skill { name, content }));
+        }
+    }
+
+    Ok(None)
+}
+
+/// Read all skills from a set of directories, supporting both Distill's flat
+/// `*.md` layout and shared agent skill directories (`<name>/SKILL.md`).
+///
+/// When the same skill name appears in multiple roots, the first root wins.
+pub fn load_skills_from_dirs(skills_dirs: &[std::path::PathBuf]) -> Result<Vec<Skill>> {
+    let mut skills_by_name = BTreeMap::new();
+
+    for skills_dir in skills_dirs {
+        if !skills_dir.exists() {
+            continue;
+        }
+
+        let mut entries = std::fs::read_dir(skills_dir)?.flatten().collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.file_name().to_string_lossy().to_string());
+
+        for entry in entries {
+            if let Some(skill) = read_skill_from_entry(&entry.path())? {
+                skills_by_name.entry(skill.name.clone()).or_insert(skill);
+            }
+        }
+    }
+
+    Ok(skills_by_name.into_values().collect())
+}
+
+/// Read all supported skills from `skills_dir`.
+pub fn load_skills(skills_dir: &Path) -> Result<Vec<Skill>> {
+    load_skills_from_dirs(&[skills_dir.to_path_buf()])
 }
 
 /// For each skill in `skills`, call `write_skill` on every agent in `agents`.
@@ -159,6 +179,83 @@ mod tests {
     fn test_load_skills_nonexistent_dir() {
         let skills = load_skills(Path::new("/nonexistent/path/skills")).unwrap();
         assert!(skills.is_empty());
+    }
+
+    #[test]
+    fn test_load_skills_supports_skill_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills_dir = dir.path().to_path_buf();
+
+        let review_dir = skills_dir.join("review");
+        std::fs::create_dir_all(&review_dir).unwrap();
+        std::fs::write(
+            review_dir.join("SKILL.md"),
+            "# Review\nLook for regressions.",
+        )
+        .unwrap();
+
+        let skills = load_skills(&skills_dir).unwrap();
+
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "review");
+        assert_eq!(skills[0].content, "# Review\nLook for regressions.");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_load_skills_follows_symlinked_skill_directories() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let skills_dir = dir.path().join("skills");
+        let source_dir = dir.path().join("source").join("jj");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::write(source_dir.join("SKILL.md"), "# Jj\nLand changes.").unwrap();
+        symlink(&source_dir, skills_dir.join("jj")).unwrap();
+
+        let skills = load_skills(&skills_dir).unwrap();
+
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "jj");
+        assert_eq!(skills[0].content, "# Jj\nLand changes.");
+    }
+
+    #[test]
+    fn test_load_skills_from_dirs_dedupes_by_name_preferring_first_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary_dir = dir.path().join("primary");
+        let shared_dir = dir.path().join("shared");
+        std::fs::create_dir_all(&primary_dir).unwrap();
+        std::fs::create_dir_all(shared_dir.join("debugging")).unwrap();
+
+        std::fs::write(
+            primary_dir.join("debugging.md"),
+            "# Debugging\nPrimary copy.",
+        )
+        .unwrap();
+        std::fs::write(
+            shared_dir.join("debugging").join("SKILL.md"),
+            "# Debugging\nShared copy.",
+        )
+        .unwrap();
+        std::fs::create_dir_all(shared_dir.join("review")).unwrap();
+        std::fs::write(
+            shared_dir.join("review").join("SKILL.md"),
+            "# Review\nShared only.",
+        )
+        .unwrap();
+
+        let skills = load_skills_from_dirs(&[primary_dir, shared_dir]).unwrap();
+
+        assert_eq!(skills.len(), 2);
+        let debugging = skills
+            .iter()
+            .find(|skill| skill.name == "debugging")
+            .unwrap();
+        let review = skills.iter().find(|skill| skill.name == "review").unwrap();
+        assert_eq!(debugging.content, "# Debugging\nPrimary copy.");
+        assert_eq!(review.content, "# Review\nShared only.");
     }
 
     // ------------------------------------------------------------------

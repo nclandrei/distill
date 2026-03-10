@@ -152,6 +152,11 @@ impl Config {
         Self::base_dir().join("skills")
     }
 
+    /// Returns the shared agent skills directory (~/.agents/skills)
+    pub fn shared_skills_dir() -> PathBuf {
+        dirs_or_home().join(".agents").join("skills")
+    }
+
     /// Returns the history directory
     pub fn history_dir() -> PathBuf {
         Self::base_dir().join("history")

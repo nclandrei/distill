@@ -102,7 +102,7 @@ git push origin main
 | `distill review` | Review pending proposals in a TUI (`a/r/e/s/A`) |
 | `distill dedupe [--dry-run]` | Detect duplicate global skills and propose removals |
 | `distill sync-agents ...` | Propose `AGENTS.md` updates from project evidence |
-| `distill status` | Show config, pending proposals, accepted skills |
+| `distill status` | Show config, pending proposals, existing skills |
 | `distill watch --install` | Install scheduled scan (launchd/systemd) |
 | `distill watch --uninstall` | Remove scheduled scan |
 | `distill notify --check` | Check for pending proposals (used by shell hook) |
