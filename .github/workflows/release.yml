@@ -127,8 +127,8 @@ jobs:
 
       - name: Smoke test local dist artifact
         run: |
-          artifact="$(find target/distrib -maxdepth 1 -name '*.tar.xz' | head -n 1)"
-          if [ -z "$artifact" ]; then
+          artifact="$(jq -r '.artifacts | to_entries[] | select(.value.kind == "executable-zip") | .value.path' dist-local.json | head -n 1)"
+          if [ -z "$artifact" ] || [ "$artifact" = "null" ] || [ ! -f "$artifact" ]; then
             echo "::error::No dist tarball found for smoke test."
             exit 1
           fi

@@ -69,7 +69,7 @@ grep -q "Scan interval:  weekly" "$workdir/status.out"
 grep -q "Proposal agent: claude" "$workdir/status.out"
 
 "$bin_path" scan --now >"$workdir/scan.out"
-grep -q "No new sessions found since last scan." "$workdir/scan.out"
+grep -q "No pending sessions found for scan." "$workdir/scan.out"
 
 "$bin_path" review --write-json - >"$workdir/review.json"
 grep -q '"format_version": 1' "$workdir/review.json"
