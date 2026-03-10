@@ -4,11 +4,18 @@ use anyhow::Result;
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use std::path::Path;
 
+#[derive(serde::Deserialize)]
+struct StoredBacklog {
+    #[serde(default)]
+    sessions: Vec<serde_json::Value>,
+}
+
 /// All the data needed to render the status output.
 pub struct StatusInfo {
     pub config: Config,
     pub pending_proposals: usize,
     pub existing_skills: usize,
+    pub pending_scan_backlog: usize,
     /// Human-readable timestamp string from `last-scan.json`, or `None` when
     /// the file does not exist (i.e. the tool has never run a scan).
     pub last_scan: Option<String>,
@@ -56,6 +63,10 @@ pub fn format_status(info: &StatusInfo) -> String {
 
     out.push_str(&format!("Pending proposals: {}\n", info.pending_proposals));
     out.push_str(&format!("Existing skills:   {}\n", info.existing_skills));
+    out.push_str(&format!(
+        "Pending scan backlog: {}\n",
+        info.pending_scan_backlog
+    ));
 
     let last_scan_display = info.last_scan.as_deref().unwrap_or("never");
     out.push_str(&format!("Last scan:         {last_scan_display}\n"));
@@ -93,6 +104,8 @@ fn collect_status_info_with_shared_dir(
     ])?
     .len();
 
+    let pending_scan_backlog = load_pending_scan_backlog(&base_dir.join("scan-backlog.json"))?;
+
     let last_scan_path = base_dir.join("last-scan.json");
     let last_scan_data = LastScan::load(&last_scan_path)?;
     let (last_scan, next_scheduled_scan) = if let Some(last_scan_data) = last_scan_data {
@@ -109,9 +122,20 @@ fn collect_status_info_with_shared_dir(
         config: config.clone(),
         pending_proposals,
         existing_skills,
+        pending_scan_backlog,
         last_scan,
         next_scheduled_scan,
     })
+}
+
+fn load_pending_scan_backlog(path: &Path) -> Result<usize> {
+    if !path.exists() {
+        return Ok(0);
+    }
+
+    let contents = std::fs::read_to_string(path)?;
+    let backlog: StoredBacklog = serde_json::from_str(&contents)?;
+    Ok(backlog.sessions.len())
 }
 
 /// Entry point called by `main`.  Delegates to `collect_status_info` and
@@ -144,6 +168,7 @@ mod tests {
             config: Config::default(),
             pending_proposals: 0,
             existing_skills: 0,
+            pending_scan_backlog: 0,
             last_scan: None,
             next_scheduled_scan: None,
         }
@@ -190,6 +215,16 @@ mod tests {
         let output = format_status(&info);
 
         assert!(output.contains("Existing skills:   4"));
+    }
+
+    #[test]
+    fn test_format_status_shows_backlog_count() {
+        let mut info = default_info();
+        info.pending_scan_backlog = 12;
+
+        let output = format_status(&info);
+
+        assert!(output.contains("Pending scan backlog: 12"));
     }
 
     #[test]

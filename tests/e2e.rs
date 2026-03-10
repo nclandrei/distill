@@ -197,7 +197,7 @@ fn test_e2e_scan_creates_proposals_dir() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "No new sessions found since last scan.",
+            "No pending sessions found for scan.",
         ));
 
     // The .distill directory must have been created by Config::ensure_dirs().
@@ -220,7 +220,7 @@ fn test_e2e_scan_without_now_runs_scheduled_path() {
         .success()
         .stdout(predicate::str::contains("running scheduled scan"))
         .stdout(predicate::str::contains(
-            "No new sessions found since last scan.",
+            "No pending sessions found for scan.",
         ));
 
     assert!(
@@ -254,12 +254,27 @@ fn test_e2e_scan_codex_proposal_agent_with_schema_enforcement() {
     let script = r##"#!/bin/sh
 schema_file=""
 last_message_file=""
+sandbox=""
+cd_dir=""
+saw_json=0
 saw_exec=0
 while [ $# -gt 0 ]; do
   case "$1" in
     exec)
       saw_exec=1
       shift
+      ;;
+    --json)
+      saw_json=1
+      shift
+      ;;
+    --sandbox)
+      sandbox="$2"
+      shift 2
+      ;;
+    -C|--cd)
+      cd_dir="$2"
+      shift 2
       ;;
     --output-schema)
       schema_file="$2"
@@ -276,11 +291,17 @@ while [ $# -gt 0 ]; do
 done
 cat > /dev/null
 [ "$saw_exec" -eq 1 ] || exit 31
+[ "$saw_json" -eq 1 ] || exit 32
+[ "$sandbox" = "read-only" ] || exit 33
+[ -n "$cd_dir" ] || exit 34
 [ -n "$schema_file" ] || exit 32
 [ -f "$schema_file" ] || exit 33
 grep -q '"proposals"' "$schema_file" || exit 34
 [ -n "$last_message_file" ] || exit 35
-printf '%s' '{"proposals":[{"type":"new","confidence":"high","target_skill":null,"evidence":[{"session":"mock-session","pattern":"repeated shell workflow"}],"body":"# Codex Skill\n\nUse codex scanner defaults."}]}' > "$last_message_file"
+staged_session="$(find "$cd_dir/sessions" -name '*.jsonl' | head -n 1)"
+[ -n "$staged_session" ] || exit 36
+printf '%s\n' "{\"type\":\"item.completed\",\"item\":{\"type\":\"command_execution\",\"command\":\"sed -n '1,40p' $staged_session\"}}"
+printf '%s' "{\"inspected_files\":[\"$staged_session\"],\"file_findings\":[{\"session\":\"$staged_session\",\"summary\":\"repeated shell workflow\"}],\"proposals\":[{\"type\":\"new\",\"confidence\":\"high\",\"target_skill\":null,\"evidence\":[{\"session\":\"$staged_session\",\"pattern\":\"repeated shell workflow\"}],\"body\":\"# Codex Skill\\n\\nUse codex scanner defaults.\"}]}" > "$last_message_file"
 "##;
     fs::write(&mock_codex, script).unwrap();
     {
@@ -300,6 +321,9 @@ printf '%s' '{"proposals":[{"type":"new","confidence":"high","target_skill":null
         .assert()
         .success()
         .stdout(predicate::str::contains("Found 1 session(s) to analyze."))
+        .stdout(predicate::str::contains(
+            "Inspecting 1 staged session file(s)",
+        ))
         .stdout(predicate::str::contains("Agent proposed 1 skill(s)."));
 
     let proposals_dir = dir.path().join(".distill").join("proposals");
@@ -316,14 +340,21 @@ printf '%s' '{"proposals":[{"type":"new","confidence":"high","target_skill":null
     let proposal_text = fs::read_to_string(&proposal_paths[0]).unwrap();
     assert!(proposal_text.contains("Codex Skill"));
     assert!(proposal_text.contains("type: new"));
+    assert!(proposal_text.contains("session-1.jsonl"));
 
     let watermark = fs::read_to_string(dir.path().join(".distill").join("last-scan.json")).unwrap();
-    assert!(watermark.contains("session-1"));
+    assert!(watermark.contains("timestamp"));
+    assert!(
+        !dir.path()
+            .join(".distill")
+            .join("scan-backlog.json")
+            .exists()
+    );
 }
 
 #[cfg(unix)]
 #[test]
-fn test_e2e_scan_reports_existing_shared_skills_and_excerpt_flow() {
+fn test_e2e_scan_reports_existing_shared_skills_and_manifest_flow() {
     let dir = tempfile::tempdir().unwrap();
     seed_config_with(dir.path(), "fake-proposal-agent.sh", true, false);
 
@@ -357,8 +388,11 @@ fn test_e2e_scan_reports_existing_shared_skills_and_excerpt_flow() {
     write_executable_script(
         &fake_agent,
         r#"#!/bin/sh
-cat > /dev/null
-printf '%s' '{"proposals":[]}'
+prompt_file="$HOME/.distill/last-scan-prompt.txt"
+cat > "$prompt_file"
+staged_session="$(find "$PWD/sessions" -name '*.jsonl' | head -n 1)"
+[ -n "$staged_session" ] || exit 21
+printf '%s' "{\"inspected_files\":[\"$staged_session\"],\"file_findings\":[{\"session\":\"$staged_session\",\"summary\":\"No reusable signal.\"}],\"proposals\":[]}"
 "#,
     );
 
@@ -376,9 +410,16 @@ printf '%s' '{"proposals":[]}'
         .stdout(predicate::str::contains("Found 1 session(s) to analyze."))
         .stdout(predicate::str::contains("Loaded 2 existing skill(s)."))
         .stdout(predicate::str::contains(
-            "Sending excerpts from 1 session file(s)",
+            "Inspecting 1 staged session file(s)",
         ))
         .stdout(predicate::str::contains("Agent proposed 0 skill(s)."));
+
+    let prompt = fs::read_to_string(dir.path().join(".distill/last-scan-prompt.txt")).unwrap();
+    assert!(prompt.contains("Candidate Session Files"));
+    assert!(prompt.contains("manifest.json"));
+    assert!(prompt.contains("review"));
+    assert!(!prompt.contains("Session Excerpts"));
+    assert!(!prompt.contains("extract workflow"));
 }
 
 #[cfg(unix)]
@@ -394,7 +435,9 @@ fn test_e2e_preference_learning_roundtrip_review_to_scan_prompt() {
         r#"#!/bin/sh
 prompt_file="$HOME/.distill/last-scan-prompt.txt"
 cat > "$prompt_file"
-printf '%s' '{"proposals":[]}'
+staged_session="$(find "$PWD/sessions" -name '*.jsonl' | head -n 1)"
+[ -n "$staged_session" ] || exit 22
+printf '%s' "{\"inspected_files\":[\"$staged_session\"],\"file_findings\":[{\"session\":\"$staged_session\",\"summary\":\"Repeated git workflow.\"}],\"proposals\":[]}"
 "#,
     );
 
@@ -459,6 +502,222 @@ printf '%s' '{"proposals":[]}'
     assert!(prompt.contains("Learned Preferences From Past Reviews"));
     assert!(prompt.contains("Prioritize categories the user usually accepts"));
     assert!(prompt.contains("git (accepted 3, rejected 0)"));
+    assert!(prompt.contains("Candidate Session Files"));
+    assert!(!prompt.contains("reuse git rebase flow"));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_e2e_scan_claude_stream_json_with_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_config_with(dir.path(), "claude", true, false);
+
+    let sessions_dir = dir.path().join(".claude").join("projects").join("demo");
+    fs::create_dir_all(&sessions_dir).unwrap();
+    fs::write(
+        sessions_dir.join("session-1.jsonl"),
+        r#"{"timestamp":"2026-03-10T12:00:00Z","role":"user","content":"repeat the release checklist"}"#,
+    )
+    .unwrap();
+
+    let bin_dir = dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let mock_claude = bin_dir.join("claude");
+    write_executable_script(
+        &mock_claude,
+        r##"#!/bin/sh
+cat > /dev/null
+staged_session="$(find "$PWD/sessions" -name '*.jsonl' | head -n 1)"
+[ -n "$staged_session" ] || exit 41
+printf '%s\n' "{\"type\":\"tool_use\",\"tool\":\"Read\",\"path\":\"$staged_session\"}"
+printf '%s\n' "{\"type\":\"result\",\"structured_output\":{\"inspected_files\":[\"$staged_session\"],\"file_findings\":[{\"session\":\"$staged_session\",\"summary\":\"Repeated release checklist.\"}],\"proposals\":[{\"type\":\"new\",\"confidence\":\"medium\",\"target_skill\":null,\"evidence\":[{\"session\":\"$staged_session\",\"pattern\":\"Repeated release checklist.\"}],\"body\":\"# Release Checklist\\n\\nUse a consistent release checklist.\"}]}}"
+"##,
+    );
+
+    let path_env = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    distill_cmd(dir.path())
+        .env("PATH", path_env)
+        .args(["scan", "--now"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Inspecting 1 staged session file(s)",
+        ))
+        .stdout(predicate::str::contains("Agent proposed 1 skill(s)."));
+
+    let proposals_dir = dir.path().join(".distill").join("proposals");
+    let proposal_paths: Vec<_> = fs::read_dir(&proposals_dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .collect();
+    assert_eq!(proposal_paths.len(), 1);
+    let proposal_text = fs::read_to_string(&proposal_paths[0]).unwrap();
+    assert!(proposal_text.contains("Release Checklist"));
+    assert!(proposal_text.contains("session-1.jsonl"));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_e2e_scan_rejects_missing_coverage_and_keeps_backlog() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_config_with(dir.path(), "fake-proposal-agent.sh", true, false);
+
+    let sessions_dir = dir.path().join(".claude").join("projects").join("demo");
+    fs::create_dir_all(&sessions_dir).unwrap();
+    fs::write(
+        sessions_dir.join("session-1.jsonl"),
+        r#"{"timestamp":"2026-03-10T12:00:00Z","role":"user","content":"extract workflow"}"#,
+    )
+    .unwrap();
+
+    let bin_dir = dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let fake_agent = bin_dir.join("fake-proposal-agent.sh");
+    write_executable_script(
+        &fake_agent,
+        r#"#!/bin/sh
+cat > /dev/null
+printf '%s' '{"inspected_files":[],"file_findings":[],"proposals":[]}'
+"#,
+    );
+
+    let path_env = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    distill_cmd(dir.path())
+        .env("PATH", path_env)
+        .args(["scan", "--now"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("inspected_files"));
+
+    let backlog = fs::read_to_string(dir.path().join(".distill/scan-backlog.json")).unwrap();
+    assert!(backlog.contains("session-1.jsonl"));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_e2e_scan_first_run_uses_newest_batch_then_drains_backlog() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_config_with(dir.path(), "fake-proposal-agent.sh", true, false);
+
+    let sessions_dir = dir.path().join(".claude").join("projects").join("demo");
+    fs::create_dir_all(&sessions_dir).unwrap();
+    for (name, touch_time) in [
+        ("session-old.jsonl", "202603101200"),
+        ("session-mid.jsonl", "202603101300"),
+        ("session-new.jsonl", "202603101400"),
+    ] {
+        let path = sessions_dir.join(name);
+        fs::write(&path, r#"{"role":"user","content":"repeat workflow"}"#).unwrap();
+        let status = std::process::Command::new("touch")
+            .args(["-t", touch_time, path.to_str().unwrap()])
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    let bin_dir = dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let fake_agent = bin_dir.join("fake-proposal-agent.sh");
+    write_executable_script(
+        &fake_agent,
+        r#"#!/bin/sh
+cat > /dev/null
+staged_session="$(find "$PWD/sessions" -name '*.jsonl' | head -n 1)"
+[ -n "$staged_session" ] || exit 51
+basename "$staged_session" >> "$HOME/.distill/seen-batches.txt"
+printf '%s' "{\"inspected_files\":[\"$staged_session\"],\"file_findings\":[{\"session\":\"$staged_session\",\"summary\":\"Covered.\"}],\"proposals\":[]}"
+"#,
+    );
+
+    let path_env = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    distill_cmd(dir.path())
+        .env("PATH", &path_env)
+        .env("DISTILL_SCAN_BATCH_SIZE", "1")
+        .args(["scan", "--now"])
+        .assert()
+        .success();
+
+    distill_cmd(dir.path())
+        .env("PATH", &path_env)
+        .env("DISTILL_SCAN_BATCH_SIZE", "1")
+        .args(["scan", "--now"])
+        .assert()
+        .success();
+
+    let seen = fs::read_to_string(dir.path().join(".distill/seen-batches.txt")).unwrap();
+    let lines = seen.lines().collect::<Vec<_>>();
+    assert_eq!(
+        lines,
+        vec!["0001-session-new.jsonl", "0001-session-mid.jsonl"]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_e2e_scan_debug_dir_captures_workspace_and_outputs() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_config_with(dir.path(), "fake-proposal-agent.sh", true, false);
+
+    let sessions_dir = dir.path().join(".claude").join("projects").join("demo");
+    fs::create_dir_all(&sessions_dir).unwrap();
+    fs::write(
+        sessions_dir.join("session-1.jsonl"),
+        r#"{"timestamp":"2026-03-10T12:00:00Z","role":"user","content":"extract workflow"}"#,
+    )
+    .unwrap();
+
+    let bin_dir = dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let fake_agent = bin_dir.join("fake-proposal-agent.sh");
+    write_executable_script(
+        &fake_agent,
+        r#"#!/bin/sh
+cat > /dev/null
+staged_session="$(find "$PWD/sessions" -name '*.jsonl' | head -n 1)"
+[ -n "$staged_session" ] || exit 61
+printf '%s' "{\"inspected_files\":[\"$staged_session\"],\"file_findings\":[{\"session\":\"$staged_session\",\"summary\":\"Covered.\"}],\"proposals\":[]}"
+"#,
+    );
+
+    let debug_dir = dir.path().join("scan-debug");
+    let path_env = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    distill_cmd(dir.path())
+        .env("PATH", path_env)
+        .env("DISTILL_SCAN_DEBUG_DIR", &debug_dir)
+        .args(["scan", "--now"])
+        .assert()
+        .success();
+
+    let run_dirs: Vec<_> = fs::read_dir(&debug_dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .collect();
+    assert_eq!(run_dirs.len(), 1);
+    let run_dir = &run_dirs[0];
+    assert!(run_dir.join("prompt.txt").is_file());
+    assert!(run_dir.join("agent-stdout.log").is_file());
+    assert!(run_dir.join("parsed-response.json").is_file());
+    assert!(run_dir.join("workspace/manifest.json").is_file());
 }
 // ---------------------------------------------------------------------------
 // Test 5 — full flow: seed config → verify status → verify proposals → verify notify

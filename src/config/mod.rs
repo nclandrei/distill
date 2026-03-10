@@ -167,6 +167,11 @@ impl Config {
         Self::base_dir().join("last-scan.json")
     }
 
+    /// Returns the scan-backlog.json path
+    pub fn scan_backlog_path() -> PathBuf {
+        Self::base_dir().join("scan-backlog.json")
+    }
+
     /// Returns the last-sync-agents.json path
     pub fn last_sync_agents_path() -> PathBuf {
         Self::base_dir().join("last-sync-agents.json")
