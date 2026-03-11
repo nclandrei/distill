@@ -78,8 +78,8 @@ Pushing to `main` triggers the release workflow. When the version in `Cargo.toml
 - updates the Homebrew formula in `nclandrei/homebrew-tap`
 
 The workflow creates the `v<version>` tag automatically. You do not need to push tags manually.
-If the current version is already released, the workflow exits without publishing again.
-For a retry of the current version, use GitHub Actions `workflow_dispatch` on the `Release` workflow.
+If a non-draft GitHub release for the current version already exists, automatic `push` runs exit without rebuilding artifacts.
+For an intentional retry of the current version, use GitHub Actions `workflow_dispatch` on the `Release` workflow.
 
 Required GitHub Actions secrets:
 - `CARGO_REGISTRY_TOKEN`: crates.io API token with publish access for `distill-cli`

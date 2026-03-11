@@ -48,11 +48,6 @@ jobs:
             release_is_draft="$(jq -r '.isDraft' /tmp/release.json)"
           fi
 
-          crate_published=false
-          if curl -fsS "https://crates.io/api/v1/crates/${crate_name}/${release_version}" >/dev/null; then
-            crate_published=true
-          fi
-
           tag_exists=false
           tag_commit=""
           if git rev-parse "$release_tag" >/dev/null 2>&1; then
@@ -61,8 +56,8 @@ jobs:
           fi
 
           release_needed=true
-          if [ "$EVENT_NAME" != "workflow_dispatch" ] && [ "$release_exists" = true ] && [ "$release_is_draft" = false ] && [ "$crate_published" = true ]; then
-            echo "::notice::Release ${release_tag} is already published; skipping."
+          if [ "$EVENT_NAME" != "workflow_dispatch" ] && [ "$release_exists" = true ] && [ "$release_is_draft" = false ]; then
+            echo "::notice::Release ${release_tag} is already published; skipping automatic rebuild so release assets and Homebrew checksums stay stable."
             release_needed=false
           elif [ "$EVENT_NAME" != "workflow_dispatch" ] && [ "$tag_exists" = true ] && [ "$tag_commit" != "$head_commit" ]; then
             echo "::notice::Version ${release_version} is already tagged on a different commit. Bump Cargo.toml before the next automatic release."

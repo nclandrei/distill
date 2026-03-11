@@ -144,5 +144,5 @@ screencapture -x -i /absolute/path/selection.png
 ## Release Workflow Notes
 
 - `Release` workflow runs on push to `main` (and `workflow_dispatch`) and auto-manages the `v<version>` tag from `Cargo.toml`.
-- If a non-draft GitHub release exists and the crate version is already on crates.io, the workflow skips duplicate publishing.
+- If a non-draft GitHub release already exists for the current version, automatic `push` runs skip duplicate publishing.
 - Successful runs publish artifacts to GitHub Releases, publish `distill-cli` to crates.io, and update `nclandrei/homebrew-tap`.
