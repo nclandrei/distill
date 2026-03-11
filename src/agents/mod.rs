@@ -237,7 +237,8 @@ impl Agent for ClaudeAdapter {
 // ---------------------------------------------------------------------------
 
 /// Codex adapter — reads from ~/.codex/, writes skills to
-/// ~/.agents/skills/<skill-name>/SKILL.md
+/// ~/.codex/skills/<skill-name>/SKILL.md and mirrors them to
+/// ~/.agents/skills/<skill-name>/SKILL.md for shared compatibility.
 pub struct CodexAdapter {
     pub home: PathBuf,
 }
@@ -276,21 +277,27 @@ impl Agent for CodexAdapter {
     }
 
     fn write_skill(&self, skill: &Skill) -> Result<()> {
-        let target = self
-            .home
-            .join(".agents")
-            .join("skills")
-            .join(&skill.name)
-            .join("SKILL.md");
-        // Ensure the parent directory exists
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)?;
+        let targets = [
+            self.config_dir()
+                .join("skills")
+                .join(&skill.name)
+                .join("SKILL.md"),
+            self.home
+                .join(".agents")
+                .join("skills")
+                .join(&skill.name)
+                .join("SKILL.md"),
+        ];
+
+        for target in targets {
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let existing = std::fs::read_to_string(&target).unwrap_or_default();
+            if existing != skill.content {
+                std::fs::write(&target, &skill.content)?;
+            }
         }
-        let existing = std::fs::read_to_string(&target).unwrap_or_default();
-        if existing == skill.content {
-            return Ok(());
-        }
-        std::fs::write(&target, &skill.content)?;
         Ok(())
     }
 
@@ -394,14 +401,20 @@ mod tests {
         };
 
         adapter.write_skill(&skill).unwrap();
-        let first =
+        let first_codex =
+            std::fs::read_to_string(home.join(".codex/skills/test-skill/SKILL.md")).unwrap();
+        let first_shared =
             std::fs::read_to_string(home.join(".agents/skills/test-skill/SKILL.md")).unwrap();
 
         adapter.write_skill(&skill).unwrap();
-        let second =
+        let second_codex =
+            std::fs::read_to_string(home.join(".codex/skills/test-skill/SKILL.md")).unwrap();
+        let second_shared =
             std::fs::read_to_string(home.join(".agents/skills/test-skill/SKILL.md")).unwrap();
 
-        assert_eq!(first, second);
+        assert_eq!(first_codex, second_codex);
+        assert_eq!(first_shared, second_shared);
+        assert_eq!(first_codex, first_shared);
     }
 
     #[test]
@@ -656,9 +669,12 @@ mod tests {
             content: "created automatically".into(),
         };
         adapter.write_skill(&skill).unwrap();
-        let written =
+        let codex_written =
+            std::fs::read_to_string(home.join(".codex/skills/auto-dir/SKILL.md")).unwrap();
+        let shared_written =
             std::fs::read_to_string(home.join(".agents/skills/auto-dir/SKILL.md")).unwrap();
-        assert_eq!(written, "created automatically");
+        assert_eq!(codex_written, "created automatically");
+        assert_eq!(shared_written, "created automatically");
     }
 
     // --- write_skill: multiple distinct skills are all written ---
@@ -707,11 +723,18 @@ mod tests {
         adapter.write_skill(&skill_a).unwrap();
         adapter.write_skill(&skill_b).unwrap();
 
-        let written_a =
+        let codex_written_a =
+            std::fs::read_to_string(home.join(".codex/skills/alpha/SKILL.md")).unwrap();
+        let codex_written_b =
+            std::fs::read_to_string(home.join(".codex/skills/beta/SKILL.md")).unwrap();
+        let shared_written_a =
             std::fs::read_to_string(home.join(".agents/skills/alpha/SKILL.md")).unwrap();
-        let written_b = std::fs::read_to_string(home.join(".agents/skills/beta/SKILL.md")).unwrap();
-        assert_eq!(written_a, "Alpha content");
-        assert_eq!(written_b, "Beta content");
+        let shared_written_b =
+            std::fs::read_to_string(home.join(".agents/skills/beta/SKILL.md")).unwrap();
+        assert_eq!(codex_written_a, "Alpha content");
+        assert_eq!(codex_written_b, "Beta content");
+        assert_eq!(shared_written_a, "Alpha content");
+        assert_eq!(shared_written_b, "Beta content");
     }
 
     // --- session content is not read (agent reads files itself) ---
