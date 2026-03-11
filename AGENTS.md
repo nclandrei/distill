@@ -10,6 +10,31 @@ Prefer the `distill_verify_session.sh` helper for repeatable test sessions.
 - `skills/distill-verify/SKILL.md`: Distill-specific Ghostty/tmux verification flow for this repo.
 - `skills/add-coding-agent/SKILL.md`: End-to-end checklist for adding a new supported coding agent to Distill.
 
+## Distill CLI For Agents
+
+Prefer Distill's non-interactive JSON flows over the TUI when operating the tool from an agent.
+
+- Supported agent names in config/JSON are `claude`, `codex`, and `opencode`.
+- Preferred one-shot onboarding flow:
+
+```bash
+distill onboard --write-json onboarding.json
+# edit onboarding.json
+distill onboard --apply-json onboarding.json
+```
+
+- Preferred one-shot review flow:
+
+```bash
+distill review --write-json review.json
+# set proposal decisions: accept | reject | skip
+distill review --apply-json review.json
+```
+
+- Use `distill scan --now` for a non-interactive scan run.
+- `--write-json -` writes to stdout and `--apply-json -` reads from stdin.
+- If `distill` onboarding is invoked without a TTY, expect it to fail closed and print the JSON-mode commands instead of launching the TUI.
+
 ## Terminal Control Model
 
 Use Ghostty window(s) backed by tmux sessions for both visual and non-visual work.
