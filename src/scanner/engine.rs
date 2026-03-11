@@ -19,6 +19,7 @@ use crate::config::Config;
 use crate::preferences::PreferenceProfile;
 use crate::proposals::{
     Confidence, Evidence, Proposal, ProposalFrontmatter, ProposalTarget, ProposalType,
+    infer_skill_name_from_body,
 };
 use crate::scanner::reader::{self, LastScan};
 use crate::sync::SkillSource;
@@ -1282,7 +1283,7 @@ fn build_prompt(manifest: &ScanManifest, preferences: &PreferenceProfile) -> Str
          Each proposal object in `proposals` must have these fields:\n\
          - \"type\": one of \"new\", \"improve\", \"edit\", \"remove\"\n\
          - \"confidence\": one of \"high\", \"medium\", \"low\"\n\
-         - \"target_skill\": string (required for improve/edit/remove, null for new)\n\
+         - \"target_skill\": string containing the canonical skill name in kebab-case; for `new`, set it to the new skill's name, and for `improve`/`edit`/`remove`, set it to the existing skill name\n\
          - \"evidence\": array of {\"session\": \"<staged path>\", \"pattern\": \"<description>\"}\n\
          - \"body\": string containing the full proposed skill content in markdown\n\n\
          For each proposal body, use this markdown structure:\n\
@@ -1290,7 +1291,11 @@ fn build_prompt(manifest: &ScanManifest, preferences: &PreferenceProfile) -> Str
          - `## When to use`\n\
          - `## Steps`\n\
          - `## Verification`\n\
-         - `## Pitfalls`\n\n",
+         - `## Pitfalls`\n\
+         For `improve` and `edit` proposals targeting an existing skill:\n\
+         - treat the proposal body as the full replacement for that skill's `SKILL.md`\n\
+         - preserve any existing YAML frontmatter unless the evidence explicitly requires changing it\n\
+         - make the smallest complete-file update that fixes the evidence; do not drop unrelated sections or command arguments\n\n",
     );
 
     prompt.push_str(&format!(
@@ -1964,14 +1969,13 @@ fn convert_raw_proposal(raw_proposal: RawProposal, workspace_root: &Path) -> Res
         other => bail!("Unknown confidence level: {other}"),
     };
 
-    let target_skill_is_present = raw_proposal
+    let target_skill = raw_proposal
         .target_skill
-        .as_deref()
-        .is_some_and(|name| !name.trim().is_empty());
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty());
+    let target_skill_is_present = target_skill.as_deref().is_some();
+    let should_derive_new_target = proposal_type == ProposalType::New;
     match proposal_type {
-        ProposalType::New if target_skill_is_present => {
-            bail!("Proposal type `new` must set `target_skill` to null");
-        }
         ProposalType::Improve | ProposalType::Edit | ProposalType::Remove
             if !target_skill_is_present =>
         {
@@ -2002,8 +2006,14 @@ fn convert_raw_proposal(raw_proposal: RawProposal, workspace_root: &Path) -> Res
         frontmatter: ProposalFrontmatter {
             proposal_type,
             confidence,
-            target: raw_proposal
-                .target_skill
+            target: target_skill
+                .or_else(|| {
+                    if should_derive_new_target {
+                        infer_skill_name_from_body(&raw_proposal.body)
+                    } else {
+                        None
+                    }
+                })
                 .map(|name| ProposalTarget::Skill { name }),
             target_skill: None,
             evidence,

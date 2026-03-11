@@ -19,13 +19,16 @@ use ratatui::{
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{self, IsTerminal, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
 use crate::agents::{AgentKind, from_kind};
 use crate::config::Config;
-use crate::proposals::{Proposal, ProposalTarget, ProposalType};
+use crate::proposals::{
+    Proposal, ProposalTarget, ProposalType, infer_skill_filename_from_body,
+    infer_skill_name_from_body,
+};
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -146,20 +149,29 @@ pub fn log_decision(history_dir: &Path, entry: &HistoryEntry) -> Result<()> {
 ///
 /// Priority:
 /// 1. `target_skill` frontmatter field — normalised to a slug, with `.md` appended.
-/// 2. The proposal's own filename (kept as-is, since it already ends with `.md`).
-/// 3. A timestamp-based fallback.
+/// 2. For `new` proposals without an explicit target, derive the filename from
+///    the proposal title (`# <Skill Name>`).
+/// 3. The proposal's own filename (kept as-is, since it already ends with `.md`).
+/// 4. A timestamp-based fallback.
 fn normalize_target_skill_filename(target: &str) -> String {
-    let slug = target.trim().to_lowercase().replace([' ', '_'], "-");
-    if slug.ends_with(".md") {
-        slug
-    } else {
-        format!("{slug}.md")
-    }
+    format!("{}.md", normalize_target_skill_name(target))
+}
+
+fn normalize_target_skill_name(target: &str) -> String {
+    target
+        .trim()
+        .trim_end_matches(".md")
+        .to_lowercase()
+        .replace([' ', '_'], "-")
 }
 
 fn skill_filename_for(proposal: &Proposal) -> String {
     if let Some(ProposalTarget::Skill { name }) = proposal.frontmatter.resolved_target() {
         normalize_target_skill_filename(&name)
+    } else if proposal.frontmatter.proposal_type == ProposalType::New {
+        infer_skill_filename_from_body(&proposal.body)
+            .or_else(|| proposal.filename.clone())
+            .unwrap_or_else(|| format!("skill-{}.md", Utc::now().timestamp()))
     } else if let Some(filename) = &proposal.filename {
         filename.clone()
     } else {
@@ -178,6 +190,87 @@ fn validate_file_target_path(path: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn extract_leading_frontmatter(input: &str) -> Option<&str> {
+    if !input.starts_with("---\n") {
+        return None;
+    }
+
+    let after_first = &input[4..];
+    if let Some(end) = after_first.find("\n---\n") {
+        return Some(&input[..(4 + end + 5)]);
+    }
+    if let Some(end) = after_first.find("\n---") {
+        return Some(&input[..(4 + end + 4)]);
+    }
+
+    None
+}
+
+fn preserve_existing_frontmatter(existing: &str, proposed: &str) -> String {
+    if extract_leading_frontmatter(proposed).is_some() {
+        return proposed.to_string();
+    }
+
+    let Some(frontmatter) = extract_leading_frontmatter(existing) else {
+        return proposed.to_string();
+    };
+
+    format!("{frontmatter}\n{}", proposed.trim_start_matches('\n'))
+}
+
+fn skill_source_roots(skills_dir: &Path, extra_roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut roots = vec![skills_dir.to_path_buf()];
+    roots.extend(extra_roots.iter().cloned());
+    roots
+}
+
+fn resolve_existing_skill_source_path(
+    name: &str,
+    skill_roots: &[PathBuf],
+) -> Result<Option<PathBuf>> {
+    let normalized = normalize_target_skill_name(name);
+    Ok(crate::sync::load_skill_sources_from_dirs(skill_roots)?
+        .into_iter()
+        .find(|source| source.skill.name == normalized)
+        .map(|source| source.source_path))
+}
+
+fn resolve_skill_write_path(
+    proposal: &Proposal,
+    skills_dir: &Path,
+    skill_roots: &[PathBuf],
+) -> Result<PathBuf> {
+    if let Some(ProposalTarget::Skill { name }) = proposal.frontmatter.resolved_target() {
+        if let Some(existing) = resolve_existing_skill_source_path(&name, skill_roots)? {
+            return Ok(existing);
+        }
+        return Ok(skills_dir.join(normalize_target_skill_filename(&name)));
+    }
+
+    Ok(skills_dir.join(skill_filename_for(proposal)))
+}
+
+fn remove_skill_at_path(skill_path: &Path) -> Result<()> {
+    if skill_path.file_name().and_then(|name| name.to_str()) == Some("SKILL.md") {
+        let entry_path = skill_path
+            .parent()
+            .context("Skill directory target is missing its parent directory")?;
+        let metadata = fs::symlink_metadata(entry_path)
+            .with_context(|| format!("Failed to inspect skill path {}", entry_path.display()))?;
+        if metadata.file_type().is_symlink() {
+            fs::remove_file(entry_path)
+                .with_context(|| format!("Failed to remove skill symlink {}", entry_path.display()))
+        } else {
+            fs::remove_dir_all(entry_path).with_context(|| {
+                format!("Failed to remove skill directory {}", entry_path.display())
+            })
+        }
+    } else {
+        fs::remove_file(skill_path)
+            .with_context(|| format!("Failed to remove skill {}", skill_path.display()))
+    }
 }
 
 fn proposal_affects_skill(proposal: &Proposal) -> bool {
@@ -338,10 +431,27 @@ pub fn accept_proposal(
     history_dir: &Path,
     proposals_dir: &Path,
 ) -> Result<()> {
+    accept_proposal_with_skill_roots(
+        proposal,
+        skills_dir,
+        &[Config::shared_skills_dir()],
+        history_dir,
+        proposals_dir,
+    )
+}
+
+fn accept_proposal_with_skill_roots(
+    proposal: &Proposal,
+    skills_dir: &Path,
+    extra_skill_roots: &[PathBuf],
+    history_dir: &Path,
+    proposals_dir: &Path,
+) -> Result<()> {
     let proposal_filename = proposal
         .filename
         .clone()
         .unwrap_or_else(|| skill_filename_for(proposal));
+    let skill_roots = skill_source_roots(skills_dir, extra_skill_roots);
 
     match proposal.frontmatter.proposal_type {
         ProposalType::Remove => {
@@ -351,12 +461,10 @@ pub fn accept_proposal(
                 .context("Remove proposal is missing target information")?
             {
                 ProposalTarget::Skill { name } => {
-                    let skill_file = normalize_target_skill_filename(&name);
-                    let skill_path = skills_dir.join(&skill_file);
+                    let skill_path = resolve_existing_skill_source_path(&name, &skill_roots)?
+                        .unwrap_or_else(|| skills_dir.join(normalize_target_skill_filename(&name)));
                     if skill_path.exists() {
-                        fs::remove_file(&skill_path).with_context(|| {
-                            format!("Failed to remove skill {}", skill_path.display())
-                        })?;
+                        remove_skill_at_path(&skill_path)?;
                     }
                 }
                 ProposalTarget::File { path } => {
@@ -386,15 +494,24 @@ pub fn accept_proposal(
                     format!("Failed to write target file {}", target_path.display())
                 })?;
             } else {
-                let skill_file = skill_filename_for(proposal);
-                fs::create_dir_all(skills_dir).with_context(|| {
-                    format!(
-                        "Failed to create skills directory: {}",
-                        skills_dir.display()
-                    )
-                })?;
-                let skill_path = skills_dir.join(&skill_file);
-                fs::write(&skill_path, &proposal.body).with_context(|| {
+                let skill_path = resolve_skill_write_path(proposal, skills_dir, &skill_roots)?;
+                let body = if skill_path.exists() {
+                    let existing = fs::read_to_string(&skill_path).with_context(|| {
+                        format!("Failed to read existing skill {}", skill_path.display())
+                    })?;
+                    preserve_existing_frontmatter(&existing, &proposal.body)
+                } else {
+                    proposal.body.clone()
+                };
+                if let Some(parent) = skill_path.parent() {
+                    fs::create_dir_all(parent).with_context(|| {
+                        format!(
+                            "Failed to create skill parent directory: {}",
+                            parent.display()
+                        )
+                    })?;
+                }
+                fs::write(&skill_path, body).with_context(|| {
                     format!("Failed to write skill to {}", skill_path.display())
                 })?;
             }
@@ -923,6 +1040,11 @@ fn proposal_details_text(proposal: &Proposal, skills_dir: &Path) -> String {
     let target = match proposal.frontmatter.resolved_target() {
         Some(ProposalTarget::Skill { name }) => format!("skill:{name}"),
         Some(ProposalTarget::File { path }) => format!("file:{path}"),
+        None if proposal.frontmatter.proposal_type == ProposalType::New => {
+            infer_skill_name_from_body(&proposal.body)
+                .map(|name| format!("skill:{name} (derived from title)"))
+                .unwrap_or_else(|| "(new skill)".to_string())
+        }
         None => "(new skill)".to_string(),
     };
 
@@ -1237,7 +1359,7 @@ fn reload_edited_proposal(path: &Path, filename: &str) -> Result<Proposal> {
     Ok(proposal)
 }
 
-/// Load config and sync all skills in `skills_dir` to all enabled agents.
+/// Load config and sync all skills in the local and shared roots to enabled agents.
 fn sync_after_review(skills_dir: &Path) -> Result<crate::sync::SyncReport> {
     let home = std::env::var("HOME")
         .map(std::path::PathBuf::from)
@@ -1257,7 +1379,10 @@ fn sync_after_review(skills_dir: &Path) -> Result<crate::sync::SyncReport> {
         })
         .collect();
 
-    crate::sync::run_sync(skills_dir, &agents)
+    crate::sync::run_sync_from_dirs(
+        &[skills_dir.to_path_buf(), Config::shared_skills_dir()],
+        &agents,
+    )
 }
 
 fn execute_intent(
@@ -1835,6 +1960,94 @@ mod tests {
             !other_path.exists(),
             "should NOT write to the proposal filename when target_skill is set"
         );
+    }
+
+    #[test]
+    fn test_accept_new_proposal_uses_body_title_when_target_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills_dir = dir.path().join("skills");
+        let history_dir = dir.path().join("history");
+        let proposals_dir = dir.path().join("proposals");
+        fs::create_dir_all(&proposals_dir).unwrap();
+
+        let proposal = make_proposal(
+            "new-20260311-102136-0.md",
+            None,
+            "# Sync AGENTS.md\n\nKeep the repo guide in sync.",
+        );
+        write_proposal_file(&proposals_dir, &proposal);
+
+        accept_proposal(&proposal, &skills_dir, &history_dir, &proposals_dir).unwrap();
+
+        assert!(skills_dir.join("sync-agents-md.md").exists());
+        assert!(!skills_dir.join("new-20260311-102136-0.md").exists());
+    }
+
+    #[test]
+    fn test_accept_improve_updates_existing_shared_skill_source_and_preserves_frontmatter() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills_dir = dir.path().join("skills");
+        let shared_dir = dir.path().join("shared");
+        let history_dir = dir.path().join("history");
+        let proposals_dir = dir.path().join("proposals");
+        fs::create_dir_all(shared_dir.join("jj")).unwrap();
+        fs::create_dir_all(&proposals_dir).unwrap();
+
+        fs::write(
+            shared_dir.join("jj").join("SKILL.md"),
+            "---\nname: jj\ndescription: original\n---\n\n# Jj\n\nOriginal body.\n",
+        )
+        .unwrap();
+        fs::write(shared_dir.join("jj").join("agents.json"), "{}").unwrap();
+
+        let mut proposal = make_proposal("improve-123.md", Some("jj"), "# Jj\n\nUpdated body.\n");
+        proposal.frontmatter.proposal_type = ProposalType::Improve;
+        write_proposal_file(&proposals_dir, &proposal);
+
+        accept_proposal_with_skill_roots(
+            &proposal,
+            &skills_dir,
+            std::slice::from_ref(&shared_dir),
+            &history_dir,
+            &proposals_dir,
+        )
+        .unwrap();
+
+        let shared_skill = shared_dir.join("jj").join("SKILL.md");
+        let content = fs::read_to_string(&shared_skill).unwrap();
+        assert!(content.starts_with("---\nname: jj\ndescription: original\n---\n"));
+        assert!(content.contains("# Jj\n\nUpdated body.\n"));
+        assert!(!skills_dir.join("jj.md").exists());
+        assert!(shared_dir.join("jj").join("agents.json").exists());
+    }
+
+    #[test]
+    fn test_accept_remove_deletes_existing_shared_skill_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills_dir = dir.path().join("skills");
+        let shared_dir = dir.path().join("shared");
+        let history_dir = dir.path().join("history");
+        let proposals_dir = dir.path().join("proposals");
+        fs::create_dir_all(shared_dir.join("jj")).unwrap();
+        fs::create_dir_all(&proposals_dir).unwrap();
+
+        fs::write(shared_dir.join("jj").join("SKILL.md"), "# Jj\n").unwrap();
+        fs::write(shared_dir.join("jj").join("agents.json"), "{}").unwrap();
+
+        let mut proposal = make_proposal("remove-123.md", Some("jj"), "# Remove jj");
+        proposal.frontmatter.proposal_type = ProposalType::Remove;
+        write_proposal_file(&proposals_dir, &proposal);
+
+        accept_proposal_with_skill_roots(
+            &proposal,
+            &skills_dir,
+            std::slice::from_ref(&shared_dir),
+            &history_dir,
+            &proposals_dir,
+        )
+        .unwrap();
+
+        assert!(!shared_dir.join("jj").exists());
     }
 
     #[test]

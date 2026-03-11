@@ -90,11 +90,6 @@ pub fn load_skills_from_dirs(skills_dirs: &[PathBuf]) -> Result<Vec<Skill>> {
         .collect())
 }
 
-/// Read all supported skills from `skills_dir`.
-pub fn load_skills(skills_dir: &Path) -> Result<Vec<Skill>> {
-    load_skills_from_dirs(&[skills_dir.to_path_buf()])
-}
-
 /// For each skill in `skills`, call `write_skill` on every agent in `agents`.
 ///
 /// Errors from individual `write_skill` calls are collected as non-fatal strings
@@ -124,9 +119,12 @@ pub fn sync_skills(skills: &[Skill], agents: &[Box<dyn Agent>]) -> Result<SyncRe
     })
 }
 
-/// Convenience function: load skills from `skills_dir` then sync them to `agents`.
-pub fn run_sync(skills_dir: &Path, agents: &[Box<dyn Agent>]) -> Result<SyncReport> {
-    let skills = load_skills(skills_dir)?;
+/// Convenience function: load skills from multiple roots then sync them to `agents`.
+pub fn run_sync_from_dirs(
+    skills_dirs: &[PathBuf],
+    agents: &[Box<dyn Agent>],
+) -> Result<SyncReport> {
+    let skills = load_skills_from_dirs(skills_dirs)?;
     sync_skills(&skills, agents)
 }
 
@@ -141,7 +139,7 @@ mod tests {
     use std::path::PathBuf;
 
     // ------------------------------------------------------------------
-    // load_skills
+    // load_skills_from_dirs
     // ------------------------------------------------------------------
 
     #[test]
@@ -156,7 +154,7 @@ mod tests {
         .unwrap();
         std::fs::write(skills_dir.join("code-review.md"), "# Code Review\nBe kind.").unwrap();
 
-        let skills = load_skills(&skills_dir).unwrap();
+        let skills = load_skills_from_dirs(&[skills_dir]).unwrap();
 
         assert_eq!(skills.len(), 2);
 
@@ -181,7 +179,7 @@ mod tests {
         std::fs::write(skills_dir.join("data.json"), "{}").unwrap();
         std::fs::write(skills_dir.join("readme.MD"), "uppercase ext").unwrap();
 
-        let skills = load_skills(&skills_dir).unwrap();
+        let skills = load_skills_from_dirs(&[skills_dir]).unwrap();
 
         // Only "real.md" should be picked up (.MD is a different extension on
         // case-sensitive file systems, and .txt / .json are always ignored).
@@ -192,13 +190,14 @@ mod tests {
     #[test]
     fn test_load_skills_empty_dir() {
         let dir = tempfile::tempdir().unwrap();
-        let skills = load_skills(dir.path()).unwrap();
+        let skills = load_skills_from_dirs(&[dir.path().to_path_buf()]).unwrap();
         assert!(skills.is_empty());
     }
 
     #[test]
     fn test_load_skills_nonexistent_dir() {
-        let skills = load_skills(Path::new("/nonexistent/path/skills")).unwrap();
+        let skills =
+            load_skills_from_dirs(&[Path::new("/nonexistent/path/skills").to_path_buf()]).unwrap();
         assert!(skills.is_empty());
     }
 
@@ -215,7 +214,7 @@ mod tests {
         )
         .unwrap();
 
-        let skills = load_skills(&skills_dir).unwrap();
+        let skills = load_skills_from_dirs(&[skills_dir]).unwrap();
 
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "review");
@@ -249,7 +248,7 @@ mod tests {
         std::fs::write(source_dir.join("SKILL.md"), "# Jj\nLand changes.").unwrap();
         symlink(&source_dir, skills_dir.join("jj")).unwrap();
 
-        let skills = load_skills(&skills_dir).unwrap();
+        let skills = load_skills_from_dirs(&[skills_dir]).unwrap();
 
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "jj");
@@ -417,7 +416,7 @@ mod tests {
             Box::new(CodexAdapter::with_home(home.clone())),
         ];
 
-        let report = run_sync(&skills_dir, &agents).unwrap();
+        let report = run_sync_from_dirs(&[skills_dir], &agents).unwrap();
 
         // 2 skills * 2 agents = 4 operations
         assert_eq!(report.synced, 4);
@@ -437,13 +436,43 @@ mod tests {
     }
 
     #[test]
+    fn test_run_sync_from_dirs_includes_shared_directory_skills() {
+        let dir = tempfile::tempdir().unwrap();
+        let local_dir = dir.path().join("local");
+        let shared_dir = dir.path().join("shared");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&local_dir).unwrap();
+        std::fs::create_dir_all(shared_dir.join("jj")).unwrap();
+
+        std::fs::write(
+            shared_dir.join("jj").join("SKILL.md"),
+            "# Jj\nLand carefully.",
+        )
+        .unwrap();
+
+        let agents: Vec<Box<dyn Agent>> = vec![
+            Box::new(ClaudeAdapter::with_home(home.clone())),
+            Box::new(CodexAdapter::with_home(home.clone())),
+        ];
+
+        let report = run_sync_from_dirs(&[local_dir, shared_dir], &agents).unwrap();
+
+        assert_eq!(report.errors, Vec::<String>::new());
+        let claude = std::fs::read_to_string(home.join(".claude/skills/jj/SKILL.md")).unwrap();
+        let codex = std::fs::read_to_string(home.join(".agents/skills/jj/SKILL.md")).unwrap();
+        assert_eq!(claude, "# Jj\nLand carefully.");
+        assert_eq!(codex, "# Jj\nLand carefully.");
+    }
+
+    #[test]
     fn test_run_sync_nonexistent_skills_dir() {
         let home_tmp = tempfile::tempdir().unwrap();
         let home = home_tmp.path().to_path_buf();
 
         let agents: Vec<Box<dyn Agent>> = vec![Box::new(ClaudeAdapter::with_home(home.clone()))];
 
-        let report = run_sync(Path::new("/nonexistent/skills"), &agents).unwrap();
+        let report =
+            run_sync_from_dirs(&[Path::new("/nonexistent/skills").to_path_buf()], &agents).unwrap();
 
         assert_eq!(report.synced, 0);
         assert!(report.errors.is_empty());

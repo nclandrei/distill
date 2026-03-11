@@ -104,6 +104,39 @@ impl Proposal {
     }
 }
 
+fn slugify_skill_name(raw: &str) -> Option<String> {
+    let mut slug = String::new();
+    let mut previous_was_dash = false;
+
+    for ch in raw.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            previous_was_dash = false;
+        } else if !previous_was_dash {
+            slug.push('-');
+            previous_was_dash = true;
+        }
+    }
+
+    let slug = slug.trim_matches('-').to_string();
+    if slug.is_empty() { None } else { Some(slug) }
+}
+
+pub fn infer_skill_name_from_body(body: &str) -> Option<String> {
+    body.lines().find_map(|line| {
+        let heading = line.trim_start().strip_prefix('#')?;
+        let heading = heading.trim_start();
+        if heading.is_empty() {
+            return None;
+        }
+        slugify_skill_name(heading)
+    })
+}
+
+pub fn infer_skill_filename_from_body(body: &str) -> Option<String> {
+    infer_skill_name_from_body(body).map(|name| format!("{name}.md"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,5 +259,18 @@ mod tests {
                 name: "git-workflow".to_string()
             })
         );
+    }
+
+    #[test]
+    fn test_infer_skill_name_from_body_slugifies_markdown_title() {
+        assert_eq!(
+            infer_skill_name_from_body("# Sync AGENTS.md\n\nBody."),
+            Some("sync-agents-md".to_string())
+        );
+    }
+
+    #[test]
+    fn test_infer_skill_name_from_body_returns_none_without_heading() {
+        assert_eq!(infer_skill_name_from_body("No heading here."), None);
     }
 }

@@ -332,7 +332,7 @@ fn test_review_apply_json() {
         dir.path()
             .join(".distill")
             .join("skills")
-            .join("proposal-1.md")
+            .join("skill-1.md")
             .exists(),
         "skill should be written after accept"
     );
@@ -384,7 +384,7 @@ fn test_review_apply_json_stdin() {
         dir.path()
             .join(".distill")
             .join("skills")
-            .join("proposal-stdin.md")
+            .join("skill-stdin.md")
             .exists(),
         "skill should be written after accept"
     );

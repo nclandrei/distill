@@ -208,7 +208,10 @@ fn sync_after_review(skills_dir: &Path) -> Result<crate::sync::SyncReport> {
         })
         .collect();
 
-    crate::sync::run_sync(skills_dir, &agents)
+    crate::sync::run_sync_from_dirs(
+        &[skills_dir.to_path_buf(), Config::shared_skills_dir()],
+        &agents,
+    )
 }
 
 fn proposal_to_spec(proposal: &Proposal) -> ReviewProposalSpec {
