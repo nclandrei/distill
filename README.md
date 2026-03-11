@@ -30,7 +30,7 @@ Icon assets used by notifications and docs:
 - Distill reads local session logs from:
   - Claude: `~/.claude/projects/**/*.jsonl`
   - Codex: `~/.codex/sessions/**/*.jsonl`
-- If a scan stalls because the upstream agent is slow, raise `DISTILL_AGENT_TIMEOUT_SECS` (default: 900 seconds).
+- If a scan stalls because the upstream agent is slow, raise `DISTILL_AGENT_TIMEOUT_SECS` (default: 7200 seconds) or set it to `0` to disable the timeout entirely.
 
 ## Quick Start
 

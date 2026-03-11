@@ -68,7 +68,7 @@ const PROPOSAL_SCHEMA: &str = r#"{
   "required": ["inspected_files", "file_findings", "proposals"]
 }"#;
 
-const DEFAULT_AGENT_TIMEOUT_SECS: u64 = 15 * 60;
+const DEFAULT_AGENT_TIMEOUT_SECS: u64 = 2 * 60 * 60;
 const AGENT_POLL_INTERVAL_MS: u64 = 250;
 const DEFAULT_SCAN_BATCH_SIZE: usize = 200;
 const MAX_AGENT_DIAGNOSTIC_CHARS: usize = 4000;
@@ -434,7 +434,7 @@ fn format_agent_failure(command: &str, output: &std::process::Output, prompt: &s
     )
 }
 
-fn agent_timeout_from_env(raw: Option<&str>) -> Result<Duration> {
+fn agent_timeout_from_env(raw: Option<&str>) -> Result<Option<Duration>> {
     match raw {
         Some(raw) => {
             let secs: u64 = raw.parse().with_context(|| {
@@ -443,15 +443,15 @@ fn agent_timeout_from_env(raw: Option<&str>) -> Result<Duration> {
                 )
             })?;
             if secs == 0 {
-                bail!("DISTILL_AGENT_TIMEOUT_SECS must be greater than 0.");
+                return Ok(None);
             }
-            Ok(Duration::from_secs(secs))
+            Ok(Some(Duration::from_secs(secs)))
         }
-        None => Ok(Duration::from_secs(DEFAULT_AGENT_TIMEOUT_SECS)),
+        None => Ok(Some(Duration::from_secs(DEFAULT_AGENT_TIMEOUT_SECS))),
     }
 }
 
-fn agent_timeout() -> Result<Duration> {
+fn agent_timeout() -> Result<Option<Duration>> {
     match std::env::var("DISTILL_AGENT_TIMEOUT_SECS") {
         Ok(raw) => agent_timeout_from_env(Some(&raw)),
         Err(std::env::VarError::NotPresent) => agent_timeout_from_env(None),
@@ -955,7 +955,7 @@ fn invoke_agent_with_timeout(
     args: &[String],
     prompt: &str,
     workspace_root: &Path,
-    timeout: Duration,
+    timeout: Option<Duration>,
     debug_run_dir: Option<&Path>,
 ) -> Result<AgentInvocation> {
     let mode = proposal_agent_mode(command, args);
@@ -1101,7 +1101,7 @@ fn invoke_agent_with_timeout(
                 }
             },
             Ok(None) => {
-                if wait_started.elapsed() >= timeout {
+                if timeout.is_some_and(|timeout| wait_started.elapsed() >= timeout) {
                     let _ = child.kill();
                     let timed_out_output = child.wait_with_output().ok();
                     stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1131,8 +1131,10 @@ fn invoke_agent_with_timeout(
 
                     cleanup_temp_files(&temp_files);
                     bail!(
-                        "Agent command `{command}` timed out after {}s. Verify the CLI is installed and authenticated, or raise DISTILL_AGENT_TIMEOUT_SECS for slower runs.{details}",
-                        timeout.as_secs()
+                        "Agent command `{command}` timed out after {}s. Verify the CLI is installed and authenticated, raise DISTILL_AGENT_TIMEOUT_SECS for slower runs, or set DISTILL_AGENT_TIMEOUT_SECS=0 to disable the timeout entirely.{details}",
+                        timeout
+                            .expect("timeout should exist when timeout branch is reached")
+                            .as_secs()
                     );
                 }
                 std::thread::sleep(Duration::from_millis(AGENT_POLL_INTERVAL_MS));
@@ -1714,6 +1716,27 @@ mod tests {
                 .map(|session| session.id.as_str())
                 .collect::<Vec<_>>(),
             vec!["existing", "newer", "older-new"]
+        );
+    }
+
+    #[test]
+    fn test_agent_timeout_defaults_to_two_hours() {
+        assert_eq!(
+            agent_timeout_from_env(None).unwrap(),
+            Some(Duration::from_secs(DEFAULT_AGENT_TIMEOUT_SECS))
+        );
+    }
+
+    #[test]
+    fn test_agent_timeout_accepts_zero_to_disable() {
+        assert_eq!(agent_timeout_from_env(Some("0")).unwrap(), None);
+    }
+
+    #[test]
+    fn test_agent_timeout_parses_positive_seconds() {
+        assert_eq!(
+            agent_timeout_from_env(Some("3600")).unwrap(),
+            Some(Duration::from_secs(3600))
         );
     }
 
