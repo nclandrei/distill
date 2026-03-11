@@ -78,7 +78,7 @@ const DEFAULT_AGENT_TIMEOUT_SECS: u64 = 2 * 60 * 60;
 const AGENT_POLL_INTERVAL_MS: u64 = 250;
 const DEFAULT_SCAN_BATCH_SIZE: usize = 200;
 const MAX_AGENT_DIAGNOSTIC_CHARS: usize = 4000;
-const MAX_STAGED_SESSION_STRING_CHARS: usize = 1200;
+const MAX_STAGED_SUMMARY_EXCERPT_CHARS: usize = 500;
 
 pub struct ScanConfig {
     pub agent_command: String,
@@ -1177,7 +1177,7 @@ fn stage_scan_workspace(
             .and_then(|name| name.to_str())
             .unwrap_or("session.jsonl");
         let staged_path = agent_dir.join(format!("{:04}-{}", index + 1, basename));
-        stage_session_file_for_scan(&session.path, &staged_path)?;
+        stage_session_file_for_scan(session, &staged_path)?;
 
         staged_sessions.push(StagedSession {
             session: session.clone(),
@@ -1237,85 +1237,190 @@ fn stage_scan_workspace(
     })
 }
 
-fn stage_session_file_for_scan(source: &Path, destination: &Path) -> Result<()> {
-    let raw = std::fs::read_to_string(source)
-        .with_context(|| format!("Failed to read session {}", source.display()))?;
-    let sanitized = sanitize_session_artifact(&raw);
-    std::fs::write(destination, sanitized).with_context(|| {
+fn stage_session_file_for_scan(session: &Session, destination: &Path) -> Result<()> {
+    let raw = std::fs::read_to_string(&session.path)
+        .with_context(|| format!("Failed to read session {}", session.path.display()))?;
+    let summary = build_staged_session_summary(session, &raw);
+    std::fs::write(destination, summary).with_context(|| {
         format!(
             "Failed to write staged session {} from {}",
             destination.display(),
-            source.display()
+            session.path.display()
         )
     })
 }
 
-fn sanitize_session_artifact(raw: &str) -> String {
-    let mut lines = Vec::new();
+#[derive(Default)]
+struct SessionDigest {
+    user_messages: Vec<String>,
+    assistant_messages: Vec<String>,
+    tool_calls: Vec<String>,
+}
+
+fn build_staged_session_summary(session: &Session, raw: &str) -> String {
+    let digest = extract_session_digest(raw);
+    let mut lines = vec![
+        "# Staged Session Summary".to_string(),
+        format!("Agent: {}", session.agent),
+        format!("Timestamp: {}", session.timestamp.to_rfc3339()),
+        format!("Original path: {}", session.path.display()),
+        "".to_string(),
+        "This file is a compact Distill summary for skill extraction. It intentionally omits large internal prompts, verbose tool output, and encrypted payloads from the raw session log.".to_string(),
+        "".to_string(),
+        "## Latest User Requests".to_string(),
+    ];
+
+    append_summary_section(
+        &mut lines,
+        &digest.user_messages,
+        "No user messages extracted.",
+    );
+
+    lines.push(String::new());
+    lines.push("## Latest Assistant Outcomes".to_string());
+    append_summary_section(
+        &mut lines,
+        &digest.assistant_messages,
+        "No assistant outcomes extracted.",
+    );
+
+    lines.push(String::new());
+    lines.push("## Tool Calls".to_string());
+    if digest.tool_calls.is_empty() {
+        lines.push("- None extracted.".to_string());
+    } else {
+        let mut counts = BTreeMap::new();
+        for tool in &digest.tool_calls {
+            *counts.entry(tool.clone()).or_insert(0usize) += 1;
+        }
+        for (tool, count) in counts {
+            lines.push(format!("- {tool} x{count}"));
+        }
+    }
+
+    lines.push(String::new());
+    lines.join("\n")
+}
+
+fn append_summary_section(lines: &mut Vec<String>, items: &[String], empty_message: &str) {
+    let mut recent = items
+        .iter()
+        .rev()
+        .filter_map(|item| {
+            let excerpt = summarize_session_excerpt(item);
+            if excerpt.is_empty() {
+                None
+            } else {
+                Some(excerpt)
+            }
+        })
+        .take(4)
+        .collect::<Vec<_>>();
+    recent.reverse();
+
+    if recent.is_empty() {
+        lines.push(format!("- {empty_message}"));
+        return;
+    }
+
+    for item in recent {
+        lines.push(format!("- {item}"));
+    }
+}
+
+fn extract_session_digest(raw: &str) -> SessionDigest {
+    let mut digest = SessionDigest::default();
     for line in raw.lines() {
-        if line.trim().is_empty() {
-            lines.push(line.to_string());
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
             continue;
         }
 
-        let sanitized = match serde_json::from_str::<serde_json::Value>(line) {
-            Ok(mut value) => {
-                sanitize_session_value(&mut value, None);
-                serde_json::to_string(&value).unwrap_or_else(|_| line.to_string())
-            }
-            Err(_) => truncate_session_string(line),
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
         };
-        lines.push(sanitized);
+        let event_type = value.get("type").and_then(|item| item.as_str());
+        let payload = value.get("payload");
+
+        match event_type {
+            Some("response_item") => {
+                let Some(payload) = payload else {
+                    continue;
+                };
+                match payload.get("type").and_then(|item| item.as_str()) {
+                    Some("message") => {
+                        let text = extract_response_message_text(payload);
+                        match payload.get("role").and_then(|item| item.as_str()) {
+                            Some("user") => digest.user_messages.push(text),
+                            Some("assistant") => digest.assistant_messages.push(text),
+                            _ => {}
+                        }
+                    }
+                    Some("function_call") => {
+                        if let Some(name) = payload.get("name").and_then(|item| item.as_str()) {
+                            digest.tool_calls.push(name.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Some("event_msg") => {
+                let Some(payload) = payload else {
+                    continue;
+                };
+                match payload.get("type").and_then(|item| item.as_str()) {
+                    Some("user_message") => {
+                        if let Some(message) = payload.get("message").and_then(|item| item.as_str())
+                        {
+                            digest.user_messages.push(message.to_string());
+                        }
+                    }
+                    Some("agent_message") => {
+                        if let Some(message) = payload.get("message").and_then(|item| item.as_str())
+                        {
+                            digest.assistant_messages.push(message.to_string());
+                        }
+                    }
+                    Some("task_complete") => {
+                        if let Some(message) = payload
+                            .get("last_agent_message")
+                            .and_then(|item| item.as_str())
+                        {
+                            digest.assistant_messages.push(message.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
     }
 
-    let mut joined = lines.join("\n");
-    if raw.ends_with('\n') {
-        joined.push('\n');
-    }
-    joined
+    digest
 }
 
-fn sanitize_session_value(value: &mut serde_json::Value, key: Option<&str>) {
-    match value {
-        serde_json::Value::String(text) => {
-            if matches!(key, Some("encrypted_content")) {
-                *text = "<omitted encrypted content>".to_string();
-            } else {
-                *text = truncate_session_string(text);
-            }
-        }
-        serde_json::Value::Array(items) => {
-            for item in items {
-                sanitize_session_value(item, None);
-            }
-        }
-        serde_json::Value::Object(map) => {
-            for (child_key, child_value) in map.iter_mut() {
-                sanitize_session_value(child_value, Some(child_key.as_str()));
-            }
-        }
-        _ => {}
-    }
-}
-
-fn truncate_session_string(input: &str) -> String {
-    if input.chars().count() <= MAX_STAGED_SESSION_STRING_CHARS {
-        return input.to_string();
-    }
-
-    let head_len = MAX_STAGED_SESSION_STRING_CHARS / 2;
-    let tail_len = MAX_STAGED_SESSION_STRING_CHARS / 4;
-    let head: String = input.chars().take(head_len).collect();
-    let tail: String = input
-        .chars()
-        .rev()
-        .take(tail_len)
-        .collect::<Vec<_>>()
+fn extract_response_message_text(payload: &serde_json::Value) -> String {
+    payload
+        .get("content")
+        .and_then(|item| item.as_array())
         .into_iter()
-        .rev()
-        .collect();
-    let omitted = input.chars().count() - head_len - tail_len;
-    format!("{head}\n[... omitted {omitted} chars ...]\n{tail}")
+        .flatten()
+        .filter_map(|item| item.get("text").and_then(|text| text.as_str()))
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn summarize_session_excerpt(input: &str) -> String {
+    let normalized = input.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= MAX_STAGED_SUMMARY_EXCERPT_CHARS {
+        return normalized;
+    }
+
+    let head_len = MAX_STAGED_SUMMARY_EXCERPT_CHARS.saturating_sub(40);
+    let head: String = normalized.chars().take(head_len).collect();
+    let omitted = normalized.chars().count().saturating_sub(head_len);
+    format!("{head} [... omitted {omitted} chars ...]")
 }
 
 fn sanitize_filename(raw: &str) -> String {
@@ -1349,6 +1454,8 @@ fn build_prompt(manifest: &ScanManifest, preferences: &PreferenceProfile) -> Str
          - Prefer `improve`/`edit` when an existing skill already overlaps\n\
          - If evidence is weak, return an empty proposals array, but still cover every session file\n\
          - Every proposal body must be concrete and actionable (no placeholders)\n\n\
+         Staged session files are already compact text summaries prepared by Distill.\n\
+         Read them directly; do not re-parse them as raw JSONL logs.\n\n\
          IMPORTANT: Respond ONLY with valid JSON in this exact wrapper shape:\n\
          {\"inspected_files\": [...], \"file_findings\": [...], \"proposals\": [...]}.\n\
          No markdown fences. No commentary.\n\n\
@@ -2748,7 +2855,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let session_path = dir.path().join("session.jsonl");
         let skill_path = dir.path().join("review.md");
-        std::fs::write(&session_path, "{\"role\":\"user\"}").unwrap();
+        std::fs::write(
+            &session_path,
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Please improve the review flow."}]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
         std::fs::write(&skill_path, "# Review").unwrap();
 
         let session = Session {
@@ -2769,10 +2888,10 @@ mod tests {
         let workspace = stage_scan_workspace(&[session], &[skill_source], None).unwrap();
         assert_eq!(workspace.staged_sessions.len(), 1);
         assert!(workspace.staged_sessions[0].staged_path.is_file());
-        assert_eq!(
-            std::fs::read_to_string(&workspace.staged_sessions[0].staged_path).unwrap(),
-            "{\"role\":\"user\"}"
-        );
+        let staged_session =
+            std::fs::read_to_string(&workspace.staged_sessions[0].staged_path).unwrap();
+        assert!(staged_session.contains("# Staged Session Summary"));
+        assert!(staged_session.contains("Please improve the review flow."));
         assert_eq!(workspace.staged_skills.len(), 1);
         assert!(workspace.staged_skills[0].staged_path.is_file());
         assert_eq!(
@@ -2785,14 +2904,13 @@ mod tests {
     fn test_stage_scan_workspace_truncates_large_session_fields() {
         let dir = tempfile::tempdir().unwrap();
         let session_path = dir.path().join("session.jsonl");
-        let huge = "x".repeat(MAX_STAGED_SESSION_STRING_CHARS + 500);
+        let huge = "x".repeat(MAX_STAGED_SUMMARY_EXCERPT_CHARS + 500);
         let line = serde_json::json!({
-            "type": "session_meta",
+            "type": "response_item",
             "payload": {
-                "base_instructions": {
-                    "text": huge
-                },
-                "encrypted_content": "secret"
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": huge}]
             }
         });
         std::fs::write(&session_path, format!("{line}\n")).unwrap();
@@ -2809,8 +2927,8 @@ mod tests {
         let staged = std::fs::read_to_string(&workspace.staged_sessions[0].staged_path).unwrap();
 
         assert!(staged.contains("[... omitted"));
-        assert!(staged.contains("<omitted encrypted content>"));
-        assert!(!staged.contains(&"x".repeat(MAX_STAGED_SESSION_STRING_CHARS + 500)));
+        assert!(staged.contains("# Staged Session Summary"));
+        assert!(!staged.contains(&"x".repeat(MAX_STAGED_SUMMARY_EXCERPT_CHARS + 500)));
     }
 
     #[test]
