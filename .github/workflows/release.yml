@@ -24,7 +24,7 @@ jobs:
       release_version: ${{ steps.release.outputs.release_version }}
       tag_exists: ${{ steps.release.outputs.tag_exists }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -96,13 +96,13 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -152,7 +152,7 @@ jobs:
           gh release upload "$tag" "${files[@]}" --clobber
 
       - name: Upload local artifacts for global packaging
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: local-artifacts-${{ matrix.target }}
           path: |
@@ -167,13 +167,13 @@ jobs:
     needs: [prepare-release, dist-local]
     if: needs.prepare-release.outputs.release_needed == 'true'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install cargo-dist
         run: curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.31.0/cargo-dist-installer.sh | sh
 
       - name: Download local artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: local-artifacts-*
           path: target/distrib
@@ -200,7 +200,7 @@ jobs:
           gh release upload "$tag" "${files[@]}" --clobber
 
       - name: Upload Homebrew formula artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: homebrew-formula
           path: target/distrib/*.rb
@@ -221,7 +221,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: true
           repository: nclandrei/homebrew-tap
@@ -229,7 +229,7 @@ jobs:
           path: homebrew-tap
 
       - name: Download Homebrew formula
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: homebrew-formula
           path: homebrew-tap/Formula
@@ -259,11 +259,11 @@ jobs:
     needs: [prepare-release, dist-global]
     if: needs.prepare-release.outputs.release_needed == 'true'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry

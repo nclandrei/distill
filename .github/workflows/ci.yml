@@ -11,7 +11,7 @@ jobs:
     name: Release config
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -28,13 +28,13 @@ jobs:
     name: Check (fmt + clippy)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -59,11 +59,11 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -82,11 +82,11 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
