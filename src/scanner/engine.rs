@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -320,7 +322,7 @@ struct AgentRunContext<'a> {
 }
 
 #[derive(Debug)]
-struct IsolatedCodexHome {
+struct IsolatedAgentHome {
     path: PathBuf,
     cleanup_on_drop: bool,
 }
@@ -394,7 +396,7 @@ impl ScanDebugArtifacts {
     }
 }
 
-impl Drop for IsolatedCodexHome {
+impl Drop for IsolatedAgentHome {
     fn drop(&mut self) {
         if self.cleanup_on_drop {
             let _ = std::fs::remove_dir_all(&self.path);
@@ -649,35 +651,81 @@ fn agent_timeout() -> Result<Option<Duration>> {
     }
 }
 
+fn user_home_dir() -> Result<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .context("HOME is not set; cannot resolve the user home directory")
+}
+
 fn codex_home_dir() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("CODEX_HOME").filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(path));
     }
 
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .context("HOME is not set; cannot resolve the default Codex home directory")?;
+    let home = user_home_dir()?;
     Ok(home.join(".codex"))
 }
 
-fn populate_isolated_codex_home(source_home: &Path, isolated_home: &Path) -> Result<()> {
-    std::fs::create_dir_all(isolated_home).with_context(|| {
-        format!(
-            "Failed to create isolated Codex home {}",
-            isolated_home.display()
-        )
-    })?;
-
-    for filename in ["auth.json", "config.toml"] {
-        let source = source_home.join(filename);
-        if !source.is_file() {
-            continue;
+fn copy_snapshot_path(source: &Path, destination: &Path) -> Result<()> {
+    let metadata = match std::fs::symlink_metadata(source) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("Failed to stat snapshot source {}", source.display()));
         }
+    };
 
-        let destination = isolated_home.join(filename);
-        std::fs::copy(&source, &destination).with_context(|| {
+    if metadata.file_type().is_symlink() {
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "Failed to create parent directory for snapshot symlink {}",
+                    destination.display()
+                )
+            })?;
+        }
+        let target = std::fs::read_link(source)
+            .with_context(|| format!("Failed to read symlink {}", source.display()))?;
+        symlink(&target, destination).with_context(|| {
             format!(
-                "Failed to copy Codex file {} into isolated home {}",
+                "Failed to create snapshot symlink {} -> {}",
+                destination.display(),
+                target.display()
+            )
+        })?;
+        return Ok(());
+    }
+
+    if metadata.is_dir() {
+        std::fs::create_dir_all(destination).with_context(|| {
+            format!(
+                "Failed to create snapshot directory {}",
+                destination.display()
+            )
+        })?;
+        for entry in std::fs::read_dir(source)
+            .with_context(|| format!("Failed to read directory {}", source.display()))?
+        {
+            let entry = entry
+                .with_context(|| format!("Failed to iterate directory {}", source.display()))?;
+            copy_snapshot_path(&entry.path(), &destination.join(entry.file_name()))?;
+        }
+        return Ok(());
+    }
+
+    if metadata.is_file() {
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "Failed to create parent directory for snapshot file {}",
+                    destination.display()
+                )
+            })?;
+        }
+        std::fs::copy(source, destination).with_context(|| {
+            format!(
+                "Failed to copy snapshot file {} to {}",
                 source.display(),
                 destination.display()
             )
@@ -687,10 +735,46 @@ fn populate_isolated_codex_home(source_home: &Path, isolated_home: &Path) -> Res
     Ok(())
 }
 
+fn copy_snapshot_entries(
+    source_root: &Path,
+    destination_root: &Path,
+    entries: &[&str],
+) -> Result<()> {
+    std::fs::create_dir_all(destination_root).with_context(|| {
+        format!(
+            "Failed to create snapshot root {}",
+            destination_root.display()
+        )
+    })?;
+    for entry in entries {
+        let relative_path = Path::new(entry);
+        copy_snapshot_path(
+            &source_root.join(relative_path),
+            &destination_root.join(relative_path),
+        )?;
+    }
+    Ok(())
+}
+
+fn populate_isolated_codex_home(source_home: &Path, isolated_home: &Path) -> Result<()> {
+    copy_snapshot_entries(
+        source_home,
+        isolated_home,
+        &[
+            "auth.json",
+            "config.toml",
+            "AGENTS.md",
+            "rules",
+            "skills",
+            "vendor_imports",
+        ],
+    )
+}
+
 fn prepare_isolated_codex_home_from_source(
     source_home: &Path,
     debug_run_dir: Option<&Path>,
-) -> Result<IsolatedCodexHome> {
+) -> Result<IsolatedAgentHome> {
     let (path, cleanup_on_drop) = if let Some(run_dir) = debug_run_dir {
         (run_dir.join("codex-home"), false)
     } else {
@@ -699,15 +783,56 @@ fn prepare_isolated_codex_home_from_source(
 
     populate_isolated_codex_home(source_home, &path)?;
 
-    Ok(IsolatedCodexHome {
+    Ok(IsolatedAgentHome {
         path,
         cleanup_on_drop,
     })
 }
 
-fn prepare_isolated_codex_home(debug_run_dir: Option<&Path>) -> Result<IsolatedCodexHome> {
+fn prepare_isolated_codex_home(debug_run_dir: Option<&Path>) -> Result<IsolatedAgentHome> {
     let source_home = codex_home_dir()?;
     prepare_isolated_codex_home_from_source(&source_home, debug_run_dir)
+}
+
+fn populate_isolated_claude_home(source_home: &Path, isolated_home: &Path) -> Result<()> {
+    copy_snapshot_entries(
+        source_home,
+        isolated_home,
+        &[
+            ".claude.json",
+            ".claude/CLAUDE.md",
+            ".claude/settings.json",
+            ".claude/commands",
+            ".claude/skills",
+            ".claude/hooks",
+            ".claude/plugins",
+            ".claude/ide",
+            ".claude/plans",
+        ],
+    )
+}
+
+fn prepare_isolated_claude_home_from_source(
+    source_home: &Path,
+    debug_run_dir: Option<&Path>,
+) -> Result<IsolatedAgentHome> {
+    let (path, cleanup_on_drop) = if let Some(run_dir) = debug_run_dir {
+        (run_dir.join("claude-home"), false)
+    } else {
+        (create_temp_dir_path("distill-claude-home")?, true)
+    };
+
+    populate_isolated_claude_home(source_home, &path)?;
+
+    Ok(IsolatedAgentHome {
+        path,
+        cleanup_on_drop,
+    })
+}
+
+fn prepare_isolated_claude_home(debug_run_dir: Option<&Path>) -> Result<IsolatedAgentHome> {
+    let source_home = user_home_dir()?;
+    prepare_isolated_claude_home_from_source(&source_home, debug_run_dir)
 }
 
 fn scan_batch_size() -> Result<usize> {
@@ -1323,9 +1448,10 @@ fn invoke_agent_with_timeout(
         ProposalAgentMode::Generic => {}
     }
 
-    let isolated_codex_home = match mode {
+    let isolated_agent_home = match mode {
         ProposalAgentMode::Codex => Some(prepare_isolated_codex_home(debug_run_dir)?),
-        ProposalAgentMode::Claude | ProposalAgentMode::Generic => None,
+        ProposalAgentMode::Claude => Some(prepare_isolated_claude_home(debug_run_dir)?),
+        ProposalAgentMode::Generic => None,
     };
 
     let mut child_command = Command::new(command);
@@ -1335,8 +1461,14 @@ fn invoke_agent_with_timeout(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if let Some(codex_home) = isolated_codex_home.as_ref() {
-        child_command.env("CODEX_HOME", &codex_home.path);
+    match (mode, isolated_agent_home.as_ref()) {
+        (ProposalAgentMode::Codex, Some(agent_home)) => {
+            child_command.env("CODEX_HOME", &agent_home.path);
+        }
+        (ProposalAgentMode::Claude, Some(agent_home)) => {
+            child_command.env("HOME", &agent_home.path);
+        }
+        _ => {}
     }
 
     let mut child = child_command
@@ -2194,13 +2326,48 @@ mod tests {
     }
 
     #[test]
-    fn test_populate_isolated_codex_home_copies_auth_and_config_only() {
+    fn test_copy_snapshot_path_preserves_symlinks() {
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let target = source.path().join("target.txt");
+        std::fs::write(&target, "hello").unwrap();
+        symlink(&target, source.path().join("link.txt")).unwrap();
+
+        copy_snapshot_path(
+            &source.path().join("link.txt"),
+            &destination.path().join("link.txt"),
+        )
+        .unwrap();
+
+        let metadata = std::fs::symlink_metadata(destination.path().join("link.txt")).unwrap();
+        assert!(metadata.file_type().is_symlink());
+        assert_eq!(
+            std::fs::read_link(destination.path().join("link.txt")).unwrap(),
+            target
+        );
+    }
+
+    #[test]
+    fn test_populate_isolated_codex_home_copies_control_plane_only() {
         let source = tempfile::tempdir().unwrap();
         let destination = tempfile::tempdir().unwrap();
 
         std::fs::write(source.path().join("auth.json"), "{\"token\":\"secret\"}").unwrap();
         std::fs::write(source.path().join("config.toml"), "model = \"gpt-5.4\"\n").unwrap();
+        std::fs::write(source.path().join("AGENTS.md"), "# agents\n").unwrap();
+        std::fs::create_dir_all(source.path().join("rules")).unwrap();
+        std::fs::write(source.path().join("rules/policy.md"), "be strict\n").unwrap();
+        std::fs::create_dir_all(source.path().join("vendor_imports")).unwrap();
+        std::fs::write(
+            source.path().join("vendor_imports/provider.txt"),
+            "imported\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(source.path().join("skills")).unwrap();
+        std::fs::write(source.path().join("skills/local.md"), "skill\n").unwrap();
         std::fs::write(source.path().join("state_5.sqlite"), "do not copy").unwrap();
+        std::fs::create_dir_all(source.path().join("sessions")).unwrap();
+        std::fs::write(source.path().join("sessions/old.jsonl"), "{}\n").unwrap();
 
         populate_isolated_codex_home(source.path(), destination.path()).unwrap();
 
@@ -2212,7 +2379,78 @@ mod tests {
             std::fs::read_to_string(destination.path().join("config.toml")).unwrap(),
             "model = \"gpt-5.4\"\n"
         );
+        assert_eq!(
+            std::fs::read_to_string(destination.path().join("AGENTS.md")).unwrap(),
+            "# agents\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(destination.path().join("rules/policy.md")).unwrap(),
+            "be strict\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(destination.path().join("vendor_imports/provider.txt"))
+                .unwrap(),
+            "imported\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(destination.path().join("skills/local.md")).unwrap(),
+            "skill\n"
+        );
         assert!(!destination.path().join("state_5.sqlite").exists());
+        assert!(!destination.path().join("sessions").exists());
+    }
+
+    #[test]
+    fn test_populate_isolated_claude_home_copies_control_plane_only() {
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+
+        std::fs::write(source.path().join(".claude.json"), "{\"token\":\"secret\"}").unwrap();
+        std::fs::create_dir_all(source.path().join(".claude/hooks")).unwrap();
+        std::fs::create_dir_all(source.path().join(".claude/plugins")).unwrap();
+        std::fs::create_dir_all(source.path().join(".claude/plans")).unwrap();
+        std::fs::write(source.path().join(".claude/CLAUDE.md"), "# claude\n").unwrap();
+        std::fs::write(
+            source.path().join(".claude/settings.json"),
+            "{\"theme\":\"dark\"}",
+        )
+        .unwrap();
+        std::fs::write(source.path().join(".claude/hooks/pre.sh"), "echo hook\n").unwrap();
+        std::fs::write(source.path().join(".claude/plugins/plugin.js"), "plugin\n").unwrap();
+        std::fs::write(source.path().join(".claude/plans/plan.md"), "plan\n").unwrap();
+        std::fs::create_dir_all(source.path().join(".claude/projects")).unwrap();
+        std::fs::create_dir_all(source.path().join(".claude/debug")).unwrap();
+        std::fs::write(source.path().join(".claude/projects/session.jsonl"), "{}\n").unwrap();
+        std::fs::write(source.path().join(".claude/debug/log.txt"), "debug\n").unwrap();
+
+        populate_isolated_claude_home(source.path(), destination.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(destination.path().join(".claude.json")).unwrap(),
+            "{\"token\":\"secret\"}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(destination.path().join(".claude/CLAUDE.md")).unwrap(),
+            "# claude\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(destination.path().join(".claude/settings.json")).unwrap(),
+            "{\"theme\":\"dark\"}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(destination.path().join(".claude/hooks/pre.sh")).unwrap(),
+            "echo hook\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(destination.path().join(".claude/plugins/plugin.js")).unwrap(),
+            "plugin\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(destination.path().join(".claude/plans/plan.md")).unwrap(),
+            "plan\n"
+        );
+        assert!(!destination.path().join(".claude/projects").exists());
+        assert!(!destination.path().join(".claude/debug").exists());
     }
 
     #[test]
