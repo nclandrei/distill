@@ -1,6 +1,10 @@
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use std::cell::RefCell;
+#[cfg(test)]
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -162,6 +166,23 @@ pub fn find_agent_command(kind: AgentKind) -> Option<PathBuf> {
     find_agent_command_in_path(kind, path_env.as_deref())
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_AGENT_COMMAND_OVERRIDES: RefCell<HashMap<AgentKind, PathBuf>> =
+        RefCell::new(HashMap::new());
+}
+
+fn resolved_agent_command(kind: AgentKind) -> PathBuf {
+    #[cfg(test)]
+    if let Some(path) =
+        TEST_AGENT_COMMAND_OVERRIDES.with(|overrides| overrides.borrow().get(&kind).cloned())
+    {
+        return path;
+    }
+
+    PathBuf::from(kind.command_name())
+}
+
 fn extract_leading_frontmatter(input: &str) -> Option<&str> {
     if !input.starts_with("---\n") {
         return None;
@@ -281,7 +302,14 @@ fn parse_rfc3339_timestamp(value: &serde_json::Value) -> Option<DateTime<Utc>> {
     }
 
     if let Some(raw) = value.as_i64() {
-        return DateTime::from_timestamp(raw, 0);
+        let (secs, nanos) = if raw.abs() >= 1_000_000_000_000 {
+            let secs = raw / 1_000;
+            let millis = (raw % 1_000).unsigned_abs() as u32;
+            (secs, millis * 1_000_000)
+        } else {
+            (raw, 0)
+        };
+        return DateTime::from_timestamp(secs, nanos);
     }
 
     None
@@ -315,6 +343,10 @@ fn opencode_virtual_session_path(home: &Path, session_id: &str) -> PathBuf {
 }
 
 fn parse_opencode_session_list(raw: &str, home: &Path) -> Result<Vec<Session>> {
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
     let value: serde_json::Value =
         serde_json::from_str(raw).context("Failed to parse OpenCode session list JSON")?;
     let items = value
@@ -337,10 +369,12 @@ fn parse_opencode_session_list(raw: &str, home: &Path) -> Result<Vec<Session>> {
         let timestamp = [
             "updatedAt",
             "updated_at",
+            "updated",
             "lastMessageAt",
             "last_message_at",
             "createdAt",
             "created_at",
+            "created",
             "timestamp",
         ]
         .iter()
@@ -527,7 +561,8 @@ impl OpenCodeAdapter {
     }
 
     fn run_json_command(&self, args: &[&str]) -> Result<String> {
-        let output = Command::new(self.kind().command_name())
+        let command = resolved_agent_command(self.kind());
+        let output = Command::new(&command)
             .args(args)
             .env("HOME", &self.home)
             .env("XDG_CONFIG_HOME", self.home.join(".config"))
@@ -536,7 +571,7 @@ impl OpenCodeAdapter {
             .with_context(|| {
                 format!(
                     "Failed to execute OpenCode command: {} {}",
-                    self.kind().command_name(),
+                    command.display(),
                     args.join(" ")
                 )
             })?;
@@ -544,7 +579,7 @@ impl OpenCodeAdapter {
         if !output.status.success() {
             bail!(
                 "{}",
-                format_command_failure(self.kind().command_name(), &output)
+                format_command_failure(&command.to_string_lossy(), &output)
             );
         }
 
@@ -559,7 +594,16 @@ impl OpenCodeAdapter {
     }
 
     fn export_session(&self, session_id: &str) -> Result<String> {
-        self.run_json_command(&["export", session_id, "--format", "json"])
+        match self.run_json_command(&["export", session_id, "--format", "json"]) {
+            Ok(output) => Ok(output),
+            Err(format_err) => self
+                .run_json_command(&["export", session_id])
+                .with_context(|| {
+                    format!(
+                        "OpenCode export fallback failed after `--format json` was rejected: {format_err}"
+                    )
+                }),
+        }
     }
 }
 
@@ -609,6 +653,32 @@ mod tests {
     // ------------------------------------------------------------------
     // Helpers
     // ------------------------------------------------------------------
+
+    struct TestAgentCommandOverride {
+        kind: AgentKind,
+        previous: Option<PathBuf>,
+    }
+
+    impl TestAgentCommandOverride {
+        fn new(kind: AgentKind, command: PathBuf) -> Self {
+            let previous = TEST_AGENT_COMMAND_OVERRIDES
+                .with(|overrides| overrides.borrow_mut().insert(kind, command));
+            Self { kind, previous }
+        }
+    }
+
+    impl Drop for TestAgentCommandOverride {
+        fn drop(&mut self) {
+            TEST_AGENT_COMMAND_OVERRIDES.with(|overrides| {
+                let mut overrides = overrides.borrow_mut();
+                if let Some(previous) = self.previous.take() {
+                    overrides.insert(self.kind, previous);
+                } else {
+                    overrides.remove(&self.kind);
+                }
+            });
+        }
+    }
 
     /// Create a `.jsonl` file at `path` with the given content and, optionally,
     /// set its modification time to `mtime_offset` seconds before now.
@@ -816,6 +886,8 @@ mod tests {
     fn test_opencode_read_sessions_missing_list_returns_error() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().to_path_buf();
+        let _command =
+            TestAgentCommandOverride::new(AgentKind::OpenCode, dir.path().join("missing-opencode"));
         let adapter = OpenCodeAdapter::with_home(home);
         let err = adapter.read_sessions(DateTime::UNIX_EPOCH).unwrap_err();
         assert!(
@@ -884,20 +956,7 @@ mod tests {
             std::fs::set_permissions(&opencode, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
 
-        let original_path = std::env::var_os("PATH");
-        unsafe {
-            std::env::set_var(
-                "PATH",
-                format!(
-                    "{}:{}",
-                    bin_dir.display(),
-                    original_path
-                        .as_deref()
-                        .map(|value| value.to_string_lossy().to_string())
-                        .unwrap_or_default()
-                ),
-            );
-        }
+        let _command = TestAgentCommandOverride::new(AgentKind::OpenCode, opencode.clone());
 
         let adapter = OpenCodeAdapter::with_home(home.clone());
         let sessions = adapter.read_sessions(DateTime::UNIX_EPOCH).unwrap();
@@ -908,14 +967,56 @@ mod tests {
             sessions[0].path,
             home.join(".local/share/opencode/sessions/sess-1.json")
         );
+    }
 
-        unsafe {
-            if let Some(path) = original_path {
-                std::env::set_var("PATH", path);
-            } else {
-                std::env::remove_var("PATH");
-            }
+    #[cfg(unix)]
+    #[test]
+    fn test_opencode_read_sessions_empty_cli_output_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        let bin_dir = home.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let opencode = bin_dir.join("opencode");
+        std::fs::write(
+            &opencode,
+            "#!/bin/sh\nif [ \"$1\" = \"session\" ] && [ \"$2\" = \"list\" ]; then\n  exit 0\nfi\nexit 41\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&opencode, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+
+        let _command = TestAgentCommandOverride::new(AgentKind::OpenCode, opencode.clone());
+
+        let adapter = OpenCodeAdapter::with_home(home);
+        let sessions = adapter.read_sessions(DateTime::UNIX_EPOCH).unwrap();
+        assert!(sessions.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_opencode_export_session_falls_back_when_format_flag_is_unsupported() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        let bin_dir = home.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let opencode = bin_dir.join("opencode");
+        std::fs::write(
+            &opencode,
+            "#!/bin/sh\nif [ \"$1\" = \"export\" ] && [ \"$2\" = \"sess-1\" ] && [ \"${3:-}\" = \"--format\" ]; then\n  echo 'unknown option: --format' >&2\n  exit 64\nfi\nif [ \"$1\" = \"export\" ] && [ \"$2\" = \"sess-1\" ]; then\n  printf '%s' '{\"messages\":[{\"role\":\"user\",\"content\":[{\"text\":\"hello\"}]}]}'\n  exit 0\nfi\nexit 41\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&opencode, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let _command = TestAgentCommandOverride::new(AgentKind::OpenCode, opencode.clone());
+
+        let adapter = OpenCodeAdapter::with_home(home);
+        let exported = adapter.export_session("sess-1").unwrap();
+        assert!(exported.contains("\"hello\""));
     }
 
     // --- read_sessions: non-.jsonl files are ignored ---
@@ -1204,6 +1305,26 @@ mod tests {
             sessions[0].path,
             PathBuf::from("/tmp/home/.local/share/opencode/sessions/sess-2.json")
         );
+    }
+
+    #[test]
+    fn test_parse_opencode_session_list_accepts_empty_output() {
+        let home = PathBuf::from("/tmp/home");
+        let sessions = parse_opencode_session_list("   \n\t", &home).unwrap();
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn test_parse_opencode_session_list_accepts_epoch_millis_updated_field() {
+        let home = PathBuf::from("/tmp/home");
+        let sessions =
+            parse_opencode_session_list(r#"[{"id":"sess-3","updated":1773239607298}]"#, &home)
+                .unwrap();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "sess-3");
+        assert_eq!(sessions[0].timestamp.timestamp(), 1773239607);
+        assert_eq!(sessions[0].timestamp.timestamp_subsec_millis(), 298);
     }
 
     // --- session path matches the actual file path ---

@@ -1134,7 +1134,15 @@ fn collect_opencode_digest(value: &serde_json::Value, digest: &mut SessionDigest
             }
         }
         serde_json::Value::Object(map) => {
-            if let Some(role) = map.get("role").and_then(|value| value.as_str()) {
+            if let Some(role) = map
+                .get("role")
+                .and_then(|value| value.as_str())
+                .or_else(|| {
+                    map.get("info")
+                        .and_then(|value| value.get("role"))
+                        .and_then(|value| value.as_str())
+                })
+            {
                 let text = extract_opencode_message_text(
                     map.get("content")
                         .or_else(|| map.get("parts"))
@@ -2434,5 +2442,46 @@ mod tests {
         assert!(summary.contains("Add OpenCode support from top to bottom."));
         assert!(summary.contains("inspect the agent registry"));
         assert!(summary.contains("- read x1"));
+    }
+
+    #[test]
+    fn test_build_staged_session_summary_extracts_current_opencode_export_shape() {
+        let session = Session {
+            id: "sess-2".to_string(),
+            agent: AgentKind::OpenCode,
+            path: PathBuf::from("/tmp/home/.local/share/opencode/sessions/sess-2.json"),
+            timestamp: Utc::now(),
+            content: String::new(),
+        };
+        let raw = r#"{
+          "messages": [
+            {
+              "info": {
+                "role": "user"
+              },
+              "parts": [
+                {
+                  "type": "text",
+                  "text": "Remember marker DISTILL_REAL_SCAN_20260311."
+                }
+              ]
+            },
+            {
+              "info": {
+                "role": "assistant"
+              },
+              "parts": [
+                {
+                  "type": "text",
+                  "text": "ACK"
+                }
+              ]
+            }
+          ]
+        }"#;
+
+        let summary = build_staged_session_summary(&session, raw);
+        assert!(summary.contains("DISTILL_REAL_SCAN_20260311"));
+        assert!(summary.contains("ACK"));
     }
 }

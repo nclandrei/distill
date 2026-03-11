@@ -31,7 +31,7 @@ Icon assets used by notifications and docs:
 - Distill reads local session logs from:
   - Claude: `~/.claude/projects/**/*.jsonl`
   - Codex: `~/.codex/sessions/**/*.jsonl`
-  - OpenCode: discovered via `opencode session list --format json`, exported via `opencode export <session-id> --format json`
+  - OpenCode: discovered via `opencode session list --format json`, exported via `opencode export <session-id>` (Distill falls back from `--format json` for newer CLIs)
 - If a scan stalls because the upstream agent is slow, raise `DISTILL_AGENT_TIMEOUT_SECS` (default: 7200 seconds) or set it to `0` to disable the timeout entirely.
 
 ## Quick Start
