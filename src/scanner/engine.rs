@@ -2,9 +2,12 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::Write;
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
@@ -265,6 +268,177 @@ struct AgentInvocation {
     mode: ProposalAgentMode,
 }
 
+#[derive(Debug, Clone)]
+struct ScanDebugArtifacts {
+    run_dir: PathBuf,
+    current_run_path: PathBuf,
+    last_failed_run_path: PathBuf,
+    cleanup_on_success: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ScanRunStatus {
+    state: String,
+    started_at: String,
+    updated_at: String,
+    scan_pid: u32,
+    agent_pid: Option<u32>,
+    agent_command: String,
+    workspace_root: String,
+    batch_size: usize,
+    prompt_bytes: usize,
+    timeout_secs: Option<u64>,
+    stdout_bytes: u64,
+    stderr_bytes: u64,
+    last_stdout_at: Option<String>,
+    last_stderr_at: Option<String>,
+    note: Option<String>,
+}
+
+struct LiveScanStatusUpdate<'a> {
+    started_at: DateTime<Utc>,
+    state: &'a str,
+    command: &'a str,
+    args: &'a [String],
+    workspace_root: &'a Path,
+    batch_size: usize,
+    prompt_bytes: usize,
+    timeout: Option<Duration>,
+    agent_pid: Option<u32>,
+    stdout_bytes: u64,
+    stderr_bytes: u64,
+    last_stdout_at: Option<SystemTime>,
+    last_stderr_at: Option<SystemTime>,
+    note: Option<String>,
+}
+
+struct AgentRunContext<'a> {
+    timeout: Option<Duration>,
+    debug_run_dir: Option<&'a Path>,
+    debug_artifacts: Option<&'a ScanDebugArtifacts>,
+    batch_size: usize,
+}
+
+struct StreamCapture {
+    bytes_captured: Arc<AtomicU64>,
+    last_update: Arc<Mutex<Option<SystemTime>>>,
+    join_handle: std::thread::JoinHandle<std::io::Result<Vec<u8>>>,
+}
+
+impl ScanDebugArtifacts {
+    fn new(base_dir: PathBuf, cleanup_on_success: bool) -> Result<Self> {
+        let run_dir = create_debug_run_dir(&base_dir)?;
+        let current_run_path = base_dir.join("current-run.txt");
+        let last_failed_run_path = base_dir.join("last-failed-run.txt");
+        std::fs::write(&current_run_path, run_dir.display().to_string()).with_context(|| {
+            format!(
+                "Failed to write current scan debug pointer {}",
+                current_run_path.display()
+            )
+        })?;
+        Ok(Self {
+            run_dir,
+            current_run_path,
+            last_failed_run_path,
+            cleanup_on_success,
+        })
+    }
+
+    fn status_path(&self) -> PathBuf {
+        self.run_dir.join("scan-status.json")
+    }
+
+    fn stdout_path(&self) -> PathBuf {
+        self.run_dir.join("agent-stdout.log")
+    }
+
+    fn stderr_path(&self) -> PathBuf {
+        self.run_dir.join("agent-stderr.log")
+    }
+
+    fn write_status(&self, status: &ScanRunStatus) {
+        if let Ok(json) = serde_json::to_string_pretty(status) {
+            let _ = std::fs::write(self.status_path(), json);
+        }
+    }
+
+    fn finish_success(&self) {
+        self.clear_current_run_pointer();
+        if self.cleanup_on_success {
+            let _ = std::fs::remove_dir_all(&self.run_dir);
+        }
+    }
+
+    fn finish_failure(&self, error: &anyhow::Error) {
+        let _ = std::fs::write(self.run_dir.join("error.txt"), error.to_string());
+        let _ = std::fs::write(
+            &self.last_failed_run_path,
+            self.run_dir.display().to_string(),
+        );
+        self.clear_current_run_pointer();
+    }
+
+    fn clear_current_run_pointer(&self) {
+        let matches_current_run = std::fs::read_to_string(&self.current_run_path)
+            .map(|value| value.trim() == self.run_dir.to_string_lossy())
+            .unwrap_or(false);
+        if matches_current_run {
+            let _ = std::fs::remove_file(&self.current_run_path);
+        }
+    }
+}
+
+impl StreamCapture {
+    fn spawn<R: Read + Send + 'static>(reader: R, output_path: Option<PathBuf>) -> Self {
+        let bytes_captured = Arc::new(AtomicU64::new(0));
+        let last_update = Arc::new(Mutex::new(None));
+        let bytes_captured_clone = bytes_captured.clone();
+        let last_update_clone = last_update.clone();
+        let join_handle = std::thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(reader);
+            let mut file = output_path
+                .map(|path| {
+                    OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .truncate(true)
+                        .open(&path)
+                })
+                .transpose()?;
+            let mut buffer = [0u8; 8192];
+            let mut captured = Vec::new();
+            loop {
+                let read = reader.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                captured.extend_from_slice(&buffer[..read]);
+                if let Some(file) = file.as_mut() {
+                    file.write_all(&buffer[..read])?;
+                    file.flush()?;
+                }
+                bytes_captured_clone.fetch_add(read as u64, Ordering::Relaxed);
+                if let Ok(mut last_update) = last_update_clone.lock() {
+                    *last_update = Some(SystemTime::now());
+                }
+            }
+            Ok(captured)
+        });
+        Self {
+            bytes_captured,
+            last_update,
+            join_handle,
+        }
+    }
+
+    fn finish(self, label: &str) -> Result<Vec<u8>> {
+        match self.join_handle.join() {
+            Ok(result) => result.with_context(|| format!("Failed to capture agent {label} stream")),
+            Err(_) => bail!("Agent {label} capture thread panicked"),
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct RawScanResponse {
     inspected_files: Vec<String>,
@@ -496,6 +670,13 @@ fn scan_debug_dir() -> Result<Option<PathBuf>> {
     }
 }
 
+fn scan_debug_artifacts() -> Result<ScanDebugArtifacts> {
+    let explicit_dir = scan_debug_dir()?;
+    let cleanup_on_success = explicit_dir.is_none();
+    let base_dir = explicit_dir.unwrap_or_else(|| Config::base_dir().join("scan-debug"));
+    ScanDebugArtifacts::new(base_dir, cleanup_on_success)
+}
+
 fn create_debug_run_dir(base_dir: &Path) -> Result<PathBuf> {
     std::fs::create_dir_all(base_dir)?;
     let timestamp = Utc::now().format("%Y%m%d-%H%M%S");
@@ -524,157 +705,182 @@ fn write_debug_text(run_dir: Option<&Path>, filename: &str, contents: &str) {
     let _ = std::fs::write(run_dir.join(filename), contents);
 }
 
+fn format_optional_system_time(value: Option<SystemTime>) -> Option<String> {
+    value.map(|time| DateTime::<Utc>::from(time).to_rfc3339())
+}
+
 pub fn run_scan(agents: &[Box<dyn Agent>], scan_config: &ScanConfig) -> Result<Vec<Proposal>> {
     let scan_started_at = Utc::now();
-    let last_scan = LastScan::load(&scan_config.last_scan_path)?;
-    let discovery_since = last_scan
-        .as_ref()
-        .map(|last_scan| last_scan.timestamp)
-        .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap());
-    let batch_size = scan_batch_size()?;
-    let debug_run_dir = scan_debug_dir()?
-        .map(|dir| create_debug_run_dir(&dir))
-        .transpose()?;
+    let debug_artifacts = scan_debug_artifacts()?;
+    let debug_run_dir = Some(debug_artifacts.run_dir.as_path());
+    println!(
+        "Live scan debug directory: {}",
+        debug_artifacts.run_dir.display()
+    );
 
-    let collected_sessions = reader::collect_sessions(agents, discovery_since)?;
-    let collected_count = collected_sessions.len();
-    let candidate_sessions =
-        filter_low_signal_sessions(filter_distill_scan_artifacts(collected_sessions));
-    let skipped_internal = collected_count.saturating_sub(candidate_sessions.len());
+    let result = (|| -> Result<Vec<Proposal>> {
+        let last_scan = LastScan::load(&scan_config.last_scan_path)?;
+        let discovery_since = last_scan
+            .as_ref()
+            .map(|last_scan| last_scan.timestamp)
+            .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap());
+        let batch_size = scan_batch_size()?;
+        let timeout = agent_timeout()?;
 
-    let mut backlog = ScanBacklog::load(&scan_config.backlog_path)?;
-    let seed_newest_first = last_scan.is_none() && backlog.sessions.is_empty();
-    backlog.merge_new_sessions(candidate_sessions, seed_newest_first);
-    backlog.save(&scan_config.backlog_path)?;
+        let collected_sessions = reader::collect_sessions(agents, discovery_since)?;
+        let collected_count = collected_sessions.len();
+        let candidate_sessions =
+            filter_low_signal_sessions(filter_distill_scan_artifacts(collected_sessions));
+        let skipped_internal = collected_count.saturating_sub(candidate_sessions.len());
 
-    if skipped_internal > 0 {
+        let mut backlog = ScanBacklog::load(&scan_config.backlog_path)?;
+        let seed_newest_first = last_scan.is_none() && backlog.sessions.is_empty();
+        backlog.merge_new_sessions(candidate_sessions, seed_newest_first);
+        backlog.save(&scan_config.backlog_path)?;
+
+        if skipped_internal > 0 {
+            println!(
+                "Skipped {} low-signal/internal session(s).",
+                skipped_internal
+            );
+        }
+
+        if backlog.sessions.is_empty() {
+            println!("No pending sessions found for scan.");
+            let watermark = LastScan {
+                timestamp: scan_started_at,
+                session_ids: vec![],
+            };
+            watermark.save(&scan_config.last_scan_path)?;
+            return Ok(vec![]);
+        }
+
+        println!("Found {} session(s) to analyze.", backlog.sessions.len());
+        println!("Pending scan backlog: {}", backlog.sessions.len());
+
+        let batch = backlog.batch(batch_size);
+        if batch.len() < backlog.sessions.len() {
+            println!(
+                "Capped this scan to {} newest pending session(s); rerun scan to continue draining the backlog.",
+                batch.len()
+            );
+        }
+
+        let skill_sources = load_existing_skill_sources(&scan_config.skill_dirs)?;
+        println!("Loaded {} existing skill(s).", skill_sources.len());
+
+        let preferences = match PreferenceProfile::load(&scan_config.history_dir) {
+            Ok(profile) => profile,
+            Err(err) => {
+                eprintln!(
+                    "Warning: failed to load preference history (continuing without it): {err}"
+                );
+                PreferenceProfile::default()
+            }
+        };
+        if preferences.reviewed > 0 {
+            println!(
+                "Loaded preference history: {} reviewed decision(s), {} strong signal(s).",
+                preferences.reviewed,
+                preferences.signal_count()
+            );
+        }
+
+        let workspace = stage_scan_workspace(&batch, &skill_sources, debug_run_dir)?;
+        let prompt = build_prompt(&workspace.manifest, &preferences);
+        write_debug_text(debug_run_dir, "prompt.txt", &prompt);
+
         println!(
-            "Skipped {} low-signal/internal session(s).",
-            skipped_internal
+            "Inspecting {} staged session file(s) with `{}` (prompt: {} bytes)...",
+            batch.len(),
+            scan_config.agent_command,
+            prompt.len()
         );
-    }
+        println!("Waiting for agent response (this may take several minutes)...");
 
-    if backlog.sessions.is_empty() {
-        println!("No pending sessions found for scan.");
+        let invocation = invoke_agent(
+            &scan_config.agent_command,
+            &scan_config.agent_args,
+            &prompt,
+            &workspace.root,
+            AgentRunContext {
+                timeout,
+                debug_run_dir,
+                debug_artifacts: Some(&debug_artifacts),
+                batch_size: batch.len(),
+            },
+        )?;
+        println!("Agent responded ({} bytes).", invocation.final_output.len());
+
+        let parsed = parse_scan_response(&invocation.final_output, &workspace.root)?;
+        write_debug_text(
+            debug_run_dir,
+            "parsed-response.json",
+            &serde_json::to_string_pretty(&serde_json::json!({
+                "inspected_files": parsed
+                    .inspected_files
+                    .iter()
+                    .map(|path| path.to_string_lossy().to_string())
+                    .collect::<Vec<_>>(),
+                "file_findings": parsed
+                    .file_findings
+                    .iter()
+                    .map(|finding| serde_json::json!({
+                        "session": finding.session.to_string_lossy().to_string(),
+                        "summary": finding.summary,
+                    }))
+                    .collect::<Vec<_>>(),
+                "proposals": parsed
+                    .proposals
+                    .iter()
+                    .map(|proposal| serde_json::json!({
+                        "type": format!("{:?}", proposal.frontmatter.proposal_type).to_lowercase(),
+                        "confidence": format!("{:?}", proposal.frontmatter.confidence).to_lowercase(),
+                        "target_skill": match proposal.frontmatter.resolved_target() {
+                            Some(ProposalTarget::Skill { name }) => Some(name),
+                            _ => None,
+                        },
+                        "evidence": proposal.frontmatter.evidence,
+                        "body": proposal.body,
+                    }))
+                    .collect::<Vec<_>>(),
+            }))
+            .unwrap_or_else(|_| "{}".to_string()),
+        );
+
+        let mut proposals = validate_and_finalize_response(&parsed, &workspace, &invocation)?;
+        println!("Agent proposed {} skill(s).", proposals.len());
+
+        std::fs::create_dir_all(&scan_config.proposals_dir)?;
+        for (index, proposal) in proposals.iter_mut().enumerate() {
+            let filename = proposal_filename(proposal, index);
+            let path = scan_config.proposals_dir.join(&filename);
+            let markdown = proposal
+                .to_markdown()
+                .context("Failed to serialize proposal to markdown")?;
+            std::fs::write(&path, markdown)
+                .with_context(|| format!("Failed to write proposal {}", path.display()))?;
+            proposal.filename = Some(filename);
+        }
+
+        backlog.remove_batch(&batch);
+        backlog.save(&scan_config.backlog_path)?;
+
         let watermark = LastScan {
             timestamp: scan_started_at,
             session_ids: vec![],
         };
         watermark.save(&scan_config.last_scan_path)?;
-        return Ok(vec![]);
+
+        Ok(proposals)
+    })();
+
+    match &result {
+        Ok(_) => debug_artifacts.finish_success(),
+        Err(err) => debug_artifacts.finish_failure(err),
     }
 
-    println!("Found {} session(s) to analyze.", backlog.sessions.len());
-    println!("Pending scan backlog: {}", backlog.sessions.len());
-
-    let batch = backlog.batch(batch_size);
-    if batch.len() < backlog.sessions.len() {
-        println!(
-            "Capped this scan to {} newest pending session(s); rerun scan to continue draining the backlog.",
-            batch.len()
-        );
-    }
-
-    let skill_sources = load_existing_skill_sources(&scan_config.skill_dirs)?;
-    println!("Loaded {} existing skill(s).", skill_sources.len());
-
-    let preferences = match PreferenceProfile::load(&scan_config.history_dir) {
-        Ok(profile) => profile,
-        Err(err) => {
-            eprintln!("Warning: failed to load preference history (continuing without it): {err}");
-            PreferenceProfile::default()
-        }
-    };
-    if preferences.reviewed > 0 {
-        println!(
-            "Loaded preference history: {} reviewed decision(s), {} strong signal(s).",
-            preferences.reviewed,
-            preferences.signal_count()
-        );
-    }
-
-    let workspace = stage_scan_workspace(&batch, &skill_sources, debug_run_dir.as_deref())?;
-    let prompt = build_prompt(&workspace.manifest, &preferences);
-    write_debug_text(debug_run_dir.as_deref(), "prompt.txt", &prompt);
-
-    println!(
-        "Inspecting {} staged session file(s) with `{}` (prompt: {} bytes)...",
-        batch.len(),
-        scan_config.agent_command,
-        prompt.len()
-    );
-    println!("Waiting for agent response (this may take several minutes)...");
-
-    let invocation = invoke_agent(
-        &scan_config.agent_command,
-        &scan_config.agent_args,
-        &prompt,
-        &workspace.root,
-        debug_run_dir.as_deref(),
-    )?;
-    println!("Agent responded ({} bytes).", invocation.final_output.len());
-
-    let parsed = parse_scan_response(&invocation.final_output, &workspace.root)?;
-    write_debug_text(
-        debug_run_dir.as_deref(),
-        "parsed-response.json",
-        &serde_json::to_string_pretty(&serde_json::json!({
-            "inspected_files": parsed
-                .inspected_files
-                .iter()
-                .map(|path| path.to_string_lossy().to_string())
-                .collect::<Vec<_>>(),
-            "file_findings": parsed
-                .file_findings
-                .iter()
-                .map(|finding| serde_json::json!({
-                    "session": finding.session.to_string_lossy().to_string(),
-                    "summary": finding.summary,
-                }))
-                .collect::<Vec<_>>(),
-            "proposals": parsed
-                .proposals
-                .iter()
-                .map(|proposal| serde_json::json!({
-                    "type": format!("{:?}", proposal.frontmatter.proposal_type).to_lowercase(),
-                    "confidence": format!("{:?}", proposal.frontmatter.confidence).to_lowercase(),
-                    "target_skill": match proposal.frontmatter.resolved_target() {
-                        Some(ProposalTarget::Skill { name }) => Some(name),
-                        _ => None,
-                    },
-                    "evidence": proposal.frontmatter.evidence,
-                    "body": proposal.body,
-                }))
-                .collect::<Vec<_>>(),
-        }))
-        .unwrap_or_else(|_| "{}".to_string()),
-    );
-
-    let mut proposals = validate_and_finalize_response(&parsed, &workspace, &invocation)?;
-    println!("Agent proposed {} skill(s).", proposals.len());
-
-    std::fs::create_dir_all(&scan_config.proposals_dir)?;
-    for (index, proposal) in proposals.iter_mut().enumerate() {
-        let filename = proposal_filename(proposal, index);
-        let path = scan_config.proposals_dir.join(&filename);
-        let markdown = proposal
-            .to_markdown()
-            .context("Failed to serialize proposal to markdown")?;
-        std::fs::write(&path, markdown)
-            .with_context(|| format!("Failed to write proposal {}", path.display()))?;
-        proposal.filename = Some(filename);
-    }
-
-    backlog.remove_batch(&batch);
-    backlog.save(&scan_config.backlog_path)?;
-
-    let watermark = LastScan {
-        timestamp: scan_started_at,
-        session_ids: vec![],
-    };
-    watermark.save(&scan_config.last_scan_path)?;
-
-    Ok(proposals)
+    result
 }
 
 fn filter_distill_scan_artifacts(sessions: Vec<Session>) -> Vec<Session> {
@@ -933,21 +1139,40 @@ fn build_prompt(manifest: &ScanManifest, preferences: &PreferenceProfile) -> Str
     prompt
 }
 
+fn write_live_scan_status(debug_artifacts: &ScanDebugArtifacts, update: LiveScanStatusUpdate<'_>) {
+    let mut agent_command = update.command.to_string();
+    if !update.args.is_empty() {
+        agent_command.push(' ');
+        agent_command.push_str(&update.args.join(" "));
+    }
+
+    debug_artifacts.write_status(&ScanRunStatus {
+        state: update.state.to_string(),
+        started_at: update.started_at.to_rfc3339(),
+        updated_at: Utc::now().to_rfc3339(),
+        scan_pid: std::process::id(),
+        agent_pid: update.agent_pid,
+        agent_command,
+        workspace_root: update.workspace_root.display().to_string(),
+        batch_size: update.batch_size,
+        prompt_bytes: update.prompt_bytes,
+        timeout_secs: update.timeout.map(|value| value.as_secs()),
+        stdout_bytes: update.stdout_bytes,
+        stderr_bytes: update.stderr_bytes,
+        last_stdout_at: format_optional_system_time(update.last_stdout_at),
+        last_stderr_at: format_optional_system_time(update.last_stderr_at),
+        note: update.note,
+    });
+}
+
 fn invoke_agent(
     command: &str,
     args: &[String],
     prompt: &str,
     workspace_root: &Path,
-    debug_run_dir: Option<&Path>,
+    context: AgentRunContext<'_>,
 ) -> Result<AgentInvocation> {
-    invoke_agent_with_timeout(
-        command,
-        args,
-        prompt,
-        workspace_root,
-        agent_timeout()?,
-        debug_run_dir,
-    )
+    invoke_agent_with_timeout(command, args, prompt, workspace_root, context)
 }
 
 fn invoke_agent_with_timeout(
@@ -955,9 +1180,12 @@ fn invoke_agent_with_timeout(
     args: &[String],
     prompt: &str,
     workspace_root: &Path,
-    timeout: Option<Duration>,
-    debug_run_dir: Option<&Path>,
+    context: AgentRunContext<'_>,
 ) -> Result<AgentInvocation> {
+    let timeout = context.timeout;
+    let debug_run_dir = context.debug_run_dir;
+    let debug_artifacts = context.debug_artifacts;
+    let batch_size = context.batch_size;
     let mode = proposal_agent_mode(command, args);
     let mut effective_args = args.to_vec();
     let mut temp_files = vec![];
@@ -1029,43 +1257,87 @@ fn invoke_agent_with_timeout(
         .spawn()
         .with_context(|| format!("Failed to execute agent command: {command}"))?;
 
+    let agent_started_at = Utc::now();
+    let agent_pid = child.id();
+    let stdout_capture = StreamCapture::spawn(
+        child
+            .stdout
+            .take()
+            .context("Failed to capture agent stdout pipe")?,
+        debug_artifacts
+            .map(|artifacts| artifacts.stdout_path())
+            .or_else(|| debug_run_dir.map(|dir| dir.join("agent-stdout.log"))),
+    );
+    let stderr_capture = StreamCapture::spawn(
+        child
+            .stderr
+            .take()
+            .context("Failed to capture agent stderr pipe")?,
+        debug_artifacts
+            .map(|artifacts| artifacts.stderr_path())
+            .or_else(|| debug_run_dir.map(|dir| dir.join("agent-stderr.log"))),
+    );
+
+    if let Some(debug_artifacts) = debug_artifacts {
+        write_live_scan_status(
+            debug_artifacts,
+            LiveScanStatusUpdate {
+                started_at: agent_started_at,
+                state: "running",
+                command,
+                args: &effective_args,
+                workspace_root,
+                batch_size,
+                prompt_bytes: prompt.len(),
+                timeout,
+                agent_pid: Some(agent_pid),
+                stdout_bytes: 0,
+                stderr_bytes: 0,
+                last_stdout_at: None,
+                last_stderr_at: None,
+                note: Some("Waiting for agent response".to_string()),
+            },
+        );
+    }
+
     if let Some(mut stdin) = child.stdin.take()
         && let Err(write_err) = stdin.write_all(prompt.as_bytes())
     {
+        let status = child.wait().with_context(|| {
+            format!("Failed to wait for agent command after stdin write failure: {command}")
+        })?;
+        let stdout = String::from_utf8_lossy(&stdout_capture.finish("stdout")?).to_string();
+        let stderr = String::from_utf8_lossy(&stderr_capture.finish("stderr")?).to_string();
+        if let Some(debug_artifacts) = debug_artifacts {
+            write_live_scan_status(
+                debug_artifacts,
+                LiveScanStatusUpdate {
+                    started_at: agent_started_at,
+                    state: "failed",
+                    command,
+                    args: &effective_args,
+                    workspace_root,
+                    batch_size,
+                    prompt_bytes: prompt.len(),
+                    timeout,
+                    agent_pid: Some(agent_pid),
+                    stdout_bytes: stdout.len() as u64,
+                    stderr_bytes: stderr.len() as u64,
+                    last_stdout_at: Some(SystemTime::now()),
+                    last_stderr_at: Some(SystemTime::now()),
+                    note: Some("Failed to write prompt to agent stdin".to_string()),
+                },
+            );
+        }
         if write_err.kind() == std::io::ErrorKind::BrokenPipe {
-            return match child.wait_with_output() {
-                Ok(output) if !output.status.success() => {
-                    persist_agent_debug_output(
-                        debug_run_dir,
-                        prompt,
-                        &String::from_utf8_lossy(&output.stdout),
-                        &String::from_utf8_lossy(&output.stderr),
-                        None,
-                    );
-                    cleanup_temp_files(&temp_files);
-                    Err(write_err).with_context(|| format_agent_failure(command, &output, prompt))
-                }
-                Ok(output) => {
-                    persist_agent_debug_output(
-                        debug_run_dir,
-                        prompt,
-                        &String::from_utf8_lossy(&output.stdout),
-                        &String::from_utf8_lossy(&output.stderr),
-                        None,
-                    );
-                    cleanup_temp_files(&temp_files);
-                    Err(write_err)
-                        .with_context(|| format!("Failed to write prompt to {command} stdin"))
-                }
-                Err(wait_err) => {
-                    cleanup_temp_files(&temp_files);
-                    Err(wait_err).with_context(|| {
-                        format!(
-                            "Failed to write prompt to {command} stdin, then failed to collect agent output"
-                        )
-                    })
-                }
+            let output = std::process::Output {
+                status,
+                stdout: stdout.as_bytes().to_vec(),
+                stderr: stderr.as_bytes().to_vec(),
             };
+            persist_agent_debug_output(debug_run_dir, prompt, &stdout, &stderr, None);
+            cleanup_temp_files(&temp_files);
+            return Err(write_err).with_context(|| format_agent_failure(command, &output, prompt));
         }
 
         cleanup_temp_files(&temp_files);
@@ -1073,69 +1345,73 @@ fn invoke_agent_with_timeout(
             .with_context(|| format!("Failed to write prompt to {command} stdin"));
     }
 
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
     let stop_clone = stop.clone();
+    let stdout_bytes = stdout_capture.bytes_captured.clone();
+    let stderr_bytes = stderr_capture.bytes_captured.clone();
+    let stdout_last_update = stdout_capture.last_update.clone();
+    let stderr_last_update = stderr_capture.last_update.clone();
+    let heartbeat_stdout_last_update = stdout_last_update.clone();
+    let heartbeat_stderr_last_update = stderr_last_update.clone();
+    let heartbeat_args = effective_args.clone();
+    let heartbeat_command = command.to_string();
+    let heartbeat_workspace_root = workspace_root.to_path_buf();
+    let heartbeat_debug_artifacts = debug_artifacts.cloned();
+    let prompt_len = prompt.len();
     let heartbeat = std::thread::spawn(move || {
         let mut elapsed = 0u64;
-        while !stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
-            std::thread::sleep(std::time::Duration::from_secs(10));
-            if stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
+        while !stop_clone.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_secs(10));
+            if stop_clone.load(Ordering::Relaxed) {
                 break;
             }
             elapsed += 10;
             eprint!("\r  ...agent working ({elapsed}s)   ");
+            if let Some(debug_artifacts) = heartbeat_debug_artifacts.as_ref() {
+                let last_stdout_at = heartbeat_stdout_last_update
+                    .lock()
+                    .ok()
+                    .and_then(|value| *value);
+                let last_stderr_at = heartbeat_stderr_last_update
+                    .lock()
+                    .ok()
+                    .and_then(|value| *value);
+                write_live_scan_status(
+                    debug_artifacts,
+                    LiveScanStatusUpdate {
+                        started_at: agent_started_at,
+                        state: "running",
+                        command: &heartbeat_command,
+                        args: &heartbeat_args,
+                        workspace_root: &heartbeat_workspace_root,
+                        batch_size,
+                        prompt_bytes: prompt_len,
+                        timeout,
+                        agent_pid: Some(agent_pid),
+                        stdout_bytes: stdout_bytes.load(Ordering::Relaxed),
+                        stderr_bytes: stderr_bytes.load(Ordering::Relaxed),
+                        last_stdout_at,
+                        last_stderr_at,
+                        note: Some(format!("Agent running for {elapsed}s")),
+                    },
+                );
+            }
         }
         eprint!("\r                            \r");
     });
 
     let wait_started = Instant::now();
-    let output = loop {
+    let mut timed_out = false;
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_status)) => match child.wait_with_output() {
-                Ok(output) => break output,
-                Err(err) => {
-                    cleanup_temp_files(&temp_files);
-                    return Err(err).with_context(|| {
-                        format!("Failed to collect output from agent command: {command}")
-                    });
-                }
-            },
+            Ok(Some(status)) => break status,
             Ok(None) => {
                 if timeout.is_some_and(|timeout| wait_started.elapsed() >= timeout) {
+                    timed_out = true;
                     let _ = child.kill();
-                    let timed_out_output = child.wait_with_output().ok();
-                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                    let _ = heartbeat.join();
-
-                    let stderr = timed_out_output
-                        .as_ref()
-                        .map(|output| String::from_utf8_lossy(&output.stderr).to_string())
-                        .unwrap_or_default();
-                    let stdout = timed_out_output
-                        .as_ref()
-                        .map(|output| String::from_utf8_lossy(&output.stdout).to_string())
-                        .unwrap_or_default();
-
-                    persist_agent_debug_output(debug_run_dir, prompt, &stdout, &stderr, None);
-
-                    let stderr = sanitize_agent_diagnostics(&stderr, prompt);
-                    let stdout = sanitize_agent_diagnostics(&stdout, prompt);
-                    let details = match (stderr.is_empty(), stdout.is_empty()) {
-                        (true, true) => String::new(),
-                        (false, true) => format!("\nAgent stderr before timeout:\n{stderr}"),
-                        (true, false) => format!("\nAgent stdout before timeout:\n{stdout}"),
-                        (false, false) => format!(
-                            "\nAgent stderr before timeout:\n{stderr}\nAgent stdout before timeout:\n{stdout}"
-                        ),
-                    };
-
-                    cleanup_temp_files(&temp_files);
-                    bail!(
-                        "Agent command `{command}` timed out after {}s. Verify the CLI is installed and authenticated, raise DISTILL_AGENT_TIMEOUT_SECS for slower runs, or set DISTILL_AGENT_TIMEOUT_SECS=0 to disable the timeout entirely.{details}",
-                        timeout
-                            .expect("timeout should exist when timeout branch is reached")
-                            .as_secs()
-                    );
+                    break child.wait().with_context(|| {
+                        format!("Failed to wait for agent command after timeout: {command}")
+                    })?;
                 }
                 std::thread::sleep(Duration::from_millis(AGENT_POLL_INTERVAL_MS));
             }
@@ -1147,19 +1423,89 @@ fn invoke_agent_with_timeout(
         }
     };
 
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    stop.store(true, Ordering::Relaxed);
     let _ = heartbeat.join();
+    let stdout = stdout_capture.finish("stdout")?;
+    let stderr = stderr_capture.finish("stderr")?;
+    let stdout_lossy = String::from_utf8_lossy(&stdout).to_string();
+    let stderr_lossy = String::from_utf8_lossy(&stderr).to_string();
 
-    if !output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        persist_agent_debug_output(debug_run_dir, prompt, &stdout, &stderr, None);
+    if timed_out {
+        persist_agent_debug_output(debug_run_dir, prompt, &stdout_lossy, &stderr_lossy, None);
+        if let Some(debug_artifacts) = debug_artifacts {
+            write_live_scan_status(
+                debug_artifacts,
+                LiveScanStatusUpdate {
+                    started_at: agent_started_at,
+                    state: "timed_out",
+                    command,
+                    args: &effective_args,
+                    workspace_root,
+                    batch_size,
+                    prompt_bytes: prompt.len(),
+                    timeout,
+                    agent_pid: Some(agent_pid),
+                    stdout_bytes: stdout.len() as u64,
+                    stderr_bytes: stderr.len() as u64,
+                    last_stdout_at: Some(SystemTime::now()),
+                    last_stderr_at: Some(SystemTime::now()),
+                    note: Some("Agent timed out before producing a final response".to_string()),
+                },
+            );
+        }
+        let stderr = sanitize_agent_diagnostics(&stderr_lossy, prompt);
+        let stdout = sanitize_agent_diagnostics(&stdout_lossy, prompt);
+        let details = match (stderr.is_empty(), stdout.is_empty()) {
+            (true, true) => String::new(),
+            (false, true) => format!("\nAgent stderr before timeout:\n{stderr}"),
+            (true, false) => format!("\nAgent stdout before timeout:\n{stdout}"),
+            (false, false) => format!(
+                "\nAgent stderr before timeout:\n{stderr}\nAgent stdout before timeout:\n{stdout}"
+            ),
+        };
         cleanup_temp_files(&temp_files);
+        bail!(
+            "Agent command `{command}` timed out after {}s. Verify the CLI is installed and authenticated, raise DISTILL_AGENT_TIMEOUT_SECS for slower runs, or set DISTILL_AGENT_TIMEOUT_SECS=0 to disable the timeout entirely.{details}",
+            timeout
+                .expect("timeout should exist when timeout branch is reached")
+                .as_secs()
+        );
+    }
+
+    if !status.success() {
+        persist_agent_debug_output(debug_run_dir, prompt, &stdout_lossy, &stderr_lossy, None);
+        if let Some(debug_artifacts) = debug_artifacts {
+            write_live_scan_status(
+                debug_artifacts,
+                LiveScanStatusUpdate {
+                    started_at: agent_started_at,
+                    state: "failed",
+                    command,
+                    args: &effective_args,
+                    workspace_root,
+                    batch_size,
+                    prompt_bytes: prompt.len(),
+                    timeout,
+                    agent_pid: Some(agent_pid),
+                    stdout_bytes: stdout.len() as u64,
+                    stderr_bytes: stderr.len() as u64,
+                    last_stdout_at: stdout_last_update.lock().ok().and_then(|value| *value),
+                    last_stderr_at: stderr_last_update.lock().ok().and_then(|value| *value),
+                    note: Some(format!("Agent exited with status {status}")),
+                },
+            );
+        }
+        cleanup_temp_files(&temp_files);
+        let output = std::process::Output {
+            status,
+            stdout,
+            stderr,
+        };
         bail!("{}", format_agent_failure(command, &output, prompt));
     }
 
-    let stdout = String::from_utf8(output.stdout).context("Agent stdout is not valid UTF-8")?;
-    let stderr = String::from_utf8(output.stderr).context("Agent stderr is not valid UTF-8")?;
+    let stdout = String::from_utf8(stdout).context("Agent stdout is not valid UTF-8")?;
+    let stderr = String::from_utf8(stderr).context("Agent stderr is not valid UTF-8")?;
 
     let final_output = match mode {
         ProposalAgentMode::Codex => {
@@ -1178,6 +1524,27 @@ fn invoke_agent_with_timeout(
     };
 
     persist_agent_debug_output(debug_run_dir, prompt, &stdout, &stderr, Some(&final_output));
+    if let Some(debug_artifacts) = debug_artifacts {
+        write_live_scan_status(
+            debug_artifacts,
+            LiveScanStatusUpdate {
+                started_at: agent_started_at,
+                state: "completed",
+                command,
+                args: &effective_args,
+                workspace_root,
+                batch_size,
+                prompt_bytes: prompt.len(),
+                timeout,
+                agent_pid: Some(agent_pid),
+                stdout_bytes: stdout.len() as u64,
+                stderr_bytes: stderr.len() as u64,
+                last_stdout_at: Some(SystemTime::now()),
+                last_stderr_at: Some(SystemTime::now()),
+                note: Some("Agent completed successfully".to_string()),
+            },
+        );
+    }
     cleanup_temp_files(&temp_files);
 
     Ok(AgentInvocation {
@@ -1737,6 +2104,46 @@ mod tests {
         assert_eq!(
             agent_timeout_from_env(Some("3600")).unwrap(),
             Some(Duration::from_secs(3600))
+        );
+    }
+
+    #[test]
+    fn test_scan_debug_artifacts_cleanup_success_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifacts = ScanDebugArtifacts::new(dir.path().to_path_buf(), true).unwrap();
+        let run_dir = artifacts.run_dir.clone();
+        let current_run_path = artifacts.current_run_path.clone();
+
+        assert!(run_dir.is_dir());
+        assert!(current_run_path.is_file());
+
+        artifacts.finish_success();
+
+        assert!(!run_dir.exists());
+        assert!(!current_run_path.exists());
+    }
+
+    #[test]
+    fn test_scan_debug_artifacts_preserve_failure_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifacts = ScanDebugArtifacts::new(dir.path().to_path_buf(), true).unwrap();
+        let run_dir = artifacts.run_dir.clone();
+        let current_run_path = artifacts.current_run_path.clone();
+        let last_failed_run_path = artifacts.last_failed_run_path.clone();
+
+        artifacts.finish_failure(&anyhow::anyhow!("boom"));
+
+        assert!(run_dir.is_dir());
+        assert!(!current_run_path.exists());
+        assert_eq!(
+            std::fs::read_to_string(&last_failed_run_path)
+                .unwrap()
+                .trim(),
+            run_dir.to_string_lossy()
+        );
+        assert_eq!(
+            std::fs::read_to_string(run_dir.join("error.txt")).unwrap(),
+            "boom"
         );
     }
 
