@@ -136,6 +136,88 @@ pub fn find_agent_command(kind: AgentKind) -> Option<PathBuf> {
     find_agent_command_in_path(kind, path_env.as_deref())
 }
 
+fn extract_leading_frontmatter(input: &str) -> Option<&str> {
+    if !input.starts_with("---\n") {
+        return None;
+    }
+
+    let after_first = &input[4..];
+    if let Some(end) = after_first.find("\n---\n") {
+        return Some(&input[..(4 + end + 5)]);
+    }
+    if let Some(end) = after_first.find("\n---") {
+        return Some(&input[..(4 + end + 4)]);
+    }
+
+    None
+}
+
+fn infer_skill_description(content: &str) -> Option<String> {
+    let mut in_when_to_use = false;
+    let mut paragraph = Vec::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            let heading = trimmed.trim_start_matches('#').trim();
+            if in_when_to_use {
+                break;
+            }
+            in_when_to_use = heading.eq_ignore_ascii_case("when to use");
+            continue;
+        }
+
+        if !in_when_to_use {
+            continue;
+        }
+
+        if trimmed.is_empty() {
+            if !paragraph.is_empty() {
+                break;
+            }
+            continue;
+        }
+
+        paragraph.push(trimmed);
+    }
+
+    if !paragraph.is_empty() {
+        return Some(paragraph.join(" "));
+    }
+
+    content
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(ToOwned::to_owned)
+}
+
+fn ensure_structured_skill_content(skill: &Skill) -> Result<String> {
+    if extract_leading_frontmatter(&skill.content).is_some() {
+        return Ok(skill.content.clone());
+    }
+
+    #[derive(Serialize)]
+    struct SkillFrontmatter<'a> {
+        name: &'a str,
+        description: &'a str,
+    }
+
+    let description = infer_skill_description(&skill.content).unwrap_or_else(|| {
+        format!(
+            "Instructions and workflow for {}.",
+            skill.name.replace('-', " ")
+        )
+    });
+    let frontmatter = SkillFrontmatter {
+        name: &skill.name,
+        description: &description,
+    };
+    let yaml = serde_yaml::to_string(&frontmatter)?;
+    let body = skill.content.trim_start_matches('\n');
+    Ok(format!("---\n{yaml}---\n\n{body}"))
+}
+
 /// Convert a `std::time::SystemTime` to `DateTime<Utc>`.
 fn system_time_to_utc(st: std::time::SystemTime) -> DateTime<Utc> {
     let duration = st.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
@@ -214,16 +296,17 @@ impl Agent for ClaudeAdapter {
             .join("skills")
             .join(&skill.name)
             .join("SKILL.md");
+        let content = ensure_structured_skill_content(skill)?;
         // Ensure the parent directory exists
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let existing = std::fs::read_to_string(&target).unwrap_or_default();
-        if existing == skill.content {
+        if existing == content {
             // Skill already synced — skip unnecessary rewrite
             return Ok(());
         }
-        std::fs::write(&target, &skill.content)?;
+        std::fs::write(&target, content)?;
         Ok(())
     }
 
@@ -277,6 +360,7 @@ impl Agent for CodexAdapter {
     }
 
     fn write_skill(&self, skill: &Skill) -> Result<()> {
+        let content = ensure_structured_skill_content(skill)?;
         let targets = [
             self.config_dir()
                 .join("skills")
@@ -294,8 +378,8 @@ impl Agent for CodexAdapter {
                 std::fs::create_dir_all(parent)?;
             }
             let existing = std::fs::read_to_string(&target).unwrap_or_default();
-            if existing != skill.content {
-                std::fs::write(&target, &skill.content)?;
+            if existing != content {
+                std::fs::write(&target, &content)?;
             }
         }
         Ok(())
@@ -655,7 +739,10 @@ mod tests {
         adapter.write_skill(&skill).unwrap();
         let written =
             std::fs::read_to_string(home.join(".claude/skills/auto-dir/SKILL.md")).unwrap();
-        assert_eq!(written, "created automatically");
+        assert!(
+            written.starts_with("---\nname: auto-dir\ndescription: created automatically\n---\n\n")
+        );
+        assert!(written.ends_with("created automatically"));
     }
 
     #[test]
@@ -673,8 +760,16 @@ mod tests {
             std::fs::read_to_string(home.join(".codex/skills/auto-dir/SKILL.md")).unwrap();
         let shared_written =
             std::fs::read_to_string(home.join(".agents/skills/auto-dir/SKILL.md")).unwrap();
-        assert_eq!(codex_written, "created automatically");
-        assert_eq!(shared_written, "created automatically");
+        assert!(
+            codex_written
+                .starts_with("---\nname: auto-dir\ndescription: created automatically\n---\n\n")
+        );
+        assert!(
+            shared_written
+                .starts_with("---\nname: auto-dir\ndescription: created automatically\n---\n\n")
+        );
+        assert!(codex_written.ends_with("created automatically"));
+        assert!(shared_written.ends_with("created automatically"));
     }
 
     // --- write_skill: multiple distinct skills are all written ---
@@ -701,8 +796,10 @@ mod tests {
             std::fs::read_to_string(home.join(".claude/skills/skill-a/SKILL.md")).unwrap();
         let written_b =
             std::fs::read_to_string(home.join(".claude/skills/skill-b/SKILL.md")).unwrap();
-        assert_eq!(written_a, "Content A");
-        assert_eq!(written_b, "Content B");
+        assert!(written_a.starts_with("---\nname: skill-a\ndescription: Content A\n---\n"));
+        assert!(written_b.starts_with("---\nname: skill-b\ndescription: Content B\n---\n"));
+        assert!(written_a.ends_with("Content A"));
+        assert!(written_b.ends_with("Content B"));
     }
 
     #[test]
@@ -731,10 +828,45 @@ mod tests {
             std::fs::read_to_string(home.join(".agents/skills/alpha/SKILL.md")).unwrap();
         let shared_written_b =
             std::fs::read_to_string(home.join(".agents/skills/beta/SKILL.md")).unwrap();
-        assert_eq!(codex_written_a, "Alpha content");
-        assert_eq!(codex_written_b, "Beta content");
-        assert_eq!(shared_written_a, "Alpha content");
-        assert_eq!(shared_written_b, "Beta content");
+        assert!(codex_written_a.starts_with("---\nname: alpha\ndescription: Alpha content\n---\n"));
+        assert!(codex_written_b.starts_with("---\nname: beta\ndescription: Beta content\n---\n"));
+        assert_eq!(codex_written_a, shared_written_a);
+        assert_eq!(codex_written_b, shared_written_b);
+    }
+
+    #[test]
+    fn test_claude_write_skill_preserves_existing_structured_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        let adapter = ClaudeAdapter::with_home(home.clone());
+        let structured = "---\nname: review\ndescription: Inspect changes.\n---\n\n# Review\n\nLook for regressions.\n";
+        let skill = Skill {
+            name: "review".into(),
+            content: structured.into(),
+        };
+
+        adapter.write_skill(&skill).unwrap();
+
+        let written = std::fs::read_to_string(home.join(".claude/skills/review/SKILL.md")).unwrap();
+        assert_eq!(written, structured);
+    }
+
+    #[test]
+    fn test_codex_write_skill_uses_when_to_use_text_for_generated_description() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        let adapter = CodexAdapter::with_home(home.clone());
+        let skill = Skill {
+            name: "sync-agents-md".into(),
+            content: "# Sync AGENTS.md\n## When to use\nUse when a repository keeps an `AGENTS.md` guide and you need to refresh it from repo evidence.\n\n## Steps\n1. Inspect files.\n".into(),
+        };
+
+        adapter.write_skill(&skill).unwrap();
+
+        let written =
+            std::fs::read_to_string(home.join(".codex/skills/sync-agents-md/SKILL.md")).unwrap();
+        assert!(written.starts_with("---\nname: sync-agents-md\ndescription: Use when a repository keeps an `AGENTS.md` guide and you need to refresh it from repo evidence.\n---\n\n"));
+        assert!(written.contains("# Sync AGENTS.md"));
     }
 
     // --- session content is not read (agent reads files itself) ---

@@ -138,6 +138,13 @@ mod tests {
     use crate::agents::{ClaudeAdapter, CodexAdapter};
     use std::path::PathBuf;
 
+    fn assert_structured_skill(content: &str, name: &str, description: &str, body_snippet: &str) {
+        assert!(content.starts_with(&format!(
+            "---\nname: {name}\ndescription: {description}\n---\n\n"
+        )));
+        assert!(content.contains(body_snippet));
+    }
+
     // ------------------------------------------------------------------
     // load_skills_from_dirs
     // ------------------------------------------------------------------
@@ -328,16 +335,36 @@ mod tests {
             std::fs::read_to_string(home.join(".claude/skills/testing/SKILL.md")).unwrap();
         let claude_debugging =
             std::fs::read_to_string(home.join(".claude/skills/debugging/SKILL.md")).unwrap();
-        assert_eq!(claude_testing, "# Testing\nWrite tests first.");
-        assert_eq!(claude_debugging, "# Debugging\nRead the error message.");
+        assert_structured_skill(
+            &claude_testing,
+            "testing",
+            "Write tests first.",
+            "# Testing\nWrite tests first.",
+        );
+        assert_structured_skill(
+            &claude_debugging,
+            "debugging",
+            "Read the error message.",
+            "# Debugging\nRead the error message.",
+        );
 
         // Verify Codex's per-skill files
         let codex_testing =
             std::fs::read_to_string(home.join(".codex/skills/testing/SKILL.md")).unwrap();
         let codex_debugging =
             std::fs::read_to_string(home.join(".codex/skills/debugging/SKILL.md")).unwrap();
-        assert_eq!(codex_testing, "# Testing\nWrite tests first.");
-        assert_eq!(codex_debugging, "# Debugging\nRead the error message.");
+        assert_structured_skill(
+            &codex_testing,
+            "testing",
+            "Write tests first.",
+            "# Testing\nWrite tests first.",
+        );
+        assert_structured_skill(
+            &codex_debugging,
+            "debugging",
+            "Read the error message.",
+            "# Debugging\nRead the error message.",
+        );
     }
 
     #[test]
@@ -425,13 +452,33 @@ mod tests {
         let claude_tdd = std::fs::read_to_string(home.join(".claude/skills/tdd/SKILL.md")).unwrap();
         let claude_docs =
             std::fs::read_to_string(home.join(".claude/skills/docs/SKILL.md")).unwrap();
-        assert_eq!(claude_tdd, "# TDD\nRed, green, refactor.");
-        assert_eq!(claude_docs, "# Docs\nWrite docs as you go.");
+        assert_structured_skill(
+            &claude_tdd,
+            "tdd",
+            "Red, green, refactor.",
+            "# TDD\nRed, green, refactor.",
+        );
+        assert_structured_skill(
+            &claude_docs,
+            "docs",
+            "Write docs as you go.",
+            "# Docs\nWrite docs as you go.",
+        );
 
         let codex_tdd = std::fs::read_to_string(home.join(".codex/skills/tdd/SKILL.md")).unwrap();
         let codex_docs = std::fs::read_to_string(home.join(".codex/skills/docs/SKILL.md")).unwrap();
-        assert_eq!(codex_tdd, "# TDD\nRed, green, refactor.");
-        assert_eq!(codex_docs, "# Docs\nWrite docs as you go.");
+        assert_structured_skill(
+            &codex_tdd,
+            "tdd",
+            "Red, green, refactor.",
+            "# TDD\nRed, green, refactor.",
+        );
+        assert_structured_skill(
+            &codex_docs,
+            "docs",
+            "Write docs as you go.",
+            "# Docs\nWrite docs as you go.",
+        );
     }
 
     #[test]
@@ -459,8 +506,8 @@ mod tests {
         assert_eq!(report.errors, Vec::<String>::new());
         let claude = std::fs::read_to_string(home.join(".claude/skills/jj/SKILL.md")).unwrap();
         let codex = std::fs::read_to_string(home.join(".codex/skills/jj/SKILL.md")).unwrap();
-        assert_eq!(claude, "# Jj\nLand carefully.");
-        assert_eq!(codex, "# Jj\nLand carefully.");
+        assert_structured_skill(&claude, "jj", "Land carefully.", "# Jj\nLand carefully.");
+        assert_structured_skill(&codex, "jj", "Land carefully.", "# Jj\nLand carefully.");
     }
 
     #[test]
