@@ -319,6 +319,12 @@ struct AgentRunContext<'a> {
     batch_size: usize,
 }
 
+#[derive(Debug)]
+struct IsolatedCodexHome {
+    path: PathBuf,
+    cleanup_on_drop: bool,
+}
+
 struct StreamCapture {
     bytes_captured: Arc<AtomicU64>,
     last_update: Arc<Mutex<Option<SystemTime>>>,
@@ -384,6 +390,14 @@ impl ScanDebugArtifacts {
             .unwrap_or(false);
         if matches_current_run {
             let _ = std::fs::remove_file(&self.current_run_path);
+        }
+    }
+}
+
+impl Drop for IsolatedCodexHome {
+    fn drop(&mut self) {
+        if self.cleanup_on_drop {
+            let _ = std::fs::remove_dir_all(&self.path);
         }
     }
 }
@@ -633,6 +647,67 @@ fn agent_timeout() -> Result<Option<Duration>> {
             bail!("DISTILL_AGENT_TIMEOUT_SECS must be valid Unicode.")
         }
     }
+}
+
+fn codex_home_dir() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("CODEX_HOME").filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(path));
+    }
+
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .context("HOME is not set; cannot resolve the default Codex home directory")?;
+    Ok(home.join(".codex"))
+}
+
+fn populate_isolated_codex_home(source_home: &Path, isolated_home: &Path) -> Result<()> {
+    std::fs::create_dir_all(isolated_home).with_context(|| {
+        format!(
+            "Failed to create isolated Codex home {}",
+            isolated_home.display()
+        )
+    })?;
+
+    for filename in ["auth.json", "config.toml"] {
+        let source = source_home.join(filename);
+        if !source.is_file() {
+            continue;
+        }
+
+        let destination = isolated_home.join(filename);
+        std::fs::copy(&source, &destination).with_context(|| {
+            format!(
+                "Failed to copy Codex file {} into isolated home {}",
+                source.display(),
+                destination.display()
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+fn prepare_isolated_codex_home_from_source(
+    source_home: &Path,
+    debug_run_dir: Option<&Path>,
+) -> Result<IsolatedCodexHome> {
+    let (path, cleanup_on_drop) = if let Some(run_dir) = debug_run_dir {
+        (run_dir.join("codex-home"), false)
+    } else {
+        (create_temp_dir_path("distill-codex-home")?, true)
+    };
+
+    populate_isolated_codex_home(source_home, &path)?;
+
+    Ok(IsolatedCodexHome {
+        path,
+        cleanup_on_drop,
+    })
+}
+
+fn prepare_isolated_codex_home(debug_run_dir: Option<&Path>) -> Result<IsolatedCodexHome> {
+    let source_home = codex_home_dir()?;
+    prepare_isolated_codex_home_from_source(&source_home, debug_run_dir)
 }
 
 fn scan_batch_size() -> Result<usize> {
@@ -1248,12 +1323,23 @@ fn invoke_agent_with_timeout(
         ProposalAgentMode::Generic => {}
     }
 
-    let mut child = Command::new(command)
+    let isolated_codex_home = match mode {
+        ProposalAgentMode::Codex => Some(prepare_isolated_codex_home(debug_run_dir)?),
+        ProposalAgentMode::Claude | ProposalAgentMode::Generic => None,
+    };
+
+    let mut child_command = Command::new(command);
+    child_command
         .args(&effective_args)
         .current_dir(workspace_root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(codex_home) = isolated_codex_home.as_ref() {
+        child_command.env("CODEX_HOME", &codex_home.path);
+    }
+
+    let mut child = child_command
         .spawn()
         .with_context(|| format!("Failed to execute agent command: {command}"))?;
 
@@ -2105,6 +2191,60 @@ mod tests {
             agent_timeout_from_env(Some("3600")).unwrap(),
             Some(Duration::from_secs(3600))
         );
+    }
+
+    #[test]
+    fn test_populate_isolated_codex_home_copies_auth_and_config_only() {
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+
+        std::fs::write(source.path().join("auth.json"), "{\"token\":\"secret\"}").unwrap();
+        std::fs::write(source.path().join("config.toml"), "model = \"gpt-5.4\"\n").unwrap();
+        std::fs::write(source.path().join("state_5.sqlite"), "do not copy").unwrap();
+
+        populate_isolated_codex_home(source.path(), destination.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(destination.path().join("auth.json")).unwrap(),
+            "{\"token\":\"secret\"}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(destination.path().join("config.toml")).unwrap(),
+            "model = \"gpt-5.4\"\n"
+        );
+        assert!(!destination.path().join("state_5.sqlite").exists());
+    }
+
+    #[test]
+    fn test_prepare_isolated_codex_home_under_debug_run_dir_is_preserved() {
+        let source = tempfile::tempdir().unwrap();
+        let debug_run_dir = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("auth.json"), "{\"token\":\"secret\"}").unwrap();
+
+        let isolated_home =
+            prepare_isolated_codex_home_from_source(source.path(), Some(debug_run_dir.path()))
+                .unwrap();
+        let isolated_path = isolated_home.path.clone();
+        drop(isolated_home);
+
+        assert_eq!(isolated_path, debug_run_dir.path().join("codex-home"));
+        assert!(isolated_path.join("auth.json").is_file());
+    }
+
+    #[test]
+    fn test_prepare_isolated_codex_home_without_debug_run_dir_cleans_up_on_drop() {
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("auth.json"), "{\"token\":\"secret\"}").unwrap();
+
+        let isolated_path = {
+            let isolated_home =
+                prepare_isolated_codex_home_from_source(source.path(), None).unwrap();
+            let isolated_path = isolated_home.path.clone();
+            assert!(isolated_path.exists());
+            isolated_path
+        };
+
+        assert!(!isolated_path.exists());
     }
 
     #[test]
