@@ -78,6 +78,7 @@ const DEFAULT_AGENT_TIMEOUT_SECS: u64 = 2 * 60 * 60;
 const AGENT_POLL_INTERVAL_MS: u64 = 250;
 const DEFAULT_SCAN_BATCH_SIZE: usize = 200;
 const MAX_AGENT_DIAGNOSTIC_CHARS: usize = 4000;
+const MAX_STAGED_SESSION_STRING_CHARS: usize = 1200;
 
 pub struct ScanConfig {
     pub agent_command: String,
@@ -1176,12 +1177,7 @@ fn stage_scan_workspace(
             .and_then(|name| name.to_str())
             .unwrap_or("session.jsonl");
         let staged_path = agent_dir.join(format!("{:04}-{}", index + 1, basename));
-        std::fs::copy(&session.path, &staged_path).with_context(|| {
-            format!(
-                "Failed to copy session {} into staged workspace",
-                session.path.display()
-            )
-        })?;
+        stage_session_file_for_scan(&session.path, &staged_path)?;
 
         staged_sessions.push(StagedSession {
             session: session.clone(),
@@ -1239,6 +1235,87 @@ fn stage_scan_workspace(
         staged_skills,
         cleanup_on_drop,
     })
+}
+
+fn stage_session_file_for_scan(source: &Path, destination: &Path) -> Result<()> {
+    let raw = std::fs::read_to_string(source)
+        .with_context(|| format!("Failed to read session {}", source.display()))?;
+    let sanitized = sanitize_session_artifact(&raw);
+    std::fs::write(destination, sanitized).with_context(|| {
+        format!(
+            "Failed to write staged session {} from {}",
+            destination.display(),
+            source.display()
+        )
+    })
+}
+
+fn sanitize_session_artifact(raw: &str) -> String {
+    let mut lines = Vec::new();
+    for line in raw.lines() {
+        if line.trim().is_empty() {
+            lines.push(line.to_string());
+            continue;
+        }
+
+        let sanitized = match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(mut value) => {
+                sanitize_session_value(&mut value, None);
+                serde_json::to_string(&value).unwrap_or_else(|_| line.to_string())
+            }
+            Err(_) => truncate_session_string(line),
+        };
+        lines.push(sanitized);
+    }
+
+    let mut joined = lines.join("\n");
+    if raw.ends_with('\n') {
+        joined.push('\n');
+    }
+    joined
+}
+
+fn sanitize_session_value(value: &mut serde_json::Value, key: Option<&str>) {
+    match value {
+        serde_json::Value::String(text) => {
+            if matches!(key, Some("encrypted_content")) {
+                *text = "<omitted encrypted content>".to_string();
+            } else {
+                *text = truncate_session_string(text);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                sanitize_session_value(item, None);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (child_key, child_value) in map.iter_mut() {
+                sanitize_session_value(child_value, Some(child_key.as_str()));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn truncate_session_string(input: &str) -> String {
+    if input.chars().count() <= MAX_STAGED_SESSION_STRING_CHARS {
+        return input.to_string();
+    }
+
+    let head_len = MAX_STAGED_SESSION_STRING_CHARS / 2;
+    let tail_len = MAX_STAGED_SESSION_STRING_CHARS / 4;
+    let head: String = input.chars().take(head_len).collect();
+    let tail: String = input
+        .chars()
+        .rev()
+        .take(tail_len)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let omitted = input.chars().count() - head_len - tail_len;
+    format!("{head}\n[... omitted {omitted} chars ...]\n{tail}")
 }
 
 fn sanitize_filename(raw: &str) -> String {
@@ -2702,6 +2779,38 @@ mod tests {
             std::fs::read_to_string(&workspace.staged_skills[0].staged_path).unwrap(),
             "# Review"
         );
+    }
+
+    #[test]
+    fn test_stage_scan_workspace_truncates_large_session_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_path = dir.path().join("session.jsonl");
+        let huge = "x".repeat(MAX_STAGED_SESSION_STRING_CHARS + 500);
+        let line = serde_json::json!({
+            "type": "session_meta",
+            "payload": {
+                "base_instructions": {
+                    "text": huge
+                },
+                "encrypted_content": "secret"
+            }
+        });
+        std::fs::write(&session_path, format!("{line}\n")).unwrap();
+
+        let session = Session {
+            id: "session-1".to_string(),
+            agent: AgentKind::Codex,
+            path: session_path,
+            timestamp: Utc::now(),
+            content: String::new(),
+        };
+
+        let workspace = stage_scan_workspace(&[session], &[], None).unwrap();
+        let staged = std::fs::read_to_string(&workspace.staged_sessions[0].staged_path).unwrap();
+
+        assert!(staged.contains("[... omitted"));
+        assert!(staged.contains("<omitted encrypted content>"));
+        assert!(!staged.contains(&"x".repeat(MAX_STAGED_SESSION_STRING_CHARS + 500)));
     }
 
     #[test]
