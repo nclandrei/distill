@@ -1447,7 +1447,12 @@ fn build_prompt(manifest: &ScanManifest, preferences: &PreferenceProfile) -> Str
     prompt.push_str(
         "You are a skill extraction engine for the `distill` tool.\n\n\
          Your job: inspect staged AI agent session files and propose reusable skills.\n\n\
-         You are allowed to inspect staged files using read-only tools/commands.\n\
+         You may inspect staged files, but keep that inspection minimal.\n\
+         If you use commands at all, restrict them to direct single-file reads of staged session summaries or staged skill files.\n\
+         Do not run searches across the workspace.\n\
+         Do not use Python, node, jq, perl, awk, shell scripts, or helper programs to analyze data or build JSON.\n\
+         Do not make network requests.\n\
+         Synthesize the final JSON directly in your response instead of generating it with tools.\n\
          Do not modify, create, delete, or rename any files.\n\n\
          Output quality bar:\n\
          - Propose only repeated, reusable workflows (not one-off tasks)\n\
@@ -1455,7 +1460,8 @@ fn build_prompt(manifest: &ScanManifest, preferences: &PreferenceProfile) -> Str
          - If evidence is weak, return an empty proposals array, but still cover every session file\n\
          - Every proposal body must be concrete and actionable (no placeholders)\n\n\
          Staged session files are already compact text summaries prepared by Distill.\n\
-         Read them directly; do not re-parse them as raw JSONL logs.\n\n\
+         Read them directly; do not re-parse them as raw JSONL logs.\n\
+         After you have read the listed files once, stop inspecting and answer.\n\n\
          IMPORTANT: Respond ONLY with valid JSON in this exact wrapper shape:\n\
          {\"inspected_files\": [...], \"file_findings\": [...], \"proposals\": [...]}.\n\
          No markdown fences. No commentary.\n\n\
@@ -2747,7 +2753,11 @@ mod tests {
         assert!(prompt.contains("/tmp/workspace/manifest.json"));
         assert!(prompt.contains("Inspect every candidate session file"));
         assert!(!prompt.contains("Session Excerpts"));
-        assert!(!prompt.contains("Do NOT execute tools/commands"));
+        assert!(prompt.contains("Do not run searches across the workspace."));
+        assert!(
+            prompt
+                .contains("After you have read the listed files once, stop inspecting and answer.")
+        );
     }
 
     #[test]
