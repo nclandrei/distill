@@ -148,6 +148,7 @@ fn test_onboard_write_json_template() {
     let written = fs::read_to_string(&output_path).unwrap();
     assert!(written.contains("\"format_version\": 1"));
     assert!(written.contains("\"agents\""));
+    assert!(written.contains("\"opencode\""));
     assert!(written.contains("\"install_shell_hook\""));
 }
 
@@ -161,6 +162,7 @@ fn test_onboard_write_json_stdout() {
         .success()
         .stdout(predicate::str::contains("\"format_version\": 1"))
         .stdout(predicate::str::contains("\"agents\""))
+        .stdout(predicate::str::contains("\"opencode\""))
         .stdout(predicate::str::contains("\"install_shell_hook\""));
 }
 

@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use crate::agents::{AgentKind, from_kind};
+use crate::agents::from_name;
 use crate::config::Config;
 use crate::proposals::{
     Proposal, ProposalTarget, ProposalType, infer_skill_filename_from_body,
@@ -1372,11 +1372,7 @@ fn sync_after_review(skills_dir: &Path) -> Result<crate::sync::SyncReport> {
         .agents
         .iter()
         .filter(|a| a.enabled)
-        .filter_map(|a| match a.name.as_str() {
-            "claude" => Some(from_kind(AgentKind::Claude, home.clone())),
-            "codex" => Some(from_kind(AgentKind::Codex, home.clone())),
-            _ => None,
-        })
+        .filter_map(|a| from_name(a.name.as_str(), home.clone()))
         .collect();
 
     crate::sync::run_sync_from_dirs(

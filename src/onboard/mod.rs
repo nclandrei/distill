@@ -1395,7 +1395,7 @@ mod tests {
         let detected = detect_agents_with_path(None);
         assert_eq!(
             detected.len(),
-            2,
+            3,
             "should report an entry for every known agent"
         );
         for (_, installed) in &detected {
@@ -1417,8 +1417,13 @@ mod tests {
             .iter()
             .find(|(k, _)| *k == AgentKind::Codex)
             .unwrap();
+        let opencode = detected
+            .iter()
+            .find(|(k, _)| *k == AgentKind::OpenCode)
+            .unwrap();
         assert!(claude.1, "Claude should be detected");
         assert!(!codex.1, "Codex should not be detected");
+        assert!(!opencode.1, "OpenCode should not be detected");
     }
 
     #[test]
@@ -1435,8 +1440,36 @@ mod tests {
             .iter()
             .find(|(k, _)| *k == AgentKind::Codex)
             .unwrap();
+        let opencode = detected
+            .iter()
+            .find(|(k, _)| *k == AgentKind::OpenCode)
+            .unwrap();
         assert!(!claude.1, "Claude should not be detected");
         assert!(codex.1, "Codex should be detected");
+        assert!(!opencode.1, "OpenCode should not be detected");
+    }
+
+    #[test]
+    fn test_detect_agents_opencode_only() {
+        let dir = tempfile::tempdir().unwrap();
+        make_fake_agent_bin(&dir, "opencode");
+
+        let detected = detect_agents_with_path(Some(dir.path().as_os_str()));
+        let claude = detected
+            .iter()
+            .find(|(k, _)| *k == AgentKind::Claude)
+            .unwrap();
+        let codex = detected
+            .iter()
+            .find(|(k, _)| *k == AgentKind::Codex)
+            .unwrap();
+        let opencode = detected
+            .iter()
+            .find(|(k, _)| *k == AgentKind::OpenCode)
+            .unwrap();
+        assert!(!claude.1, "Claude should not be detected");
+        assert!(!codex.1, "Codex should not be detected");
+        assert!(opencode.1, "OpenCode should be detected");
     }
 
     #[test]
@@ -1444,9 +1477,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         make_fake_agent_bin(&dir, "claude");
         make_fake_agent_bin(&dir, "codex");
+        make_fake_agent_bin(&dir, "opencode");
 
         let detected = detect_agents_with_path(Some(dir.path().as_os_str()));
-        assert_eq!(detected.len(), 2);
+        assert_eq!(detected.len(), 3);
         for (_, installed) in &detected {
             assert!(installed, "both agents should be detected");
         }
@@ -1539,13 +1573,15 @@ mod tests {
         let config = build_config(&answers);
         assert_eq!(
             config.agents.len(),
-            2,
+            3,
             "should produce one entry per detected agent"
         );
         let claude = config.agents.iter().find(|a| a.name == "claude").unwrap();
         let codex = config.agents.iter().find(|a| a.name == "codex").unwrap();
+        let opencode = config.agents.iter().find(|a| a.name == "opencode").unwrap();
         assert!(claude.enabled);
         assert!(codex.enabled);
+        assert!(!opencode.enabled);
     }
 
     // --- build_config: various interval and notification combinations ---

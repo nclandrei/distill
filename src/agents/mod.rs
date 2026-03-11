@@ -1,8 +1,9 @@
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 /// Represents a single session from an AI agent
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -27,12 +28,22 @@ pub struct Skill {
 pub enum AgentKind {
     Claude,
     Codex,
+    OpenCode,
 }
 
 impl AgentKind {
     /// Return all variants of AgentKind
     pub fn all() -> Vec<AgentKind> {
-        vec![AgentKind::Claude, AgentKind::Codex]
+        vec![AgentKind::Claude, AgentKind::Codex, AgentKind::OpenCode]
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "claude" => Some(Self::Claude),
+            "codex" => Some(Self::Codex),
+            "opencode" => Some(Self::OpenCode),
+            _ => None,
+        }
     }
 
     /// Return the expected CLI name for this agent.
@@ -40,6 +51,7 @@ impl AgentKind {
         match self {
             AgentKind::Claude => "claude",
             AgentKind::Codex => "codex",
+            AgentKind::OpenCode => "opencode",
         }
     }
 }
@@ -49,6 +61,7 @@ impl std::fmt::Display for AgentKind {
         match self {
             AgentKind::Claude => write!(f, "claude"),
             AgentKind::Codex => write!(f, "codex"),
+            AgentKind::OpenCode => write!(f, "opencode"),
         }
     }
 }
@@ -78,6 +91,19 @@ pub fn from_kind(kind: AgentKind, home: PathBuf) -> Box<dyn Agent> {
     match kind {
         AgentKind::Claude => Box::new(ClaudeAdapter { home }),
         AgentKind::Codex => Box::new(CodexAdapter { home }),
+        AgentKind::OpenCode => Box::new(OpenCodeAdapter { home }),
+    }
+}
+
+pub fn from_name(name: &str, home: PathBuf) -> Option<Box<dyn Agent>> {
+    AgentKind::from_name(name).map(|kind| from_kind(kind, home))
+}
+
+pub fn read_session_source(session: &Session) -> Result<String> {
+    match session.agent {
+        AgentKind::Claude | AgentKind::Codex => std::fs::read_to_string(&session.path)
+            .with_context(|| format!("Failed to read session {}", session.path.display())),
+        AgentKind::OpenCode => OpenCodeAdapter::new().export_session(&session.id),
     }
 }
 
@@ -247,6 +273,107 @@ fn read_jsonl_session(path: &std::path::Path, kind: AgentKind) -> Result<Session
     })
 }
 
+fn parse_rfc3339_timestamp(value: &serde_json::Value) -> Option<DateTime<Utc>> {
+    if let Some(raw) = value.as_str() {
+        return DateTime::parse_from_rfc3339(raw)
+            .ok()
+            .map(|timestamp| timestamp.to_utc());
+    }
+
+    if let Some(raw) = value.as_i64() {
+        return DateTime::from_timestamp(raw, 0);
+    }
+
+    None
+}
+
+fn sanitize_virtual_filename(raw: &str) -> String {
+    let sanitized: String = raw
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = sanitized.trim_matches('-');
+    if trimmed.is_empty() {
+        "session".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn opencode_virtual_session_path(home: &Path, session_id: &str) -> PathBuf {
+    home.join(".local")
+        .join("share")
+        .join("opencode")
+        .join("sessions")
+        .join(format!("{}.json", sanitize_virtual_filename(session_id)))
+}
+
+fn parse_opencode_session_list(raw: &str, home: &Path) -> Result<Vec<Session>> {
+    let value: serde_json::Value =
+        serde_json::from_str(raw).context("Failed to parse OpenCode session list JSON")?;
+    let items = value
+        .as_array()
+        .or_else(|| value.get("sessions").and_then(|value| value.as_array()))
+        .or_else(|| value.get("items").and_then(|value| value.as_array()))
+        .or_else(|| value.get("data").and_then(|value| value.as_array()))
+        .context("OpenCode session list JSON did not contain a session array")?;
+
+    let mut sessions = Vec::new();
+    for item in items {
+        let Some(id) = item
+            .get("id")
+            .and_then(|value| value.as_str())
+            .or_else(|| item.get("sessionId").and_then(|value| value.as_str()))
+        else {
+            continue;
+        };
+
+        let timestamp = [
+            "updatedAt",
+            "updated_at",
+            "lastMessageAt",
+            "last_message_at",
+            "createdAt",
+            "created_at",
+            "timestamp",
+        ]
+        .iter()
+        .find_map(|field| item.get(*field).and_then(parse_rfc3339_timestamp))
+        .unwrap_or_else(Utc::now);
+
+        sessions.push(Session {
+            id: id.to_string(),
+            agent: AgentKind::OpenCode,
+            path: opencode_virtual_session_path(home, id),
+            timestamp,
+            content: String::new(),
+        });
+    }
+
+    Ok(sessions)
+}
+
+fn format_command_failure(command: &str, output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let details = match (stderr.trim().is_empty(), stdout.trim().is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => format!(":\n{}", stderr.trim()),
+        (true, false) => format!(":\n{}", stdout.trim()),
+        (false, false) => format!(":\n{}\n{}", stderr.trim(), stdout.trim()),
+    };
+    format!(
+        "Agent command `{command}` failed with status {}{}",
+        output.status, details
+    )
+}
+
 // ---------------------------------------------------------------------------
 // ClaudeAdapter
 // ---------------------------------------------------------------------------
@@ -258,13 +385,6 @@ pub struct ClaudeAdapter {
 }
 
 impl ClaudeAdapter {
-    pub fn new() -> Self {
-        let home = std::env::var("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("."));
-        Self { home }
-    }
-
     #[cfg(test)]
     pub fn with_home(home: PathBuf) -> Self {
         Self { home }
@@ -327,13 +447,6 @@ pub struct CodexAdapter {
 }
 
 impl CodexAdapter {
-    pub fn new() -> Self {
-        let home = std::env::var("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("."));
-        Self { home }
-    }
-
     #[cfg(test)]
     pub fn with_home(home: PathBuf) -> Self {
         Self { home }
@@ -391,6 +504,101 @@ impl Agent for CodexAdapter {
 }
 
 // ---------------------------------------------------------------------------
+// OpenCodeAdapter
+// ---------------------------------------------------------------------------
+
+/// OpenCode adapter — discovers sessions through the official CLI and writes
+/// skills to ~/.config/opencode/skills/<skill-name>/SKILL.md.
+pub struct OpenCodeAdapter {
+    pub home: PathBuf,
+}
+
+impl OpenCodeAdapter {
+    pub fn new() -> Self {
+        let home = std::env::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("."));
+        Self { home }
+    }
+
+    #[cfg(test)]
+    pub fn with_home(home: PathBuf) -> Self {
+        Self { home }
+    }
+
+    fn run_json_command(&self, args: &[&str]) -> Result<String> {
+        let output = Command::new(self.kind().command_name())
+            .args(args)
+            .env("HOME", &self.home)
+            .env("XDG_CONFIG_HOME", self.home.join(".config"))
+            .env("XDG_DATA_HOME", self.home.join(".local").join("share"))
+            .output()
+            .with_context(|| {
+                format!(
+                    "Failed to execute OpenCode command: {} {}",
+                    self.kind().command_name(),
+                    args.join(" ")
+                )
+            })?;
+
+        if !output.status.success() {
+            bail!(
+                "{}",
+                format_command_failure(self.kind().command_name(), &output)
+            );
+        }
+
+        String::from_utf8(output.stdout).context("OpenCode output is not valid UTF-8")
+    }
+
+    fn session_list(&self) -> Result<Vec<Session>> {
+        parse_opencode_session_list(
+            &self.run_json_command(&["session", "list", "--format", "json"])?,
+            &self.home,
+        )
+    }
+
+    fn export_session(&self, session_id: &str) -> Result<String> {
+        self.run_json_command(&["export", session_id, "--format", "json"])
+    }
+}
+
+impl Agent for OpenCodeAdapter {
+    fn kind(&self) -> AgentKind {
+        AgentKind::OpenCode
+    }
+
+    fn read_sessions(&self, since: DateTime<Utc>) -> Result<Vec<Session>> {
+        Ok(self
+            .session_list()?
+            .into_iter()
+            .filter(|session| session.timestamp >= since)
+            .collect())
+    }
+
+    fn write_skill(&self, skill: &Skill) -> Result<()> {
+        let target = self
+            .config_dir()
+            .join("skills")
+            .join(&skill.name)
+            .join("SKILL.md");
+        let content = ensure_structured_skill_content(skill)?;
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let existing = std::fs::read_to_string(&target).unwrap_or_default();
+        if existing != content {
+            std::fs::write(&target, content)?;
+        }
+        Ok(())
+    }
+
+    fn config_dir(&self) -> PathBuf {
+        self.home.join(".config").join("opencode")
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -419,12 +627,14 @@ mod tests {
     fn test_agent_kind_display() {
         assert_eq!(AgentKind::Claude.to_string(), "claude");
         assert_eq!(AgentKind::Codex.to_string(), "codex");
+        assert_eq!(AgentKind::OpenCode.to_string(), "opencode");
     }
 
     #[test]
     fn test_agent_kind_command_name() {
         assert_eq!(AgentKind::Claude.command_name(), "claude");
         assert_eq!(AgentKind::Codex.command_name(), "codex");
+        assert_eq!(AgentKind::OpenCode.command_name(), "opencode");
     }
 
     #[test]
@@ -523,11 +733,12 @@ mod tests {
     // --- AgentKind::all ---
 
     #[test]
-    fn test_agent_kind_all_returns_both_variants() {
+    fn test_agent_kind_all_returns_supported_variants() {
         let all = AgentKind::all();
-        assert_eq!(all.len(), 2);
+        assert_eq!(all.len(), 3);
         assert!(all.contains(&AgentKind::Claude));
         assert!(all.contains(&AgentKind::Codex));
+        assert!(all.contains(&AgentKind::OpenCode));
     }
 
     // --- from_kind factory ---
@@ -546,6 +757,14 @@ mod tests {
         let agent = from_kind(AgentKind::Codex, home.clone());
         assert_eq!(agent.kind(), AgentKind::Codex);
         assert_eq!(agent.config_dir(), home.join(".codex"));
+    }
+
+    #[test]
+    fn test_from_kind_returns_opencode_adapter() {
+        let home = PathBuf::from("/tmp/fakehome");
+        let agent = from_kind(AgentKind::OpenCode, home.clone());
+        assert_eq!(agent.kind(), AgentKind::OpenCode);
+        assert_eq!(agent.config_dir(), home.join(".config/opencode"));
     }
 
     #[test]
@@ -592,6 +811,19 @@ mod tests {
         assert!(sessions.is_empty());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_opencode_read_sessions_missing_list_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        let adapter = OpenCodeAdapter::with_home(home);
+        let err = adapter.read_sessions(DateTime::UNIX_EPOCH).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Failed to execute OpenCode command")
+        );
+    }
+
     // --- read_sessions: returns sessions from .jsonl files ---
 
     #[test]
@@ -632,6 +864,58 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert!(sessions[0].id.ends_with("sess-1.jsonl"));
         assert_eq!(sessions[0].agent, AgentKind::Codex);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_opencode_read_sessions_uses_cli_json_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        let bin_dir = home.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let opencode = bin_dir.join("opencode");
+        std::fs::write(
+            &opencode,
+            "#!/bin/sh\nif [ \"$1\" = \"session\" ] && [ \"$2\" = \"list\" ]; then\n  printf '%s' '[{\"id\":\"sess-1\",\"updatedAt\":\"2026-03-10T12:00:00Z\"}]'\n  exit 0\nfi\nexit 41\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&opencode, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let original_path = std::env::var_os("PATH");
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin_dir.display(),
+                    original_path
+                        .as_deref()
+                        .map(|value| value.to_string_lossy().to_string())
+                        .unwrap_or_default()
+                ),
+            );
+        }
+
+        let adapter = OpenCodeAdapter::with_home(home.clone());
+        let sessions = adapter.read_sessions(DateTime::UNIX_EPOCH).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "sess-1");
+        assert_eq!(sessions[0].agent, AgentKind::OpenCode);
+        assert_eq!(
+            sessions[0].path,
+            home.join(".local/share/opencode/sessions/sess-1.json")
+        );
+
+        unsafe {
+            if let Some(path) = original_path {
+                std::env::set_var("PATH", path);
+            } else {
+                std::env::remove_var("PATH");
+            }
+        }
     }
 
     // --- read_sessions: non-.jsonl files are ignored ---
@@ -772,6 +1056,25 @@ mod tests {
         assert!(shared_written.ends_with("created automatically"));
     }
 
+    #[test]
+    fn test_opencode_write_skill_creates_parent_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        let adapter = OpenCodeAdapter::with_home(home.clone());
+        let skill = Skill {
+            name: "auto-dir".into(),
+            content: "created automatically".into(),
+        };
+        adapter.write_skill(&skill).unwrap();
+        let written =
+            std::fs::read_to_string(home.join(".config/opencode/skills/auto-dir/SKILL.md"))
+                .unwrap();
+        assert!(
+            written.starts_with("---\nname: auto-dir\ndescription: created automatically\n---\n\n")
+        );
+        assert!(written.ends_with("created automatically"));
+    }
+
     // --- write_skill: multiple distinct skills are all written ---
 
     #[test]
@@ -884,6 +1187,23 @@ mod tests {
 
         assert_eq!(sessions.len(), 1);
         assert!(sessions[0].content.is_empty());
+    }
+
+    #[test]
+    fn test_parse_opencode_session_list_accepts_nested_sessions_array() {
+        let home = PathBuf::from("/tmp/home");
+        let sessions = parse_opencode_session_list(
+            r#"{"sessions":[{"id":"sess-2","createdAt":"2026-03-10T12:00:00Z"}]}"#,
+            &home,
+        )
+        .unwrap();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "sess-2");
+        assert_eq!(
+            sessions[0].path,
+            PathBuf::from("/tmp/home/.local/share/opencode/sessions/sess-2.json")
+        );
     }
 
     // --- session path matches the actual file path ---

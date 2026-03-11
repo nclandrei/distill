@@ -4,8 +4,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
-#[cfg(unix)]
-use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -17,6 +15,10 @@ use crate::agents::AgentKind;
 use crate::agents::{Agent, Session};
 use crate::config::Config;
 use crate::preferences::PreferenceProfile;
+use crate::proposal_runner::{
+    ProposalAgentMode, cleanup_temp_files, extract_json_value, finalize_proposal_output,
+    prepare_proposal_command, proposal_agent_command,
+};
 use crate::proposals::{
     Confidence, Evidence, Proposal, ProposalFrontmatter, ProposalTarget, ProposalType,
     infer_skill_name_from_body,
@@ -92,37 +94,16 @@ pub struct ScanConfig {
 
 impl ScanConfig {
     pub fn from_config(config: &Config) -> Self {
-        let (command, args) = agent_command_for(&config.proposal_agent);
+        let command = proposal_agent_command(&config.proposal_agent);
         Self {
-            agent_command: command,
-            agent_args: args,
+            agent_command: command.command,
+            agent_args: command.args,
             skill_dirs: vec![Config::skills_dir(), Config::shared_skills_dir()],
             proposals_dir: Config::proposals_dir(),
             last_scan_path: Config::last_scan_path(),
             backlog_path: Config::scan_backlog_path(),
             history_dir: Config::history_dir(),
         }
-    }
-}
-
-fn agent_command_for(agent_name: &str) -> (String, Vec<String>) {
-    match agent_name {
-        "claude" => (
-            "claude".into(),
-            vec![
-                "--print".into(),
-                "--no-session-persistence".into(),
-                "--verbose".into(),
-                "--output-format".into(),
-                "stream-json".into(),
-                "--permission-mode".into(),
-                "bypassPermissions".into(),
-                "--tools".into(),
-                "Read,Grep,Glob,LS".into(),
-            ],
-        ),
-        "codex" => ("codex".into(), vec!["exec".into(), "--ephemeral".into()]),
-        other => (other.into(), vec![]),
     }
 }
 
@@ -259,13 +240,6 @@ struct ParsedScanResponse {
     proposals: Vec<Proposal>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProposalAgentMode {
-    Codex,
-    Claude,
-    Generic,
-}
-
 struct AgentInvocation {
     final_output: String,
     audit_log: String,
@@ -321,12 +295,6 @@ struct AgentRunContext<'a> {
     debug_run_dir: Option<&'a Path>,
     debug_artifacts: Option<&'a ScanDebugArtifacts>,
     batch_size: usize,
-}
-
-#[derive(Debug)]
-struct IsolatedAgentHome {
-    path: PathBuf,
-    cleanup_on_drop: bool,
 }
 
 struct StreamCapture {
@@ -394,14 +362,6 @@ impl ScanDebugArtifacts {
             .unwrap_or(false);
         if matches_current_run {
             let _ = std::fs::remove_file(&self.current_run_path);
-        }
-    }
-}
-
-impl Drop for IsolatedAgentHome {
-    fn drop(&mut self) {
-        if self.cleanup_on_drop {
-            let _ = std::fs::remove_dir_all(&self.path);
         }
     }
 }
@@ -486,13 +446,6 @@ struct RawEvidence {
     pattern: String,
 }
 
-#[derive(Deserialize)]
-struct ClaudeEnvelope {
-    is_error: Option<bool>,
-    structured_output: Option<serde_json::Value>,
-    result: Option<String>,
-}
-
 fn sort_sessions_newest_first(sessions: &mut [Session]) {
     sessions.sort_by(|left, right| {
         right
@@ -500,60 +453,6 @@ fn sort_sessions_newest_first(sessions: &mut [Session]) {
             .cmp(&left.timestamp)
             .then_with(|| left.path.cmp(&right.path))
     });
-}
-
-fn is_codex_exec(command: &str, args: &[String]) -> bool {
-    let command_name = Path::new(command)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(command);
-    command_name == "codex" && args.first().is_some_and(|arg| arg == "exec")
-}
-
-fn is_claude_cli(command: &str) -> bool {
-    Path::new(command)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(command)
-        == "claude"
-}
-
-fn proposal_agent_mode(command: &str, args: &[String]) -> ProposalAgentMode {
-    if is_codex_exec(command, args) {
-        ProposalAgentMode::Codex
-    } else if is_claude_cli(command) {
-        ProposalAgentMode::Claude
-    } else {
-        ProposalAgentMode::Generic
-    }
-}
-
-fn create_temp_file_path(prefix: &str, extension: &str) -> Result<PathBuf> {
-    let tmp_dir = std::env::temp_dir();
-    let pid = std::process::id();
-    let mut attempt = 0u32;
-    loop {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let path = tmp_dir.join(format!("{prefix}-{pid}-{nanos}-{attempt}.{extension}"));
-        match std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&path)
-        {
-            Ok(_) => return Ok(path),
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                attempt += 1;
-            }
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!("Failed to create temporary file {}", path.display())
-                });
-            }
-        }
-    }
 }
 
 fn create_temp_dir_path(prefix: &str) -> Result<PathBuf> {
@@ -576,12 +475,6 @@ fn create_temp_dir_path(prefix: &str) -> Result<PathBuf> {
                     .with_context(|| format!("Failed to create directory {}", path.display()));
             }
         }
-    }
-}
-
-fn cleanup_temp_files(paths: &[PathBuf]) {
-    for path in paths {
-        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -651,190 +544,6 @@ fn agent_timeout() -> Result<Option<Duration>> {
             bail!("DISTILL_AGENT_TIMEOUT_SECS must be valid Unicode.")
         }
     }
-}
-
-fn user_home_dir() -> Result<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .context("HOME is not set; cannot resolve the user home directory")
-}
-
-fn codex_home_dir() -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("CODEX_HOME").filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(path));
-    }
-
-    let home = user_home_dir()?;
-    Ok(home.join(".codex"))
-}
-
-fn copy_snapshot_path(source: &Path, destination: &Path) -> Result<()> {
-    let metadata = match std::fs::symlink_metadata(source) {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => {
-            return Err(err)
-                .with_context(|| format!("Failed to stat snapshot source {}", source.display()));
-        }
-    };
-
-    if metadata.file_type().is_symlink() {
-        if let Some(parent) = destination.parent() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!(
-                    "Failed to create parent directory for snapshot symlink {}",
-                    destination.display()
-                )
-            })?;
-        }
-        let target = std::fs::read_link(source)
-            .with_context(|| format!("Failed to read symlink {}", source.display()))?;
-        symlink(&target, destination).with_context(|| {
-            format!(
-                "Failed to create snapshot symlink {} -> {}",
-                destination.display(),
-                target.display()
-            )
-        })?;
-        return Ok(());
-    }
-
-    if metadata.is_dir() {
-        std::fs::create_dir_all(destination).with_context(|| {
-            format!(
-                "Failed to create snapshot directory {}",
-                destination.display()
-            )
-        })?;
-        for entry in std::fs::read_dir(source)
-            .with_context(|| format!("Failed to read directory {}", source.display()))?
-        {
-            let entry = entry
-                .with_context(|| format!("Failed to iterate directory {}", source.display()))?;
-            copy_snapshot_path(&entry.path(), &destination.join(entry.file_name()))?;
-        }
-        return Ok(());
-    }
-
-    if metadata.is_file() {
-        if let Some(parent) = destination.parent() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!(
-                    "Failed to create parent directory for snapshot file {}",
-                    destination.display()
-                )
-            })?;
-        }
-        std::fs::copy(source, destination).with_context(|| {
-            format!(
-                "Failed to copy snapshot file {} to {}",
-                source.display(),
-                destination.display()
-            )
-        })?;
-    }
-
-    Ok(())
-}
-
-fn copy_snapshot_entries(
-    source_root: &Path,
-    destination_root: &Path,
-    entries: &[&str],
-) -> Result<()> {
-    std::fs::create_dir_all(destination_root).with_context(|| {
-        format!(
-            "Failed to create snapshot root {}",
-            destination_root.display()
-        )
-    })?;
-    for entry in entries {
-        let relative_path = Path::new(entry);
-        copy_snapshot_path(
-            &source_root.join(relative_path),
-            &destination_root.join(relative_path),
-        )?;
-    }
-    Ok(())
-}
-
-fn populate_isolated_codex_home(source_home: &Path, isolated_home: &Path) -> Result<()> {
-    copy_snapshot_entries(
-        source_home,
-        isolated_home,
-        &[
-            "auth.json",
-            "config.toml",
-            "AGENTS.md",
-            "rules",
-            "skills",
-            "vendor_imports",
-        ],
-    )
-}
-
-fn prepare_isolated_codex_home_from_source(
-    source_home: &Path,
-    debug_run_dir: Option<&Path>,
-) -> Result<IsolatedAgentHome> {
-    let (path, cleanup_on_drop) = if let Some(run_dir) = debug_run_dir {
-        (run_dir.join("codex-home"), false)
-    } else {
-        (create_temp_dir_path("distill-codex-home")?, true)
-    };
-
-    populate_isolated_codex_home(source_home, &path)?;
-
-    Ok(IsolatedAgentHome {
-        path,
-        cleanup_on_drop,
-    })
-}
-
-fn prepare_isolated_codex_home(debug_run_dir: Option<&Path>) -> Result<IsolatedAgentHome> {
-    let source_home = codex_home_dir()?;
-    prepare_isolated_codex_home_from_source(&source_home, debug_run_dir)
-}
-
-fn populate_isolated_claude_home(source_home: &Path, isolated_home: &Path) -> Result<()> {
-    copy_snapshot_entries(
-        source_home,
-        isolated_home,
-        &[
-            ".claude.json",
-            ".claude/CLAUDE.md",
-            ".claude/settings.json",
-            ".claude/commands",
-            ".claude/skills",
-            ".claude/hooks",
-            ".claude/plugins",
-            ".claude/ide",
-            ".claude/plans",
-        ],
-    )
-}
-
-fn prepare_isolated_claude_home_from_source(
-    source_home: &Path,
-    debug_run_dir: Option<&Path>,
-) -> Result<IsolatedAgentHome> {
-    let (path, cleanup_on_drop) = if let Some(run_dir) = debug_run_dir {
-        (run_dir.join("claude-home"), false)
-    } else {
-        (create_temp_dir_path("distill-claude-home")?, true)
-    };
-
-    populate_isolated_claude_home(source_home, &path)?;
-
-    Ok(IsolatedAgentHome {
-        path,
-        cleanup_on_drop,
-    })
-}
-
-fn prepare_isolated_claude_home(debug_run_dir: Option<&Path>) -> Result<IsolatedAgentHome> {
-    let source_home = user_home_dir()?;
-    prepare_isolated_claude_home_from_source(&source_home, debug_run_dir)
 }
 
 fn scan_batch_size() -> Result<usize> {
@@ -1238,8 +947,7 @@ fn stage_scan_workspace(
 }
 
 fn stage_session_file_for_scan(session: &Session, destination: &Path) -> Result<()> {
-    let raw = std::fs::read_to_string(&session.path)
-        .with_context(|| format!("Failed to read session {}", session.path.display()))?;
+    let raw = crate::agents::read_session_source(session)?;
     let summary = build_staged_session_summary(session, &raw);
     std::fs::write(destination, summary).with_context(|| {
         format!(
@@ -1258,7 +966,7 @@ struct SessionDigest {
 }
 
 fn build_staged_session_summary(session: &Session, raw: &str) -> String {
-    let digest = extract_session_digest(raw);
+    let digest = extract_session_digest(session.agent, raw);
     let mut lines = vec![
         "# Staged Session Summary".to_string(),
         format!("Agent: {}", session.agent),
@@ -1328,7 +1036,11 @@ fn append_summary_section(lines: &mut Vec<String>, items: &[String], empty_messa
     }
 }
 
-fn extract_session_digest(raw: &str) -> SessionDigest {
+fn extract_session_digest(agent: crate::agents::AgentKind, raw: &str) -> SessionDigest {
+    if agent == crate::agents::AgentKind::OpenCode {
+        return extract_opencode_session_digest(raw);
+    }
+
     let mut digest = SessionDigest::default();
     for line in raw.lines() {
         let trimmed = line.trim();
@@ -1397,6 +1109,103 @@ fn extract_session_digest(raw: &str) -> SessionDigest {
     }
 
     digest
+}
+
+fn extract_opencode_session_digest(raw: &str) -> SessionDigest {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return SessionDigest::default();
+    };
+
+    let mut digest = SessionDigest::default();
+    collect_opencode_digest(&value, &mut digest, 0);
+    digest
+}
+
+fn collect_opencode_digest(value: &serde_json::Value, digest: &mut SessionDigest, depth: usize) {
+    const MAX_DEPTH: usize = 8;
+    if depth > MAX_DEPTH {
+        return;
+    }
+
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_opencode_digest(item, digest, depth + 1);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            if let Some(role) = map.get("role").and_then(|value| value.as_str()) {
+                let text = extract_opencode_message_text(
+                    map.get("content")
+                        .or_else(|| map.get("parts"))
+                        .or_else(|| map.get("text"))
+                        .or_else(|| map.get("message"))
+                        .unwrap_or(value),
+                );
+                if !text.is_empty() {
+                    match role {
+                        "user" => digest.user_messages.push(text),
+                        "assistant" => digest.assistant_messages.push(text),
+                        _ => {}
+                    }
+                }
+            }
+
+            if let Some(tool_name) = extract_opencode_tool_name(map) {
+                digest.tool_calls.push(tool_name);
+            }
+
+            for item in map.values() {
+                collect_opencode_digest(item, digest, depth + 1);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn extract_opencode_tool_name(map: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    let type_name = map
+        .get("type")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    if !type_name.to_ascii_lowercase().contains("tool")
+        && !map.contains_key("tool")
+        && !map.contains_key("name")
+    {
+        return None;
+    }
+
+    map.get("tool")
+        .and_then(|value| value.as_str())
+        .or_else(|| map.get("name").and_then(|value| value.as_str()))
+        .map(ToOwned::to_owned)
+}
+
+fn extract_opencode_message_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .map(extract_opencode_message_text)
+            .filter(|item| !item.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        serde_json::Value::Object(map) => {
+            let mut parts = Vec::new();
+            for key in [
+                "text", "message", "content", "parts", "summary", "input", "output",
+            ] {
+                if let Some(item) = map.get(key) {
+                    let text = extract_opencode_message_text(item);
+                    if !text.trim().is_empty() {
+                        parts.push(text);
+                    }
+                }
+            }
+            parts.join("\n")
+        }
+        _ => String::new(),
+    }
 }
 
 fn extract_response_message_text(payload: &serde_json::Value) -> String {
@@ -1581,73 +1390,16 @@ fn invoke_agent_with_timeout(
     let debug_run_dir = context.debug_run_dir;
     let debug_artifacts = context.debug_artifacts;
     let batch_size = context.batch_size;
-    let mode = proposal_agent_mode(command, args);
-    let mut effective_args = args.to_vec();
-    let mut temp_files = vec![];
-    let mut codex_output_path = None;
-
-    match mode {
-        ProposalAgentMode::Codex => {
-            if !effective_args.iter().any(|arg| arg == "--json") {
-                effective_args.push("--json".into());
-            }
-            if !effective_args
-                .iter()
-                .any(|arg| arg == "--skip-git-repo-check")
-            {
-                effective_args.push("--skip-git-repo-check".into());
-            }
-            if !effective_args
-                .iter()
-                .any(|arg| arg == "--sandbox" || arg == "-s")
-            {
-                effective_args.push("--sandbox".into());
-                effective_args.push("read-only".into());
-            }
-            if !effective_args
-                .iter()
-                .any(|arg| arg == "-C" || arg == "--cd")
-            {
-                effective_args.push("-C".into());
-                effective_args.push(workspace_root.to_string_lossy().to_string());
-            }
-            if !effective_args.iter().any(|arg| arg == "--output-schema") {
-                let schema_path = create_temp_file_path("distill-codex-schema", "json")?;
-                std::fs::write(&schema_path, PROPOSAL_SCHEMA).with_context(|| {
-                    format!(
-                        "Failed to write Codex schema file {}",
-                        schema_path.display()
-                    )
-                })?;
-                effective_args.push("--output-schema".into());
-                effective_args.push(schema_path.to_string_lossy().to_string());
-                temp_files.push(schema_path);
-            }
-            if !effective_args
-                .iter()
-                .any(|arg| arg == "--output-last-message" || arg == "-o")
-            {
-                let last_message_path = create_temp_file_path("distill-codex-last-message", "txt")?;
-                effective_args.push("--output-last-message".into());
-                effective_args.push(last_message_path.to_string_lossy().to_string());
-                codex_output_path = Some(last_message_path.clone());
-                temp_files.push(last_message_path);
-            }
-        }
-        ProposalAgentMode::Claude => {
-            if !effective_args.iter().any(|arg| arg == "--add-dir") {
-                effective_args.push("--add-dir".into());
-                effective_args.push(workspace_root.to_string_lossy().to_string());
-            }
-        }
-        ProposalAgentMode::Generic => {}
-    }
-
-    let isolated_agent_home = match mode {
-        ProposalAgentMode::Codex => Some(prepare_isolated_codex_home(debug_run_dir)?),
-        ProposalAgentMode::Claude => Some(prepare_isolated_claude_home(debug_run_dir)?),
-        ProposalAgentMode::Generic => None,
-    };
+    let prepared = prepare_proposal_command(
+        command,
+        args,
+        workspace_root,
+        debug_run_dir,
+        Some(PROPOSAL_SCHEMA),
+    )?;
+    let effective_args = prepared.args.clone();
+    let temp_files = prepared.temp_files.clone();
+    let mode = prepared.mode;
 
     let mut child_command = Command::new(command);
     child_command
@@ -1656,14 +1408,8 @@ fn invoke_agent_with_timeout(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    match (mode, isolated_agent_home.as_ref()) {
-        (ProposalAgentMode::Codex, Some(agent_home)) => {
-            child_command.env("CODEX_HOME", &agent_home.path);
-        }
-        (ProposalAgentMode::Claude, Some(agent_home)) => {
-            child_command.env("HOME", &agent_home.path);
-        }
-        _ => {}
+    for (key, value) in &prepared.env_overrides {
+        child_command.env(key, value);
     }
 
     let mut child = child_command
@@ -1920,21 +1666,8 @@ fn invoke_agent_with_timeout(
     let stdout = String::from_utf8(stdout).context("Agent stdout is not valid UTF-8")?;
     let stderr = String::from_utf8(stderr).context("Agent stderr is not valid UTF-8")?;
 
-    let final_output = match mode {
-        ProposalAgentMode::Codex => {
-            let stdout_fallback = stdout.clone();
-            if let Some(path) = codex_output_path {
-                match std::fs::read_to_string(&path) {
-                    Ok(contents) if !contents.trim().is_empty() => contents,
-                    _ => stdout_fallback,
-                }
-            } else {
-                stdout_fallback
-            }
-        }
-        ProposalAgentMode::Claude => extract_claude_stream_output(&stdout)?,
-        ProposalAgentMode::Generic => stdout.clone(),
-    };
+    let final_output =
+        finalize_proposal_output(mode, &stdout, prepared.sidecar_output_path.as_deref())?;
 
     persist_agent_debug_output(debug_run_dir, prompt, &stdout, &stderr, Some(&final_output));
     if let Some(debug_artifacts) = debug_artifacts {
@@ -1985,81 +1718,8 @@ fn persist_agent_debug_output(
     }
 }
 
-fn extract_claude_stream_output(stdout: &str) -> Result<String> {
-    let trimmed = stdout.trim();
-    if trimmed.is_empty() {
-        bail!("Claude agent returned no output");
-    }
-
-    let mut candidates = Vec::new();
-    for line in trimmed.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-
-        if value
-            .get("is_error")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false)
-        {
-            let message = value
-                .get("result")
-                .and_then(|value| value.as_str())
-                .unwrap_or("unknown Claude error");
-            bail!("Claude agent returned an error: {message}");
-        }
-
-        if let Some(structured) = value.get("structured_output") {
-            candidates.push(structured.to_string());
-        }
-
-        collect_text_candidates(&value, &mut candidates, 0);
-    }
-
-    for candidate in candidates.into_iter().rev() {
-        if extract_json_value(&candidate).is_ok() {
-            return Ok(candidate);
-        }
-    }
-
-    if extract_json_value(trimmed).is_ok() {
-        return Ok(trimmed.to_string());
-    }
-
-    bail!("Failed to extract structured JSON from Claude stream output")
-}
-
-fn collect_text_candidates(value: &serde_json::Value, out: &mut Vec<String>, depth: usize) {
-    const MAX_DEPTH: usize = 4;
-    if depth > MAX_DEPTH {
-        return;
-    }
-
-    match value {
-        serde_json::Value::String(text) => out.push(text.clone()),
-        serde_json::Value::Array(items) => {
-            for item in items {
-                collect_text_candidates(item, out, depth + 1);
-            }
-        }
-        serde_json::Value::Object(map) => {
-            for key in ["result", "text", "content", "message", "structured_output"] {
-                if let Some(next) = map.get(key) {
-                    collect_text_candidates(next, out, depth + 1);
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
 fn parse_scan_response(raw: &str, workspace_root: &Path) -> Result<ParsedScanResponse> {
-    let response_value = extract_response_value(raw)?;
+    let response_value = extract_json_value(raw)?;
     let raw_response: RawScanResponse =
         serde_json::from_value(response_value).context("Failed to parse agent response")?;
 
@@ -2088,46 +1748,6 @@ fn parse_scan_response(raw: &str, workspace_root: &Path) -> Result<ParsedScanRes
         file_findings,
         proposals,
     })
-}
-
-fn extract_response_value(raw: &str) -> Result<serde_json::Value> {
-    let trimmed = raw.trim();
-    if let Ok(envelope) = serde_json::from_str::<ClaudeEnvelope>(trimmed) {
-        if envelope.is_error.unwrap_or(false) {
-            let message = envelope
-                .result
-                .unwrap_or_else(|| "unknown Claude error".to_string());
-            bail!("Claude agent returned an error: {message}");
-        }
-
-        if let Some(structured) = envelope.structured_output {
-            return Ok(structured);
-        }
-        if let Some(text) = envelope.result {
-            return extract_json_value(&text);
-        }
-    }
-
-    extract_json_value(trimmed)
-}
-
-fn extract_json_value(text: &str) -> Result<serde_json::Value> {
-    let trimmed = text.trim();
-    let json_str = if trimmed.starts_with("```") {
-        let inner = trimmed
-            .strip_prefix("```json")
-            .or_else(|| trimmed.strip_prefix("```"))
-            .unwrap_or(trimmed);
-        inner
-            .rfind("```")
-            .map(|position| &inner[..position])
-            .unwrap_or(inner)
-            .trim()
-    } else {
-        trimmed
-    };
-
-    serde_json::from_str(json_str).context("Failed to parse agent response as JSON")
 }
 
 fn normalize_reported_path(raw_path: &str, workspace_root: &Path) -> PathBuf {
@@ -2256,7 +1876,10 @@ fn validate_and_finalize_response(
         }
     }
 
-    if invocation.mode != ProposalAgentMode::Generic {
+    if matches!(
+        invocation.mode,
+        ProposalAgentMode::Claude | ProposalAgentMode::Codex
+    ) {
         validate_audit_trail(&invocation.audit_log, &expected_paths)?;
     }
 
@@ -2526,166 +2149,6 @@ mod tests {
     }
 
     #[test]
-    fn test_copy_snapshot_path_preserves_symlinks() {
-        let source = tempfile::tempdir().unwrap();
-        let destination = tempfile::tempdir().unwrap();
-        let target = source.path().join("target.txt");
-        std::fs::write(&target, "hello").unwrap();
-        symlink(&target, source.path().join("link.txt")).unwrap();
-
-        copy_snapshot_path(
-            &source.path().join("link.txt"),
-            &destination.path().join("link.txt"),
-        )
-        .unwrap();
-
-        let metadata = std::fs::symlink_metadata(destination.path().join("link.txt")).unwrap();
-        assert!(metadata.file_type().is_symlink());
-        assert_eq!(
-            std::fs::read_link(destination.path().join("link.txt")).unwrap(),
-            target
-        );
-    }
-
-    #[test]
-    fn test_populate_isolated_codex_home_copies_control_plane_only() {
-        let source = tempfile::tempdir().unwrap();
-        let destination = tempfile::tempdir().unwrap();
-
-        std::fs::write(source.path().join("auth.json"), "{\"token\":\"secret\"}").unwrap();
-        std::fs::write(source.path().join("config.toml"), "model = \"gpt-5.4\"\n").unwrap();
-        std::fs::write(source.path().join("AGENTS.md"), "# agents\n").unwrap();
-        std::fs::create_dir_all(source.path().join("rules")).unwrap();
-        std::fs::write(source.path().join("rules/policy.md"), "be strict\n").unwrap();
-        std::fs::create_dir_all(source.path().join("vendor_imports")).unwrap();
-        std::fs::write(
-            source.path().join("vendor_imports/provider.txt"),
-            "imported\n",
-        )
-        .unwrap();
-        std::fs::create_dir_all(source.path().join("skills")).unwrap();
-        std::fs::write(source.path().join("skills/local.md"), "skill\n").unwrap();
-        std::fs::write(source.path().join("state_5.sqlite"), "do not copy").unwrap();
-        std::fs::create_dir_all(source.path().join("sessions")).unwrap();
-        std::fs::write(source.path().join("sessions/old.jsonl"), "{}\n").unwrap();
-
-        populate_isolated_codex_home(source.path(), destination.path()).unwrap();
-
-        assert_eq!(
-            std::fs::read_to_string(destination.path().join("auth.json")).unwrap(),
-            "{\"token\":\"secret\"}"
-        );
-        assert_eq!(
-            std::fs::read_to_string(destination.path().join("config.toml")).unwrap(),
-            "model = \"gpt-5.4\"\n"
-        );
-        assert_eq!(
-            std::fs::read_to_string(destination.path().join("AGENTS.md")).unwrap(),
-            "# agents\n"
-        );
-        assert_eq!(
-            std::fs::read_to_string(destination.path().join("rules/policy.md")).unwrap(),
-            "be strict\n"
-        );
-        assert_eq!(
-            std::fs::read_to_string(destination.path().join("vendor_imports/provider.txt"))
-                .unwrap(),
-            "imported\n"
-        );
-        assert_eq!(
-            std::fs::read_to_string(destination.path().join("skills/local.md")).unwrap(),
-            "skill\n"
-        );
-        assert!(!destination.path().join("state_5.sqlite").exists());
-        assert!(!destination.path().join("sessions").exists());
-    }
-
-    #[test]
-    fn test_populate_isolated_claude_home_copies_control_plane_only() {
-        let source = tempfile::tempdir().unwrap();
-        let destination = tempfile::tempdir().unwrap();
-
-        std::fs::write(source.path().join(".claude.json"), "{\"token\":\"secret\"}").unwrap();
-        std::fs::create_dir_all(source.path().join(".claude/hooks")).unwrap();
-        std::fs::create_dir_all(source.path().join(".claude/plugins")).unwrap();
-        std::fs::create_dir_all(source.path().join(".claude/plans")).unwrap();
-        std::fs::write(source.path().join(".claude/CLAUDE.md"), "# claude\n").unwrap();
-        std::fs::write(
-            source.path().join(".claude/settings.json"),
-            "{\"theme\":\"dark\"}",
-        )
-        .unwrap();
-        std::fs::write(source.path().join(".claude/hooks/pre.sh"), "echo hook\n").unwrap();
-        std::fs::write(source.path().join(".claude/plugins/plugin.js"), "plugin\n").unwrap();
-        std::fs::write(source.path().join(".claude/plans/plan.md"), "plan\n").unwrap();
-        std::fs::create_dir_all(source.path().join(".claude/projects")).unwrap();
-        std::fs::create_dir_all(source.path().join(".claude/debug")).unwrap();
-        std::fs::write(source.path().join(".claude/projects/session.jsonl"), "{}\n").unwrap();
-        std::fs::write(source.path().join(".claude/debug/log.txt"), "debug\n").unwrap();
-
-        populate_isolated_claude_home(source.path(), destination.path()).unwrap();
-
-        assert_eq!(
-            std::fs::read_to_string(destination.path().join(".claude.json")).unwrap(),
-            "{\"token\":\"secret\"}"
-        );
-        assert_eq!(
-            std::fs::read_to_string(destination.path().join(".claude/CLAUDE.md")).unwrap(),
-            "# claude\n"
-        );
-        assert_eq!(
-            std::fs::read_to_string(destination.path().join(".claude/settings.json")).unwrap(),
-            "{\"theme\":\"dark\"}"
-        );
-        assert_eq!(
-            std::fs::read_to_string(destination.path().join(".claude/hooks/pre.sh")).unwrap(),
-            "echo hook\n"
-        );
-        assert_eq!(
-            std::fs::read_to_string(destination.path().join(".claude/plugins/plugin.js")).unwrap(),
-            "plugin\n"
-        );
-        assert_eq!(
-            std::fs::read_to_string(destination.path().join(".claude/plans/plan.md")).unwrap(),
-            "plan\n"
-        );
-        assert!(!destination.path().join(".claude/projects").exists());
-        assert!(!destination.path().join(".claude/debug").exists());
-    }
-
-    #[test]
-    fn test_prepare_isolated_codex_home_under_debug_run_dir_is_preserved() {
-        let source = tempfile::tempdir().unwrap();
-        let debug_run_dir = tempfile::tempdir().unwrap();
-        std::fs::write(source.path().join("auth.json"), "{\"token\":\"secret\"}").unwrap();
-
-        let isolated_home =
-            prepare_isolated_codex_home_from_source(source.path(), Some(debug_run_dir.path()))
-                .unwrap();
-        let isolated_path = isolated_home.path.clone();
-        drop(isolated_home);
-
-        assert_eq!(isolated_path, debug_run_dir.path().join("codex-home"));
-        assert!(isolated_path.join("auth.json").is_file());
-    }
-
-    #[test]
-    fn test_prepare_isolated_codex_home_without_debug_run_dir_cleans_up_on_drop() {
-        let source = tempfile::tempdir().unwrap();
-        std::fs::write(source.path().join("auth.json"), "{\"token\":\"secret\"}").unwrap();
-
-        let isolated_path = {
-            let isolated_home =
-                prepare_isolated_codex_home_from_source(source.path(), None).unwrap();
-            let isolated_path = isolated_home.path.clone();
-            assert!(isolated_path.exists());
-            isolated_path
-        };
-
-        assert!(!isolated_path.exists());
-    }
-
-    #[test]
     fn test_scan_debug_artifacts_cleanup_success_run() {
         let dir = tempfile::tempdir().unwrap();
         let artifacts = ScanDebugArtifacts::new(dir.path().to_path_buf(), true).unwrap();
@@ -2942,12 +2405,34 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_claude_stream_output_uses_last_json_candidate() {
-        let stdout = r#"{"type":"tool_use","tool":"Read","path":"/tmp/workspace/sessions/claude/0001.jsonl"}
-{"type":"assistant","text":"thinking"}
-{"type":"result","result":"{\"inspected_files\":[\"/tmp/workspace/sessions/claude/0001.jsonl\"],\"file_findings\":[{\"session\":\"/tmp/workspace/sessions/claude/0001.jsonl\",\"summary\":\"Repeated workflow.\"}],\"proposals\":[]}"}"#;
+    fn test_build_staged_session_summary_extracts_opencode_export_messages_and_tools() {
+        let session = Session {
+            id: "sess-1".to_string(),
+            agent: AgentKind::OpenCode,
+            path: PathBuf::from("/tmp/home/.local/share/opencode/sessions/sess-1.json"),
+            timestamp: Utc::now(),
+            content: String::new(),
+        };
+        let raw = r#"{
+          "messages": [
+            {
+              "role": "user",
+              "content": [{"text": "Add OpenCode support from top to bottom."}]
+            },
+            {
+              "role": "assistant",
+              "content": [{"text": "I will inspect the agent registry and scan runner."}]
+            },
+            {
+              "type": "tool_call",
+              "tool": "read"
+            }
+          ]
+        }"#;
 
-        let output = extract_claude_stream_output(stdout).unwrap();
-        assert!(output.contains("\"inspected_files\""));
+        let summary = build_staged_session_summary(&session, raw);
+        assert!(summary.contains("Add OpenCode support from top to bottom."));
+        assert!(summary.contains("inspect the agent registry"));
+        assert!(summary.contains("- read x1"));
     }
 }

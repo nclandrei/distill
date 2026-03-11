@@ -4,6 +4,7 @@ mod config;
 mod notify;
 mod onboard;
 mod preferences;
+mod proposal_runner;
 mod proposals;
 mod review;
 mod scanner;
@@ -40,7 +41,11 @@ const ONBOARD_AFTER_HELP: &str = "\
 Example onboarding JSON:
 {
   \"format_version\": 1,
-  \"agents\": [{\"name\": \"claude\", \"enabled\": true}, {\"name\": \"codex\", \"enabled\": false}],
+  \"agents\": [
+    {\"name\": \"claude\", \"enabled\": true},
+    {\"name\": \"codex\", \"enabled\": false},
+    {\"name\": \"opencode\", \"enabled\": false}
+  ],
   \"scan_interval\": \"weekly\",
   \"proposal_agent\": \"claude\",
   \"shell\": \"zsh\",

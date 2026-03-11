@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 
-use crate::agents::{Agent, ClaudeAdapter, CodexAdapter};
+use crate::agents::{Agent, from_name};
 use crate::config::Config;
 use crate::sync_agents::{
     ProjectStatus, SyncAgentsRunConfig, parse_since, resolve_projects, run_sync_agents,
@@ -120,10 +120,18 @@ fn build_agents(config: &Config) -> Vec<Box<dyn Agent>> {
             continue;
         }
 
-        match entry.name.as_str() {
-            "claude" => agents.push(Box::new(ClaudeAdapter::new())),
-            "codex" => agents.push(Box::new(CodexAdapter::new())),
-            other => eprintln!("Warning: unknown agent '{other}' in config, skipping."),
+        if let Some(agent) = from_name(
+            entry.name.as_str(),
+            std::env::var("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        ) {
+            agents.push(agent);
+        } else {
+            eprintln!(
+                "Warning: unknown agent '{}' in config, skipping.",
+                entry.name
+            );
         }
     }
 

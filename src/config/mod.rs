@@ -120,6 +120,10 @@ impl Default for Config {
                     name: "codex".into(),
                     enabled: true,
                 },
+                AgentEntry {
+                    name: "opencode".into(),
+                    enabled: true,
+                },
             ],
             scan_interval: Interval::default(),
             proposal_agent: "claude".into(),
@@ -255,7 +259,7 @@ mod tests {
         assert_eq!(config.notification_icon, None);
         assert!(config.sync_agents.projects.is_empty());
         assert_eq!(config.proposal_agent, "claude");
-        assert_eq!(config.agents.len(), 2);
+        assert_eq!(config.agents.len(), 3);
     }
 
     #[test]
@@ -274,6 +278,8 @@ agents:
     enabled: true
   - name: codex
     enabled: false
+  - name: opencode
+    enabled: true
 scan_interval: daily
 proposal_agent: claude
 shell: bash
@@ -296,6 +302,7 @@ sync_agents:
         );
         assert_eq!(config.shell, ShellType::Bash);
         assert!(!config.agents[1].enabled);
+        assert!(config.agents[2].enabled);
     }
 
     #[test]
@@ -464,6 +471,10 @@ shell: zsh
                     name: "codex".into(),
                     enabled: false,
                 },
+                AgentEntry {
+                    name: "opencode".into(),
+                    enabled: true,
+                },
             ],
             scan_interval: Interval::Monthly,
             proposal_agent: "codex".into(),
@@ -491,5 +502,6 @@ shell: zsh
             vec!["/tmp/project-a".to_string(), "/tmp/project-b".to_string()]
         );
         assert!(!loaded.agents[1].enabled);
+        assert!(loaded.agents[2].enabled);
     }
 }

@@ -2,7 +2,7 @@
 
 ![distill icon](assets/icons/png/color/distill-color-256.png)
 
-`distill` helps you turn repeated AI-agent work into reusable skills. It watches Claude/Codex sessions, proposes improvements, and lets you accept them with a quick review flow.
+`distill` helps you turn repeated AI-agent work into reusable skills. It watches Claude/Codex/OpenCode sessions, proposes improvements, and lets you accept them with a quick review flow.
 
 ## Install
 
@@ -25,17 +25,19 @@ Icon assets used by notifications and docs:
 - Distill needs at least one supported agent CLI on `PATH`:
   - Claude Code via `claude`
   - Codex CLI via `codex`
+  - OpenCode via `opencode`
 - Onboarding marks an agent as detected only when its CLI is discoverable on `PATH`.
 - Scans require the configured `proposal_agent` CLI to be installed and already authenticated.
 - Distill reads local session logs from:
   - Claude: `~/.claude/projects/**/*.jsonl`
   - Codex: `~/.codex/sessions/**/*.jsonl`
+  - OpenCode: discovered via `opencode session list --format json`, exported via `opencode export <session-id> --format json`
 - If a scan stalls because the upstream agent is slow, raise `DISTILL_AGENT_TIMEOUT_SECS` (default: 7200 seconds) or set it to `0` to disable the timeout entirely.
 
 ## Quick Start
 
 ```bash
-which claude || which codex
+which claude || which codex || which opencode
 distill              # First-run onboarding (interactive TUI)
 distill scan --now   # Scan sessions for new skill proposals
 distill review       # Review proposals (accept/reject/edit/snooze/batch)
@@ -154,9 +156,9 @@ distill onboard --apply-json onboarding.json
 
 `onboarding.json` fields:
 - `format_version` (currently `1`)
-- `agents` (`[{"name":"claude|codex","enabled":true|false}]`)
+- `agents` (`[{"name":"claude|codex|opencode","enabled":true|false}]`)
 - `scan_interval` (`daily|weekly|monthly`)
-- `proposal_agent` (`claude|codex`)
+- `proposal_agent` (`claude|codex|opencode`)
 - `shell` (`zsh|bash|fish|other`)
 - `notifications` (`terminal|native|both|none`)
 - `notification_icon` (`null` or absolute path)
@@ -177,6 +179,7 @@ distill review --apply-json review.json
 - Accepted skills are synced to:
   - `~/.agents/skills/<skill-name>/SKILL.md` (default shared target)
   - `~/.claude/skills/<skill-name>/SKILL.md` when Claude is enabled
+  - `~/.config/opencode/skills/<skill-name>/SKILL.md` when OpenCode is enabled
 
 ### 3) Stdin/stdout mode
 

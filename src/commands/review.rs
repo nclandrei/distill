@@ -6,7 +6,7 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::Path;
 
-use crate::agents::{Agent, AgentKind, from_kind};
+use crate::agents::{Agent, from_name};
 use crate::config::Config;
 use crate::proposals::{Confidence, Evidence, Proposal, ProposalTarget, ProposalType};
 use crate::review::{self, ReviewDecision};
@@ -201,11 +201,7 @@ fn sync_after_review(skills_dir: &Path) -> Result<crate::sync::SyncReport> {
         .agents
         .iter()
         .filter(|entry| entry.enabled)
-        .filter_map(|entry| match entry.name.as_str() {
-            "claude" => Some(from_kind(AgentKind::Claude, home.clone())),
-            "codex" => Some(from_kind(AgentKind::Codex, home.clone())),
-            _ => None,
-        })
+        .filter_map(|entry| from_name(entry.name.as_str(), home.clone()))
         .collect();
 
     crate::sync::run_sync_from_dirs(

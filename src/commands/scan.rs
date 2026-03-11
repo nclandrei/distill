@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 
-use crate::agents::{Agent, ClaudeAdapter, CodexAdapter};
+use crate::agents::{Agent, from_name};
 use crate::config::Config;
 use crate::notify::notify_scan_complete;
 use crate::scanner::engine::{self, ScanConfig};
@@ -63,12 +63,18 @@ fn build_agents(config: &Config) -> Vec<Box<dyn Agent>> {
         if !entry.enabled {
             continue;
         }
-        match entry.name.as_str() {
-            "claude" => agents.push(Box::new(ClaudeAdapter::new())),
-            "codex" => agents.push(Box::new(CodexAdapter::new())),
-            other => {
-                eprintln!("Warning: unknown agent '{other}' in config, skipping.");
-            }
+        if let Some(agent) = from_name(
+            entry.name.as_str(),
+            std::env::var("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        ) {
+            agents.push(agent);
+        } else {
+            eprintln!(
+                "Warning: unknown agent '{}' in config, skipping.",
+                entry.name
+            );
         }
     }
 
@@ -126,6 +132,10 @@ mod tests {
                     name: "codex".into(),
                     enabled: true,
                 },
+                crate::config::AgentEntry {
+                    name: "opencode".into(),
+                    enabled: true,
+                },
             ],
             ..Config::default()
         };
@@ -136,7 +146,8 @@ mod tests {
             kinds,
             vec![
                 crate::agents::AgentKind::Claude,
-                crate::agents::AgentKind::Codex
+                crate::agents::AgentKind::Codex,
+                crate::agents::AgentKind::OpenCode
             ]
         );
     }

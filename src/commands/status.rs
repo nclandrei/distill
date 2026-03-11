@@ -192,9 +192,10 @@ mod tests {
     fn test_format_status_shows_all_agents() {
         let output = format_status(&default_info());
 
-        // Default config has claude and codex, both enabled.
+        // Default config lists every supported agent.
         assert!(output.contains("  - claude (enabled)"));
         assert!(output.contains("  - codex (enabled)"));
+        assert!(output.contains("  - opencode (enabled)"));
     }
 
     #[test]
@@ -263,12 +264,17 @@ mod tests {
                 name: "codex".into(),
                 enabled: false,
             },
+            AgentEntry {
+                name: "opencode".into(),
+                enabled: true,
+            },
         ];
 
         let output = format_status(&info);
 
         assert!(output.contains("  - claude (enabled)"));
         assert!(output.contains("  - codex (disabled)"));
+        assert!(output.contains("  - opencode (enabled)"));
     }
 
     /// Verify that all supported interval / shell / notification variants

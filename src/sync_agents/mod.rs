@@ -7,6 +7,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::agents::Agent;
+use crate::proposal_runner::{
+    cleanup_temp_files, extract_json_value, finalize_proposal_output, prepare_proposal_command,
+    proposal_agent_command,
+};
 use crate::proposals::{
     Confidence, Evidence, Proposal, ProposalFrontmatter, ProposalTarget, ProposalType,
 };
@@ -86,19 +90,6 @@ struct GitEvidence {
 struct SessionEvidence {
     session: String,
     cwd: PathBuf,
-}
-
-#[derive(Debug, Clone)]
-struct AgentInvocation {
-    command: String,
-    args: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ClaudeEnvelope {
-    is_error: Option<bool>,
-    structured_output: Option<serde_json::Value>,
-    result: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -199,7 +190,7 @@ pub fn run_sync_agents(
     let mut total_written = 0usize;
     let mut total_skipped_pending = 0usize;
 
-    let invocation = agent_invocation(&run_config.proposal_agent);
+    let invocation = proposal_agent_command(&run_config.proposal_agent);
 
     for project in projects {
         let agents_path = project.join("AGENTS.md");
@@ -231,7 +222,7 @@ pub fn run_sync_agents(
             &session_evidence,
         );
 
-        let raw = match invoke_agent(&invocation, &prompt) {
+        let raw = match invoke_agent(&invocation, &prompt, project) {
             Ok(value) => value,
             Err(err) => {
                 results.push(ProjectSyncResult {
@@ -605,53 +596,49 @@ If there is no strong evidence for an update, return {\"proposals\":[]}.\n\n",
     prompt
 }
 
-fn agent_invocation(agent_name: &str) -> AgentInvocation {
-    match agent_name {
-        "claude" => AgentInvocation {
-            command: "claude".to_string(),
-            args: vec![
-                "--print".to_string(),
-                "--no-session-persistence".to_string(),
-                "--output-format".to_string(),
-                "json".to_string(),
-            ],
-        },
-        "codex" => AgentInvocation {
-            command: "codex".to_string(),
-            args: vec!["exec".to_string(), "--ephemeral".to_string()],
-        },
-        other => AgentInvocation {
-            command: other.to_string(),
-            args: vec![],
-        },
-    }
-}
-
-fn invoke_agent(invocation: &AgentInvocation, prompt: &str) -> Result<String> {
-    let mut child = Command::new(&invocation.command)
-        .args(&invocation.args)
+fn invoke_agent(
+    invocation: &crate::proposal_runner::ProposalAgentCommand,
+    prompt: &str,
+    workspace_root: &Path,
+) -> Result<String> {
+    let prepared = prepare_proposal_command(
+        &invocation.command,
+        &invocation.args,
+        workspace_root,
+        None,
+        None,
+    )?;
+    let mut child_command = Command::new(&prepared.command);
+    child_command
+        .args(&prepared.args)
+        .current_dir(workspace_root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (key, value) in &prepared.env_overrides {
+        child_command.env(key, value);
+    }
+    let mut child = child_command
         .spawn()
-        .with_context(|| format!("Failed to execute {}", invocation.command))?;
+        .with_context(|| format!("Failed to execute {}", prepared.command))?;
 
     if let Some(mut stdin) = child.stdin.take() {
         stdin
             .write_all(prompt.as_bytes())
-            .with_context(|| format!("Failed to write prompt to {}", invocation.command))?;
+            .with_context(|| format!("Failed to write prompt to {}", prepared.command))?;
     }
 
     let output = child
         .wait_with_output()
-        .with_context(|| format!("Failed to wait on {}", invocation.command))?;
+        .with_context(|| format!("Failed to wait on {}", prepared.command))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
+        cleanup_temp_files(&prepared.temp_files);
         bail!(
             "Agent command '{}' failed with status {}: {}{}",
-            invocation.command,
+            prepared.command,
             output.status,
             stderr.trim(),
             if stdout.trim().is_empty() {
@@ -662,30 +649,18 @@ fn invoke_agent(invocation: &AgentInvocation, prompt: &str) -> Result<String> {
         );
     }
 
-    String::from_utf8(output.stdout).context("Agent output is not valid UTF-8")
+    let stdout = String::from_utf8(output.stdout).context("Agent output is not valid UTF-8")?;
+    let final_output = finalize_proposal_output(
+        prepared.mode,
+        &stdout,
+        prepared.sidecar_output_path.as_deref(),
+    )?;
+    cleanup_temp_files(&prepared.temp_files);
+    Ok(final_output)
 }
 
 fn parse_agent_response(raw: &str, expected_agents_path: &Path) -> Result<Vec<Proposal>> {
-    let trimmed = raw.trim();
-
-    let root_value = if let Ok(envelope) = serde_json::from_str::<ClaudeEnvelope>(trimmed) {
-        if envelope.is_error.unwrap_or(false) {
-            let msg = envelope
-                .result
-                .unwrap_or_else(|| "unknown Claude error".to_string());
-            bail!("Claude agent returned an error: {msg}");
-        }
-
-        if let Some(structured) = envelope.structured_output {
-            structured
-        } else if let Some(result) = envelope.result {
-            extract_json_value(&result)?
-        } else {
-            extract_json_value(trimmed)?
-        }
-    } else {
-        extract_json_value(trimmed)?
-    };
+    let root_value = extract_json_value(raw)?;
 
     let raw_proposals =
         if let Ok(wrapper) = serde_json::from_value::<ProposalWrapper>(root_value.clone()) {
@@ -761,26 +736,6 @@ fn parse_agent_response(raw: &str, expected_agents_path: &Path) -> Result<Vec<Pr
     }
 
     Ok(proposals)
-}
-
-fn extract_json_value(text: &str) -> Result<serde_json::Value> {
-    let trimmed = text.trim();
-
-    let json_text = if trimmed.starts_with("```") {
-        let inner = trimmed
-            .strip_prefix("```json")
-            .or_else(|| trimmed.strip_prefix("```"))
-            .unwrap_or(trimmed);
-        inner
-            .rfind("```")
-            .map(|position| &inner[..position])
-            .unwrap_or(inner)
-            .trim()
-    } else {
-        trimmed
-    };
-
-    serde_json::from_str(json_text).context("Failed to parse agent response as JSON")
 }
 
 fn pending_file_targets(proposals_dir: &Path) -> Result<BTreeSet<String>> {

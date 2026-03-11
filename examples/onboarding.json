@@ -8,6 +8,10 @@
     {
       "name": "codex",
       "enabled": true
+    },
+    {
+      "name": "opencode",
+      "enabled": false
     }
   ],
   "scan_interval": "weekly",

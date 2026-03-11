@@ -135,7 +135,7 @@ pub fn run_sync_from_dirs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agents::{ClaudeAdapter, CodexAdapter};
+    use crate::agents::{ClaudeAdapter, CodexAdapter, OpenCodeAdapter};
     use std::path::PathBuf;
 
     fn assert_structured_skill(content: &str, name: &str, description: &str, body_snippet: &str) {
@@ -311,6 +311,7 @@ mod tests {
         let agents: Vec<Box<dyn Agent>> = vec![
             Box::new(ClaudeAdapter::with_home(home.clone())),
             Box::new(CodexAdapter::with_home(home.clone())),
+            Box::new(OpenCodeAdapter::with_home(home.clone())),
         ];
 
         let skills = vec![
@@ -326,8 +327,8 @@ mod tests {
 
         let report = sync_skills(&skills, &agents).unwrap();
 
-        // 2 skills * 2 agents = 4 successful writes
-        assert_eq!(report.synced, 4);
+        // 2 skills * 3 agents = 6 successful writes
+        assert_eq!(report.synced, 6);
         assert!(report.errors.is_empty());
 
         // Verify Claude's per-skill files
@@ -361,6 +362,24 @@ mod tests {
         );
         assert_structured_skill(
             &codex_debugging,
+            "debugging",
+            "Read the error message.",
+            "# Debugging\nRead the error message.",
+        );
+
+        let opencode_testing =
+            std::fs::read_to_string(home.join(".config/opencode/skills/testing/SKILL.md")).unwrap();
+        let opencode_debugging =
+            std::fs::read_to_string(home.join(".config/opencode/skills/debugging/SKILL.md"))
+                .unwrap();
+        assert_structured_skill(
+            &opencode_testing,
+            "testing",
+            "Write tests first.",
+            "# Testing\nWrite tests first.",
+        );
+        assert_structured_skill(
+            &opencode_debugging,
             "debugging",
             "Read the error message.",
             "# Debugging\nRead the error message.",
@@ -441,12 +460,13 @@ mod tests {
         let agents: Vec<Box<dyn Agent>> = vec![
             Box::new(ClaudeAdapter::with_home(home.clone())),
             Box::new(CodexAdapter::with_home(home.clone())),
+            Box::new(OpenCodeAdapter::with_home(home.clone())),
         ];
 
         let report = run_sync_from_dirs(&[skills_dir], &agents).unwrap();
 
-        // 2 skills * 2 agents = 4 operations
-        assert_eq!(report.synced, 4);
+        // 2 skills * 3 agents = 6 operations
+        assert_eq!(report.synced, 6);
         assert!(report.errors.is_empty());
 
         let claude_tdd = std::fs::read_to_string(home.join(".claude/skills/tdd/SKILL.md")).unwrap();
@@ -479,6 +499,23 @@ mod tests {
             "Write docs as you go.",
             "# Docs\nWrite docs as you go.",
         );
+
+        let opencode_tdd =
+            std::fs::read_to_string(home.join(".config/opencode/skills/tdd/SKILL.md")).unwrap();
+        let opencode_docs =
+            std::fs::read_to_string(home.join(".config/opencode/skills/docs/SKILL.md")).unwrap();
+        assert_structured_skill(
+            &opencode_tdd,
+            "tdd",
+            "Red, green, refactor.",
+            "# TDD\nRed, green, refactor.",
+        );
+        assert_structured_skill(
+            &opencode_docs,
+            "docs",
+            "Write docs as you go.",
+            "# Docs\nWrite docs as you go.",
+        );
     }
 
     #[test]
@@ -499,6 +536,7 @@ mod tests {
         let agents: Vec<Box<dyn Agent>> = vec![
             Box::new(ClaudeAdapter::with_home(home.clone())),
             Box::new(CodexAdapter::with_home(home.clone())),
+            Box::new(OpenCodeAdapter::with_home(home.clone())),
         ];
 
         let report = run_sync_from_dirs(&[local_dir, shared_dir], &agents).unwrap();
@@ -506,8 +544,11 @@ mod tests {
         assert_eq!(report.errors, Vec::<String>::new());
         let claude = std::fs::read_to_string(home.join(".claude/skills/jj/SKILL.md")).unwrap();
         let codex = std::fs::read_to_string(home.join(".codex/skills/jj/SKILL.md")).unwrap();
+        let opencode =
+            std::fs::read_to_string(home.join(".config/opencode/skills/jj/SKILL.md")).unwrap();
         assert_structured_skill(&claude, "jj", "Land carefully.", "# Jj\nLand carefully.");
         assert_structured_skill(&codex, "jj", "Land carefully.", "# Jj\nLand carefully.");
+        assert_structured_skill(&opencode, "jj", "Land carefully.", "# Jj\nLand carefully.");
     }
 
     #[test]

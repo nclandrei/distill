@@ -5,6 +5,11 @@ Reliable operating guide for agents working on this repository.
 Use `$distill-verify` for visual/interactive verification tasks.
 Prefer the `distill_verify_session.sh` helper for repeatable test sessions.
 
+## Repo-local Skills
+
+- `skills/distill-verify/SKILL.md`: Distill-specific Ghostty/tmux verification flow for this repo.
+- `skills/add-coding-agent/SKILL.md`: End-to-end checklist for adding a new supported coding agent to Distill.
+
 ## Terminal Control Model
 
 Use Ghostty window(s) backed by tmux sessions for both visual and non-visual work.

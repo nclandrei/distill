@@ -27,13 +27,23 @@ fn seed_config_with(
     claude_enabled: bool,
     codex_enabled: bool,
 ) {
+    seed_config_with_all(home, proposal_agent, claude_enabled, codex_enabled, false);
+}
+
+fn seed_config_with_all(
+    home: &std::path::Path,
+    proposal_agent: &str,
+    claude_enabled: bool,
+    codex_enabled: bool,
+    opencode_enabled: bool,
+) {
     let distill_dir = home.join(".distill");
     fs::create_dir_all(&distill_dir).unwrap();
     fs::write(
         distill_dir.join("config.yaml"),
         format!(
             "agents:\n  - name: claude\n    enabled: {claude_enabled}\n  - name: codex\n    \
-             enabled: {codex_enabled}\nscan_interval: weekly\nproposal_agent: \
+             enabled: {codex_enabled}\n  - name: opencode\n    enabled: {opencode_enabled}\nscan_interval: weekly\nproposal_agent: \
              {proposal_agent}\nshell: zsh\nnotifications: both\n"
         ),
     )
@@ -78,6 +88,63 @@ fn write_executable_script(path: &std::path::Path, body: &str) {
     fs::set_permissions(path, perms).unwrap();
 }
 
+#[cfg(unix)]
+fn init_git_repo(path: &std::path::Path) {
+    fs::create_dir_all(path).unwrap();
+    let status = std::process::Command::new("git")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .arg("init")
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(status.success(), "failed to init git repo");
+
+    for args in [
+        [
+            "-C",
+            path.to_str().unwrap(),
+            "config",
+            "user.name",
+            "Distill Test",
+        ],
+        [
+            "-C",
+            path.to_str().unwrap(),
+            "config",
+            "user.email",
+            "distill@example.com",
+        ],
+    ] {
+        let status = std::process::Command::new("git")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "failed to configure git repo");
+    }
+}
+
+#[cfg(unix)]
+fn commit_all(path: &std::path::Path, message: &str) {
+    let add_status = std::process::Command::new("git")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .args(["-C", path.to_str().unwrap(), "add", "."])
+        .status()
+        .unwrap();
+    assert!(add_status.success(), "failed to stage git changes");
+
+    let commit_status = std::process::Command::new("git")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .args(["-C", path.to_str().unwrap(), "commit", "-m", message])
+        .status()
+        .unwrap();
+    assert!(commit_status.success(), "failed to create git commit");
+}
+
 // ---------------------------------------------------------------------------
 // Test 1 — status output includes configured agents and scan interval
 // ---------------------------------------------------------------------------
@@ -96,6 +163,7 @@ fn test_e2e_status_shows_config() {
         .stdout(predicate::str::contains("distill status"))
         .stdout(predicate::str::contains("claude"))
         .stdout(predicate::str::contains("codex"))
+        .stdout(predicate::str::contains("opencode"))
         .stdout(predicate::str::contains("weekly"));
 }
 
@@ -718,6 +786,219 @@ printf '%s' "{\"inspected_files\":[\"$staged_session\"],\"file_findings\":[{\"se
     assert!(run_dir.join("agent-stdout.log").is_file());
     assert!(run_dir.join("parsed-response.json").is_file());
     assert!(run_dir.join("workspace/manifest.json").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn test_e2e_scan_opencode_monitored_sessions_with_generic_proposal_agent() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_config_with_all(dir.path(), "fake-proposal-agent.sh", false, false, true);
+
+    let bin_dir = dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+
+    let opencode = bin_dir.join("opencode");
+    write_executable_script(
+        &opencode,
+        r#"#!/bin/sh
+log_file="$HOME/opencode-calls.log"
+printf '%s\n' "$*" >> "$log_file"
+if [ "$1" = "session" ] && [ "$2" = "list" ]; then
+  printf '%s' '[{"id":"sess-1","updatedAt":"2026-03-10T12:00:00Z"}]'
+  exit 0
+fi
+if [ "$1" = "export" ]; then
+  [ "$2" = "sess-1" ] || exit 41
+  printf '%s' '{"messages":[{"role":"user","content":[{"text":"Create a review checklist"}]},{"role":"assistant","content":[{"text":"I inspected the repo and drafted a plan."}]},{"type":"tool_call","tool":"read"}]}'
+  exit 0
+fi
+exit 42
+"#,
+    );
+
+    let fake_agent = bin_dir.join("fake-proposal-agent.sh");
+    write_executable_script(
+        &fake_agent,
+        r##"#!/bin/sh
+cat > /dev/null
+staged_session="$(find "$PWD/sessions/opencode" -type f | head -n 1)"
+[ -n "$staged_session" ] || exit 51
+printf '%s' "{\"inspected_files\":[\"$staged_session\"],\"file_findings\":[{\"session\":\"$staged_session\",\"summary\":\"Repeated review workflow.\"}],\"proposals\":[{\"type\":\"new\",\"confidence\":\"high\",\"target_skill\":\"review-checklist\",\"evidence\":[{\"session\":\"$staged_session\",\"pattern\":\"Repeated review workflow.\"}],\"body\":\"# Review Checklist\\n\\n## When to use\\nUse when reviewing repo changes.\\n\\n## Steps\\n1. Inspect the diff.\\n\\n## Verification\\nConfirm tests pass.\\n\\n## Pitfalls\\nDo not skip failing tests.\"}]}"
+"##,
+    );
+
+    let path_env = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    distill_cmd(dir.path())
+        .env("PATH", &path_env)
+        .args(["scan", "--now"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Scanning agents: opencode"))
+        .stdout(predicate::str::contains("Found 1 session(s) to analyze."))
+        .stdout(predicate::str::contains("Agent proposed 1 skill(s)."));
+
+    let proposal_dir = dir.path().join(".distill/proposals");
+    let proposal_paths: Vec<_> = fs::read_dir(&proposal_dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .collect();
+    assert_eq!(proposal_paths.len(), 1);
+    let proposal = fs::read_to_string(&proposal_paths[0]).unwrap();
+    assert!(proposal.contains("Review Checklist"));
+    assert!(proposal.contains(".local/share/opencode/sessions/sess-1.json"));
+
+    let calls = fs::read_to_string(dir.path().join("opencode-calls.log")).unwrap();
+    assert!(calls.contains("session list --format json"));
+    assert!(calls.contains("export sess-1 --format json"));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_e2e_scan_opencode_proposal_agent_uses_isolated_home_and_inline_permissions() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_config_with_all(dir.path(), "opencode", false, false, true);
+
+    fs::create_dir_all(dir.path().join(".config/opencode")).unwrap();
+    fs::create_dir_all(dir.path().join(".local/share/opencode")).unwrap();
+    fs::write(
+        dir.path().join(".config/opencode/opencode.json"),
+        "{\"theme\":\"dark\"}",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join(".local/share/opencode/auth.json"),
+        "{\"token\":\"secret\"}",
+    )
+    .unwrap();
+
+    let bin_dir = dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let opencode = bin_dir.join("opencode");
+    write_executable_script(
+        &opencode,
+        &format!(
+            r##"#!/bin/sh
+if [ "$1" = "session" ] && [ "$2" = "list" ]; then
+  printf '%s' '[{{"id":"sess-1","updatedAt":"2026-03-10T12:00:00Z"}}]'
+  exit 0
+fi
+if [ "$1" = "export" ]; then
+  printf '%s' '{{"messages":[{{"role":"user","content":[{{"text":"Document the release workflow"}}]}},{{"role":"assistant","content":[{{"text":"I will inspect the release scripts."}}]}}]}}'
+  exit 0
+fi
+[ "$1" = "run" ] || exit 61
+[ "$HOME" != "{home}" ] || exit 62
+[ -f "$HOME/.config/opencode/opencode.json" ] || exit 63
+[ -f "$HOME/.local/share/opencode/auth.json" ] || exit 64
+printf '%s' "$OPENCODE_CONFIG_CONTENT" | grep -q '"edit":"deny"' || exit 65
+printf '%s' "$OPENCODE_CONFIG_CONTENT" | grep -q '"bash":"deny"' || exit 66
+printf '%s' "$OPENCODE_CONFIG_CONTENT" | grep -q '"webfetch":"deny"' || exit 67
+staged_session="$(find "$PWD/sessions/opencode" -type f | head -n 1)"
+[ -n "$staged_session" ] || exit 68
+cat > /dev/null
+printf '%s\n' "{{\"type\":\"tool\",\"name\":\"read\",\"path\":\"$staged_session\"}}"
+printf '%s' "{{\"output\":\"{{\\\"inspected_files\\\":[\\\"$staged_session\\\"],\\\"file_findings\\\":[{{\\\"session\\\":\\\"$staged_session\\\",\\\"summary\\\":\\\"Repeated release workflow.\\\"}}],\\\"proposals\\\":[{{\\\"type\\\":\\\"new\\\",\\\"confidence\\\":\\\"high\\\",\\\"target_skill\\\":\\\"release-checklist\\\",\\\"evidence\\\":[{{\\\"session\\\":\\\"$staged_session\\\",\\\"pattern\\\":\\\"Repeated release workflow.\\\"}}],\\\"body\\\":\\\"# Release Checklist\\\\n\\\\n## When to use\\\\nUse when preparing a release.\\\\n\\\\n## Steps\\\\n1. Inspect the release scripts.\\\\n\\\\n## Verification\\\\nConfirm package output.\\\\n\\\\n## Pitfalls\\\\nDo not skip smoke tests.\\\"}}]}}\"}}"
+"##,
+            home = dir.path().display()
+        ),
+    );
+
+    let path_env = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    distill_cmd(dir.path())
+        .env("PATH", &path_env)
+        .args(["scan", "--now"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Scanning agents: opencode"))
+        .stdout(predicate::str::contains("Agent proposed 1 skill(s)."));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_e2e_sync_agents_opencode_proposal_agent_writes_proposal() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_config_with_all(dir.path(), "opencode", false, false, false);
+
+    fs::create_dir_all(dir.path().join(".config/opencode")).unwrap();
+    fs::create_dir_all(dir.path().join(".local/share/opencode")).unwrap();
+    fs::write(
+        dir.path().join(".config/opencode/opencode.json"),
+        "{\"theme\":\"dark\"}",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join(".local/share/opencode/auth.json"),
+        "{\"token\":\"secret\"}",
+    )
+    .unwrap();
+
+    let project = dir.path().join("demo-project");
+    init_git_repo(&project);
+    fs::write(project.join("README.md"), "# Demo\n").unwrap();
+    commit_all(&project, "Add README");
+    let canonical_project = fs::canonicalize(&project).unwrap();
+
+    let bin_dir = dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let opencode = bin_dir.join("opencode");
+    write_executable_script(
+        &opencode,
+        &format!(
+            r##"#!/bin/sh
+[ "$1" = "run" ] || exit 71
+[ "$HOME" != "{home}" ] || exit 72
+cat > "{prompt_path}"
+printf '%s' "{{\"proposals\":[{{\"type\":\"edit\",\"confidence\":\"high\",\"target\":{{\"kind\":\"file\",\"path\":\"{agents_path}\"}},\"evidence\":[{{\"session\":\"/tmp/session-1.jsonl\",\"pattern\":\"Repeated AGENTS drift.\"}}],\"body\":\"# AGENTS\\n\\nKeep repo instructions current.\"}}]}}"
+"##,
+            home = dir.path().display(),
+            prompt_path = dir.path().join("sync-agents-prompt.txt").display(),
+            agents_path = canonical_project.join("AGENTS.md").display()
+        ),
+    );
+
+    let path_env = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    distill_cmd(dir.path())
+        .env("PATH", &path_env)
+        .args(["sync-agents", "--projects"])
+        .arg(canonical_project.display().to_string())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "sync-agents: evaluated 1 project(s)",
+        ))
+        .stdout(predicate::str::contains("Wrote 1 proposal(s)"));
+
+    let proposals: Vec<_> = fs::read_dir(dir.path().join(".distill/proposals"))
+        .unwrap()
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .collect();
+    assert_eq!(proposals.len(), 1);
+    let proposal = fs::read_to_string(&proposals[0]).unwrap();
+    assert!(
+        proposal.contains(
+            canonical_project
+                .join("AGENTS.md")
+                .to_string_lossy()
+                .as_ref()
+        )
+    );
+    assert!(proposal.contains("type: edit"));
+    assert!(dir.path().join("sync-agents-prompt.txt").is_file());
 }
 // ---------------------------------------------------------------------------
 // Test 5 — full flow: seed config → verify status → verify proposals → verify notify
