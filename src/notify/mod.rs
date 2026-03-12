@@ -170,10 +170,13 @@ fn should_render_terminal_image() -> bool {
         return false;
     }
 
-    let mode = std::env::var(TERMINAL_IMAGE_MODE_ENV).ok();
-    match mode.as_deref().map(str::trim).map(str::to_ascii_lowercase) {
-        None => true,
-        Some(raw) => !matches!(raw.as_str(), "0" | "false" | "off" | "none"),
+    terminal_image_mode_enabled(std::env::var(TERMINAL_IMAGE_MODE_ENV).ok().as_deref())
+}
+
+fn terminal_image_mode_enabled(mode: Option<&str>) -> bool {
+    match mode.map(str::trim).map(str::to_ascii_lowercase) {
+        Some(raw) => matches!(raw.as_str(), "1" | "true" | "on"),
+        None => false,
     }
 }
 
@@ -793,6 +796,26 @@ mod tests {
     #[test]
     fn test_parse_terminal_image_protocol_none_for_unknown() {
         assert_eq!(parse_terminal_image_protocol("unknown"), None);
+    }
+
+    #[test]
+    fn test_terminal_image_mode_defaults_to_disabled() {
+        assert!(!terminal_image_mode_enabled(None));
+    }
+
+    #[test]
+    fn test_terminal_image_mode_explicit_on_enables_rendering() {
+        assert!(terminal_image_mode_enabled(Some("on")));
+        assert!(terminal_image_mode_enabled(Some("true")));
+        assert!(terminal_image_mode_enabled(Some("1")));
+    }
+
+    #[test]
+    fn test_terminal_image_mode_explicit_off_disables_rendering() {
+        assert!(!terminal_image_mode_enabled(Some("off")));
+        assert!(!terminal_image_mode_enabled(Some("false")));
+        assert!(!terminal_image_mode_enabled(Some("0")));
+        assert!(!terminal_image_mode_enabled(Some("none")));
     }
 
     // ── MacOsNotifier ─────────────────────────────────────────────────────────

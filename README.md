@@ -119,15 +119,16 @@ git push origin main
 
 - `notifications`: `terminal|native|both|none`
 - `notification_icon`: `null` or absolute icon path
-- Terminal notifications show an inline icon when supported by the terminal:
+- Terminal notifications are text-only by default.
+- You can opt into inline terminal icons when supported by the terminal:
   - Ghostty/kitty-like terminals via kitty graphics protocol
   - iTerm2 via OSC 1337
-  - Fallback is text-only
 - Optional terminal controls:
-  - `DISTILL_TERMINAL_IMAGE=on|off` (`on` by default; set `off` to disable)
+  - `DISTILL_TERMINAL_IMAGE=on|true|1` to enable inline terminal images
+  - `DISTILL_TERMINAL_IMAGE=off|false|0|none` or unset to keep text-only terminal notifications
   - `DISTILL_TERMINAL_IMAGE_PROTOCOL=ansi|kitty|iterm|none`
 - If running inside tmux, enable passthrough for image rendering: `set -g allow-passthrough on`.
-- In tmux sessions, distill auto-detects the attached terminal (`ghostty/kitty` first, then `iTerm`) and falls back to text-only when passthrough is disabled.
+- In tmux sessions, distill auto-detects the attached terminal (`ghostty/kitty` first, then `iTerm`) when inline images are enabled and falls back to text-only when passthrough is disabled.
 - SVG `notification_icon` values are rasterized to PNG for terminal inline rendering.
 - On Linux native notifications, `notification_icon: null` falls back to the built-in project icon automatically.
 - On macOS native notifications, distill tries `terminal-notifier -appIcon <icon>` first and falls back to AppleScript notification if that path fails.

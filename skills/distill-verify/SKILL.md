@@ -147,13 +147,13 @@ Treat this as success when artifacts confirm it:
 
 ## Notification Image Checks
 
-Terminal inline notification images are enabled by default.
+Terminal notifications are text-only by default.
 For default-behavior verification, run commands without setting `DISTILL_TERMINAL_IMAGE`.
 
 Use the env var only as an override during tests:
 
-- `DISTILL_TERMINAL_IMAGE=off` to disable inline images and validate text-only fallback.
-- `DISTILL_TERMINAL_IMAGE=on` to force-enable while comparing environments.
+- `DISTILL_TERMINAL_IMAGE=off` to keep text-only fallback explicit.
+- `DISTILL_TERMINAL_IMAGE=on` to force-enable inline images while comparing environments.
 
 In tmux, ensure passthrough is enabled before image checks:
 
