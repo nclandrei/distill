@@ -145,6 +145,108 @@ fn commit_all(path: &std::path::Path, message: &str) {
     assert!(commit_status.success(), "failed to create git commit");
 }
 
+#[cfg(unix)]
+fn codex_message_line(role: &str, text: &str) -> String {
+    serde_json::json!({
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "role": role,
+            "content": [{"type": if role == "user" { "input_text" } else { "output_text" }, "text": text}]
+        }
+    })
+    .to_string()
+}
+
+#[cfg(unix)]
+fn codex_command_line(command: &str) -> String {
+    serde_json::json!({
+        "type": "item.completed",
+        "item": {
+            "type": "command_execution",
+            "command": command
+        }
+    })
+    .to_string()
+}
+
+#[cfg(unix)]
+fn write_codex_session(
+    home: &std::path::Path,
+    session_name: &str,
+    project: &str,
+    touch_time: &str,
+    filler_before: usize,
+    filler_after: usize,
+    filler_width: usize,
+    include_workflow: bool,
+) -> std::path::PathBuf {
+    let sessions_dir = home.join(".codex").join("sessions").join("2026").join("03").join("12");
+    fs::create_dir_all(&sessions_dir).unwrap();
+    let path = sessions_dir.join(format!("{session_name}.jsonl"));
+
+    let mut lines = vec![serde_json::json!({
+        "type": "session_meta",
+        "payload": { "cwd": format!("/Users/test/code/{project}") }
+    })
+    .to_string()];
+
+    for index in 0..filler_before {
+        let filler = format!(
+            "{project} before {index} {}",
+            "x".repeat(filler_width.max(1))
+        );
+        lines.push(codex_message_line("user", &filler));
+        lines.push(codex_message_line(
+            "assistant",
+            &format!("Investigating {project} before {index}"),
+        ));
+    }
+
+    if include_workflow {
+        lines.push(codex_message_line(
+            "user",
+            &format!("Wrap this up in {project} and land it cleanly."),
+        ));
+        lines.push(codex_command_line("jj land"));
+        lines.push(codex_command_line(&format!("cargo test -p {project}")));
+        lines.push(codex_message_line(
+            "assistant",
+            &format!("Landed {project} changes and verified tests."),
+        ));
+    } else {
+        lines.push(codex_message_line(
+            "user",
+            &format!("Keep exploring unrelated {project} copy tweaks."),
+        ));
+        lines.push(codex_command_line("sed -n '1,40p' README.md"));
+        lines.push(codex_message_line(
+            "assistant",
+            &format!("Reviewed unrelated {project} docs."),
+        ));
+    }
+
+    for index in 0..filler_after {
+        let filler = format!(
+            "{project} after {index} {}",
+            "y".repeat(filler_width.max(1))
+        );
+        lines.push(codex_message_line("user", &filler));
+        lines.push(codex_message_line(
+            "assistant",
+            &format!("Following up on {project} after {index}"),
+        ));
+    }
+
+    fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+    let status = std::process::Command::new("touch")
+        .args(["-t", touch_time, path.to_str().unwrap()])
+        .status()
+        .unwrap();
+    assert!(status.success(), "failed to set session timestamp");
+    path
+}
+
 // ---------------------------------------------------------------------------
 // Test 1 — status output includes configured agents and scan interval
 // ---------------------------------------------------------------------------
@@ -297,11 +399,11 @@ fn test_e2e_scan_without_now_runs_scheduled_path() {
     );
 }
 
-/// Full Codex proposal-agent path:
+/// Full Codex detection-agent path:
 ///  1. Configure `proposal_agent: codex`
 ///  2. Seed one fake Codex session file
 ///  3. Put a mock `codex` executable at the front of PATH
-///  4. Run `scan --now` and verify a proposal is written
+///  4. Run `scan --now` and verify workflow findings are persisted
 #[cfg(unix)]
 #[test]
 fn test_e2e_scan_codex_proposal_agent_with_schema_enforcement() {
@@ -364,12 +466,12 @@ cat > /dev/null
 [ -n "$cd_dir" ] || exit 34
 [ -n "$schema_file" ] || exit 32
 [ -f "$schema_file" ] || exit 33
-grep -q '"proposals"' "$schema_file" || exit 34
+grep -q '"session_findings"' "$schema_file" || exit 34
 [ -n "$last_message_file" ] || exit 35
 staged_session="$(find "$cd_dir/sessions" -name '*.jsonl' | head -n 1)"
 [ -n "$staged_session" ] || exit 36
 printf '%s\n' "{\"type\":\"item.completed\",\"item\":{\"type\":\"command_execution\",\"command\":\"sed -n '1,40p' $staged_session\"}}"
-printf '%s' "{\"inspected_files\":[\"$staged_session\"],\"file_findings\":[{\"session\":\"$staged_session\",\"summary\":\"repeated shell workflow\"}],\"proposals\":[{\"type\":\"new\",\"confidence\":\"high\",\"target_skill\":null,\"evidence\":[{\"session\":\"$staged_session\",\"pattern\":\"repeated shell workflow\"}],\"body\":\"# Codex Skill\\n\\nUse codex scanner defaults.\"}]}" > "$last_message_file"
+printf '%s' "{\"inspected_files\":[\"$staged_session\"],\"session_findings\":[{\"session\":\"$staged_session\",\"summary\":\"repeated shell workflow\",\"candidates\":[{\"workflow_key\":\"jj-land-run-tests\",\"workflow_label\":\"land and test\",\"note\":\"Repeated landing and test workflow in the middle of the session.\",\"start_event\":1,\"end_event\":1}]}]}" > "$last_message_file"
 "##;
     fs::write(&mock_codex, script).unwrap();
     {
@@ -390,25 +492,13 @@ printf '%s' "{\"inspected_files\":[\"$staged_session\"],\"file_findings\":[{\"se
         .success()
         .stdout(predicate::str::contains("Found 1 session(s) to analyze."))
         .stdout(predicate::str::contains(
-            "Inspecting 1 staged session file(s)",
+            "Inspecting 1 staged session timeline file(s)",
         ))
-        .stdout(predicate::str::contains("Agent proposed 1 skill(s)."));
+        .stdout(predicate::str::contains("Agent proposed 0 skill(s)."));
 
-    let proposals_dir = dir.path().join(".distill").join("proposals");
-    let proposal_paths: Vec<_> = fs::read_dir(&proposals_dir)
-        .unwrap()
-        .filter_map(|e| e.ok().map(|entry| entry.path()))
-        .collect();
-    assert_eq!(
-        proposal_paths.len(),
-        1,
-        "expected one generated proposal file"
-    );
-
-    let proposal_text = fs::read_to_string(&proposal_paths[0]).unwrap();
-    assert!(proposal_text.contains("Codex Skill"));
-    assert!(proposal_text.contains("type: new"));
-    assert!(proposal_text.contains("session-1.jsonl"));
+    let scan_state = fs::read_to_string(dir.path().join(".distill/scan-state.json")).unwrap();
+    assert!(scan_state.contains("jj-land-run-tests"));
+    assert!(scan_state.contains("session-1.jsonl"));
 
     let watermark = fs::read_to_string(dir.path().join(".distill").join("last-scan.json")).unwrap();
     assert!(watermark.contains("timestamp"));
@@ -460,7 +550,7 @@ prompt_file="$HOME/.distill/last-scan-prompt.txt"
 cat > "$prompt_file"
 staged_session="$(find "$PWD/sessions" -name '*.jsonl' | head -n 1)"
 [ -n "$staged_session" ] || exit 21
-printf '%s' "{\"inspected_files\":[\"$staged_session\"],\"file_findings\":[{\"session\":\"$staged_session\",\"summary\":\"No reusable signal.\"}],\"proposals\":[]}"
+printf '%s' "{\"inspected_files\":[\"$staged_session\"],\"session_findings\":[{\"session\":\"$staged_session\",\"summary\":\"No reusable signal.\",\"candidates\":[]}]}"
 "#,
     );
 
@@ -478,7 +568,7 @@ printf '%s' "{\"inspected_files\":[\"$staged_session\"],\"file_findings\":[{\"se
         .stdout(predicate::str::contains("Found 1 session(s) to analyze."))
         .stdout(predicate::str::contains("Loaded 2 existing skill(s)."))
         .stdout(predicate::str::contains(
-            "Inspecting 1 staged session file(s)",
+            "Inspecting 1 staged session timeline file(s)",
         ))
         .stdout(predicate::str::contains("Agent proposed 0 skill(s)."));
 
@@ -598,7 +688,7 @@ cat > /dev/null
 staged_session="$(find "$PWD/sessions" -name '*.jsonl' | head -n 1)"
 [ -n "$staged_session" ] || exit 41
 printf '%s\n' "{\"type\":\"tool_use\",\"tool\":\"Read\",\"path\":\"$staged_session\"}"
-printf '%s\n' "{\"type\":\"result\",\"structured_output\":{\"inspected_files\":[\"$staged_session\"],\"file_findings\":[{\"session\":\"$staged_session\",\"summary\":\"Repeated release checklist.\"}],\"proposals\":[{\"type\":\"new\",\"confidence\":\"medium\",\"target_skill\":null,\"evidence\":[{\"session\":\"$staged_session\",\"pattern\":\"Repeated release checklist.\"}],\"body\":\"# Release Checklist\\n\\nUse a consistent release checklist.\"}]}}"
+printf '%s\n' "{\"type\":\"result\",\"structured_output\":{\"inspected_files\":[\"$staged_session\"],\"session_findings\":[{\"session\":\"$staged_session\",\"summary\":\"Repeated release checklist.\",\"candidates\":[{\"workflow_key\":\"release-checklist\",\"workflow_label\":\"release checklist\",\"note\":\"Reusable release checklist workflow.\",\"start_event\":1,\"end_event\":1}]}]}}"
 "##,
     );
 
@@ -614,7 +704,145 @@ printf '%s\n' "{\"type\":\"result\",\"structured_output\":{\"inspected_files\":[
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "Inspecting 1 staged session file(s)",
+            "Inspecting 1 staged session timeline file(s)",
+        ))
+        .stdout(predicate::str::contains("Agent proposed 0 skill(s)."));
+
+    let scan_state = fs::read_to_string(dir.path().join(".distill/scan-state.json")).unwrap();
+    assert!(scan_state.contains("release-checklist"));
+    assert!(scan_state.contains("session-1.jsonl"));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_e2e_scan_codex_middle_workflow_across_projects_writes_proposal() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_config_with(dir.path(), "fake-proposal-agent.sh", false, true);
+
+    write_codex_session(
+        dir.path(),
+        "atlas-short",
+        "atlas",
+        "202603121100",
+        1,
+        1,
+        16,
+        true,
+    );
+    write_codex_session(
+        dir.path(),
+        "ios-long",
+        "ios-app",
+        "202603121200",
+        12,
+        10,
+        180,
+        true,
+    );
+    write_codex_session(
+        dir.path(),
+        "web-medium",
+        "web-ui",
+        "202603121300",
+        4,
+        4,
+        80,
+        true,
+    );
+    write_codex_session(
+        dir.path(),
+        "docs-noise",
+        "docs-site",
+        "202603121400",
+        6,
+        6,
+        90,
+        false,
+    );
+    write_codex_session(
+        dir.path(),
+        "copy-noise",
+        "marketing",
+        "202603121500",
+        3,
+        2,
+        120,
+        false,
+    );
+
+    let bin_dir = dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let fake_agent = bin_dir.join("fake-proposal-agent.sh");
+    write_executable_script(
+        &fake_agent,
+        r##"#!/bin/sh
+prompt="$(cat)"
+sessions="$(find "$PWD/sessions" -name '*.jsonl' | sort)"
+[ -n "$sessions" ] || exit 71
+
+if printf '%s' "$prompt" | grep -q "workflow detection engine"; then
+  printf '{"inspected_files":['
+  first=1
+  for file in $sessions; do
+    [ $first -eq 0 ] && printf ','
+    printf '"%s"' "$file"
+    first=0
+  done
+  printf '],"session_findings":['
+  first=1
+  for file in $sessions; do
+    [ $first -eq 0 ] && printf ','
+    if grep -q "COMMAND: jj land" "$file" && grep -q "COMMAND: cargo test" "$file"; then
+      candidates='[{"workflow_key":"jj-land-run-tests","workflow_label":"land and run tests","note":"Repeated landing and verification workflow.","start_event":1,"end_event":999}]'
+      summary='Landing workflow detected.'
+    else
+      candidates='[]'
+      summary='Noise-only session.'
+    fi
+    printf '{"session":"%s","summary":"%s","candidates":%s}' "$file" "$summary" "$candidates"
+    first=0
+  done
+  printf ']}'
+else
+  printf '{"inspected_files":['
+  first=1
+  for file in $sessions; do
+    [ $first -eq 0 ] && printf ','
+    printf '"%s"' "$file"
+    first=0
+  done
+  printf '],"file_findings":['
+  first=1
+  for file in $sessions; do
+    [ $first -eq 0 ] && printf ','
+    printf '{"session":"%s","summary":"Repeated landing and verification workflow."}' "$file"
+    first=0
+  done
+  printf '],"proposals":[{"type":"new","confidence":"high","target_skill":null,"evidence":['
+  first=1
+  for file in $sessions; do
+    [ $first -eq 0 ] && printf ','
+    printf '{"session":"%s","pattern":"Repeated landing and verification workflow."}' "$file"
+    first=0
+  done
+  printf '],"body":"# Land And Test\\n\\n## When to use\\nUse when wrapping up work by landing changes and running targeted verification.\\n\\n## Steps\\n1. Finish the change.\\n2. Run `jj land`.\\n3. Run the relevant test command.\\n4. Confirm the result.\\n\\n## Verification\\nCheck that the land command and tests both succeeded.\\n\\n## Pitfalls\\nDo not skip the test step after landing."}]}'
+fi
+"##,
+    );
+
+    let path_env = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    distill_cmd(dir.path())
+        .env("PATH", path_env)
+        .args(["scan", "--now"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "workflow group(s) reached the proposal threshold",
         ))
         .stdout(predicate::str::contains("Agent proposed 1 skill(s)."));
 
@@ -625,8 +853,115 @@ printf '%s\n' "{\"type\":\"result\",\"structured_output\":{\"inspected_files\":[
         .collect();
     assert_eq!(proposal_paths.len(), 1);
     let proposal_text = fs::read_to_string(&proposal_paths[0]).unwrap();
-    assert!(proposal_text.contains("Release Checklist"));
-    assert!(proposal_text.contains("session-1.jsonl"));
+    assert!(proposal_text.contains("Land And Test"));
+    assert!(proposal_text.contains("atlas-short"));
+    assert!(proposal_text.contains("ios-long"));
+    assert!(proposal_text.contains("web-medium"));
+    assert!(!proposal_text.contains("docs-noise"));
+    assert!(!proposal_text.contains("copy-noise"));
+
+    let scan_state = fs::read_to_string(dir.path().join(".distill/scan-state.json")).unwrap();
+    assert!(scan_state.contains("jj-land-run-tests"));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_e2e_scan_large_codex_backlog_respects_byte_cap_and_preserves_remaining_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_config_with(dir.path(), "fake-proposal-agent.sh", false, true);
+
+    for index in 0..18 {
+        write_codex_session(
+            dir.path(),
+            &format!("bulk-{index:02}"),
+            &format!("project-{index:02}"),
+            &format!("20260311{:02}00", index + 1),
+            4,
+            4,
+            220,
+            false,
+        );
+    }
+
+    let bin_dir = dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let fake_agent = bin_dir.join("fake-proposal-agent.sh");
+    write_executable_script(
+        &fake_agent,
+        r#"#!/bin/sh
+cat > /dev/null
+sessions="$(find "$PWD/sessions" -name '*.jsonl' | sort)"
+[ -n "$sessions" ] || exit 81
+for file in $sessions; do
+  basename "$file" >> "$HOME/.distill/seen-batches.txt"
+done
+printf '{"inspected_files":['
+first=1
+for file in $sessions; do
+  [ $first -eq 0 ] && printf ','
+  printf '"%s"' "$file"
+  first=0
+done
+printf '],"session_findings":['
+first=1
+for file in $sessions; do
+  [ $first -eq 0 ] && printf ','
+  printf '{"session":"%s","summary":"Noise-only session.","candidates":[]}' "$file"
+  first=0
+done
+printf ']}'
+"#,
+    );
+
+    let path_env = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    distill_cmd(dir.path())
+        .env("PATH", &path_env)
+        .env("DISTILL_SCAN_BATCH_SIZE", "50")
+        .env("DISTILL_SCAN_MAX_RAW_BYTES", "12000")
+        .args(["scan", "--now"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Capped this scan to"));
+
+    let seen_after_first = fs::read_to_string(dir.path().join(".distill/seen-batches.txt")).unwrap();
+    let first_count = seen_after_first.lines().count();
+    assert!(first_count > 0);
+    assert!(first_count < 18);
+
+    let backlog_after_first =
+        fs::read_to_string(dir.path().join(".distill/scan-backlog.json")).unwrap();
+    let backlog_count_first = serde_json::from_str::<serde_json::Value>(&backlog_after_first)
+        .unwrap()["sessions"]
+        .as_array()
+        .unwrap()
+        .len();
+    assert!(backlog_count_first > 0);
+
+    distill_cmd(dir.path())
+        .env("PATH", &path_env)
+        .env("DISTILL_SCAN_BATCH_SIZE", "50")
+        .env("DISTILL_SCAN_MAX_RAW_BYTES", "12000")
+        .args(["scan", "--now"])
+        .assert()
+        .success();
+
+    let seen_after_second =
+        fs::read_to_string(dir.path().join(".distill/seen-batches.txt")).unwrap();
+    assert!(seen_after_second.lines().count() > first_count);
+
+    let backlog_after_second =
+        fs::read_to_string(dir.path().join(".distill/scan-backlog.json")).unwrap();
+    let backlog_count_second = serde_json::from_str::<serde_json::Value>(&backlog_after_second)
+        .unwrap()["sessions"]
+        .as_array()
+        .unwrap()
+        .len();
+    assert!(backlog_count_second < backlog_count_first);
 }
 
 #[cfg(unix)]
@@ -758,7 +1093,7 @@ fn test_e2e_scan_debug_dir_captures_workspace_and_outputs() {
 cat > /dev/null
 staged_session="$(find "$PWD/sessions" -name '*.jsonl' | head -n 1)"
 [ -n "$staged_session" ] || exit 61
-printf '%s' "{\"inspected_files\":[\"$staged_session\"],\"file_findings\":[{\"session\":\"$staged_session\",\"summary\":\"Covered.\"}],\"proposals\":[]}"
+printf '%s' "{\"inspected_files\":[\"$staged_session\"],\"session_findings\":[{\"session\":\"$staged_session\",\"summary\":\"Covered.\",\"candidates\":[]}]}"
 "#,
     );
 
@@ -784,8 +1119,18 @@ printf '%s' "{\"inspected_files\":[\"$staged_session\"],\"file_findings\":[{\"se
     let run_dir = &run_dirs[0];
     assert!(run_dir.join("prompt.txt").is_file());
     assert!(run_dir.join("agent-stdout.log").is_file());
-    assert!(run_dir.join("parsed-response.json").is_file());
+    assert!(run_dir.join("parsed-workflow-response.json").is_file());
+    assert!(run_dir.join("scan-status.json").is_file());
     assert!(run_dir.join("workspace/manifest.json").is_file());
+
+    let scan_status =
+        serde_json::from_str::<serde_json::Value>(&fs::read_to_string(run_dir.join("scan-status.json")).unwrap())
+            .unwrap();
+    assert_eq!(scan_status["phase"], "finalize");
+    assert!(scan_status["selected_raw_bytes"].as_u64().unwrap() > 0);
+    assert!(scan_status["staged_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(scan_status["discovered_sessions"], 1);
+    assert!(scan_status["durations_ms"]["discovery"].as_u64().is_some());
 }
 
 #[cfg(unix)]

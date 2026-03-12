@@ -3,16 +3,14 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::OpenOptions;
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-#[cfg(test)]
-use crate::agents::AgentKind;
-use crate::agents::{Agent, Session};
+use crate::agents::{Agent, AgentKind, Session};
 use crate::config::Config;
 use crate::preferences::PreferenceProfile;
 use crate::proposal_runner::{
@@ -24,6 +22,11 @@ use crate::proposals::{
     infer_skill_name_from_body,
 };
 use crate::scanner::reader::{self, LastScan};
+use crate::scanner::state::{ReadyWorkflow, ScanState, WorkflowFinding};
+use crate::scanner::timeline::{
+    SessionDescriptor, TimelineWindowRequest, build_session_timeline, discover_session,
+    render_timeline, render_timeline_window,
+};
 use crate::sync::SkillSource;
 
 const PROPOSAL_SCHEMA: &str = r#"{
@@ -76,10 +79,53 @@ const PROPOSAL_SCHEMA: &str = r#"{
   "required": ["inspected_files", "file_findings", "proposals"]
 }"#;
 
+const WORKFLOW_DETECTION_SCHEMA: &str = r#"{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "inspected_files": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "session_findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "session": { "type": "string" },
+          "summary": { "type": "string" },
+          "candidates": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "workflow_key": { "type": "string" },
+                "workflow_label": { "type": ["string", "null"] },
+                "note": { "type": "string" },
+                "start_event": { "type": "integer", "minimum": 1 },
+                "end_event": { "type": "integer", "minimum": 1 }
+              },
+              "required": ["workflow_key", "workflow_label", "note", "start_event", "end_event"]
+            }
+          }
+        },
+        "required": ["session", "summary", "candidates"]
+      }
+    }
+  },
+  "required": ["inspected_files", "session_findings"]
+}"#;
+
 const DEFAULT_AGENT_TIMEOUT_SECS: u64 = 2 * 60 * 60;
 const AGENT_POLL_INTERVAL_MS: u64 = 250;
-const DEFAULT_SCAN_BATCH_SIZE: usize = 200;
+const DEFAULT_SCAN_BATCH_SIZE: usize = 20;
+const DEFAULT_SCAN_MAX_RAW_BYTES: u64 = 64 * 1024 * 1024;
+const MIN_WORKFLOW_MATCHES_FOR_PROPOSAL: usize = 3;
+const MAX_AGENT_TAIL_BYTES: usize = 16 * 1024;
 const MAX_AGENT_DIAGNOSTIC_CHARS: usize = 4000;
+#[cfg(test)]
 const MAX_STAGED_SUMMARY_EXCERPT_CHARS: usize = 500;
 
 pub struct ScanConfig {
@@ -89,6 +135,7 @@ pub struct ScanConfig {
     pub proposals_dir: PathBuf,
     pub last_scan_path: PathBuf,
     pub backlog_path: PathBuf,
+    pub state_path: PathBuf,
     pub history_dir: PathBuf,
 }
 
@@ -102,6 +149,7 @@ impl ScanConfig {
             proposals_dir: Config::proposals_dir(),
             last_scan_path: Config::last_scan_path(),
             backlog_path: Config::scan_backlog_path(),
+            state_path: Config::scan_state_path(),
             history_dir: Config::history_dir(),
         }
     }
@@ -161,10 +209,6 @@ impl ScanBacklog {
         }
     }
 
-    fn batch(&self, batch_size: usize) -> Vec<Session> {
-        self.sessions.iter().take(batch_size).cloned().collect()
-    }
-
     fn remove_batch(&mut self, batch: &[Session]) {
         let batch_paths: HashSet<PathBuf> =
             batch.iter().map(|session| session.path.clone()).collect();
@@ -200,7 +244,7 @@ struct ManifestSkill {
 
 #[derive(Debug, Clone)]
 struct StagedSession {
-    session: Session,
+    source_session: Session,
     staged_path: PathBuf,
 }
 
@@ -240,9 +284,22 @@ struct ParsedScanResponse {
     proposals: Vec<Proposal>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionWorkflowFinding {
+    session: PathBuf,
+    summary: String,
+    candidates: Vec<WorkflowFinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedWorkflowResponse {
+    inspected_files: Vec<PathBuf>,
+    session_findings: Vec<SessionWorkflowFinding>,
+}
+
 struct AgentInvocation {
     final_output: String,
-    audit_log: String,
+    touched_paths: HashSet<PathBuf>,
     mode: ProposalAgentMode,
 }
 
@@ -259,27 +316,56 @@ struct ScanRunStatus {
     state: String,
     started_at: String,
     updated_at: String,
+    phase: String,
     scan_pid: u32,
     agent_pid: Option<u32>,
     agent_command: String,
     workspace_root: String,
     batch_size: usize,
+    selected_raw_bytes: u64,
+    staged_bytes: u64,
+    discovered_sessions: usize,
+    candidate_sessions: usize,
+    skipped_sessions: usize,
+    backlog_sessions: usize,
+    ready_workflows: usize,
+    proposals_written: usize,
     prompt_bytes: usize,
     timeout_secs: Option<u64>,
     stdout_bytes: u64,
     stderr_bytes: u64,
     last_stdout_at: Option<String>,
     last_stderr_at: Option<String>,
+    durations_ms: ScanPhaseDurations,
     note: Option<String>,
+}
+
+#[derive(Debug, Serialize, Default, Clone)]
+struct ScanPhaseDurations {
+    discovery: u64,
+    selection: u64,
+    staging: u64,
+    detection_agent: u64,
+    proposal_agent: u64,
+    finalize: u64,
 }
 
 struct LiveScanStatusUpdate<'a> {
     started_at: DateTime<Utc>,
     state: &'a str,
+    phase: &'a str,
     command: &'a str,
     args: &'a [String],
     workspace_root: &'a Path,
     batch_size: usize,
+    selected_raw_bytes: u64,
+    staged_bytes: u64,
+    discovered_sessions: usize,
+    candidate_sessions: usize,
+    skipped_sessions: usize,
+    backlog_sessions: usize,
+    ready_workflows: usize,
+    proposals_written: usize,
     prompt_bytes: usize,
     timeout: Option<Duration>,
     agent_pid: Option<u32>,
@@ -287,19 +373,34 @@ struct LiveScanStatusUpdate<'a> {
     stderr_bytes: u64,
     last_stdout_at: Option<SystemTime>,
     last_stderr_at: Option<SystemTime>,
+    durations: ScanPhaseDurations,
     note: Option<String>,
 }
 
 struct AgentRunContext<'a> {
+    phase: &'a str,
     timeout: Option<Duration>,
     debug_run_dir: Option<&'a Path>,
     debug_artifacts: Option<&'a ScanDebugArtifacts>,
     batch_size: usize,
+    selected_raw_bytes: u64,
+    staged_bytes: u64,
+    discovered_sessions: usize,
+    candidate_sessions: usize,
+    skipped_sessions: usize,
+    backlog_sessions: usize,
+    ready_workflows: usize,
+    proposals_written: usize,
+    durations: ScanPhaseDurations,
+    output_schema: Option<&'a str>,
+    candidate_paths: Vec<PathBuf>,
 }
 
 struct StreamCapture {
+    output_path: PathBuf,
     bytes_captured: Arc<AtomicU64>,
     last_update: Arc<Mutex<Option<SystemTime>>>,
+    touched_paths: Arc<Mutex<HashSet<PathBuf>>>,
     join_handle: std::thread::JoinHandle<std::io::Result<Vec<u8>>>,
 }
 
@@ -367,52 +468,103 @@ impl ScanDebugArtifacts {
 }
 
 impl StreamCapture {
-    fn spawn<R: Read + Send + 'static>(reader: R, output_path: Option<PathBuf>) -> Self {
+    fn spawn<R: Read + Send + 'static>(
+        reader: R,
+        output_path: PathBuf,
+        candidate_paths: Vec<PathBuf>,
+    ) -> Self {
         let bytes_captured = Arc::new(AtomicU64::new(0));
         let last_update = Arc::new(Mutex::new(None));
+        let touched_paths = Arc::new(Mutex::new(HashSet::new()));
         let bytes_captured_clone = bytes_captured.clone();
         let last_update_clone = last_update.clone();
+        let touched_paths_clone = touched_paths.clone();
+        let output_path_for_thread = output_path.clone();
         let join_handle = std::thread::spawn(move || {
             let mut reader = std::io::BufReader::new(reader);
-            let mut file = output_path
-                .map(|path| {
-                    OpenOptions::new()
-                        .create(true)
-                        .write(true)
-                        .truncate(true)
-                        .open(&path)
-                })
-                .transpose()?;
-            let mut buffer = [0u8; 8192];
-            let mut captured = Vec::new();
+            let mut file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&output_path_for_thread)?;
+            let mut buffer = String::new();
+            let mut tail = Vec::new();
             loop {
-                let read = reader.read(&mut buffer)?;
+                buffer.clear();
+                let read = reader.read_line(&mut buffer)?;
                 if read == 0 {
                     break;
                 }
-                captured.extend_from_slice(&buffer[..read]);
-                if let Some(file) = file.as_mut() {
-                    file.write_all(&buffer[..read])?;
-                    file.flush()?;
-                }
+                file.write_all(buffer.as_bytes())?;
+                file.flush()?;
+                update_touched_paths_from_line(&buffer, &candidate_paths, &touched_paths_clone);
+                append_bounded_tail(&mut tail, buffer.as_bytes(), MAX_AGENT_TAIL_BYTES);
                 bytes_captured_clone.fetch_add(read as u64, Ordering::Relaxed);
                 if let Ok(mut last_update) = last_update_clone.lock() {
                     *last_update = Some(SystemTime::now());
                 }
             }
-            Ok(captured)
+            Ok(tail)
         });
         Self {
+            output_path,
             bytes_captured,
             last_update,
+            touched_paths,
             join_handle,
         }
     }
 
-    fn finish(self, label: &str) -> Result<Vec<u8>> {
+    fn finish(self, label: &str) -> Result<(Vec<u8>, HashSet<PathBuf>, PathBuf)> {
+        let output_path = self.output_path;
+        let touched_paths = self
+            .touched_paths
+            .lock()
+            .map(|value| value.clone())
+            .unwrap_or_default();
         match self.join_handle.join() {
-            Ok(result) => result.with_context(|| format!("Failed to capture agent {label} stream")),
+            Ok(result) => result
+                .with_context(|| format!("Failed to capture agent {label} stream"))
+                .map(|tail| (tail, touched_paths, output_path)),
             Err(_) => bail!("Agent {label} capture thread panicked"),
+        }
+    }
+}
+
+fn append_bounded_tail(buffer: &mut Vec<u8>, chunk: &[u8], limit: usize) {
+    buffer.extend_from_slice(chunk);
+    if buffer.len() > limit {
+        let trim = buffer.len() - limit;
+        buffer.drain(..trim);
+    }
+}
+
+fn update_touched_paths_from_line(
+    line: &str,
+    candidate_paths: &[PathBuf],
+    touched_paths: &Arc<Mutex<HashSet<PathBuf>>>,
+) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return;
+    };
+    if !looks_like_audit_event(&value) {
+        return;
+    }
+
+    let mut strings = Vec::new();
+    collect_all_strings(&value, &mut strings, 0);
+    let haystack = strings.join("\n");
+    let normalized_haystack = normalize_path_like_text(&haystack);
+    if let Ok(mut touched) = touched_paths.lock() {
+        for path in candidate_paths {
+            if path_search_variants(path)
+                .iter()
+                .any(|variant| {
+                    haystack.contains(variant) || normalized_haystack.contains(variant)
+                })
+            {
+                touched.insert(path.clone());
+            }
         }
     }
 }
@@ -446,6 +598,28 @@ struct RawEvidence {
     pattern: String,
 }
 
+#[derive(Deserialize)]
+struct RawWorkflowResponse {
+    inspected_files: Vec<String>,
+    session_findings: Vec<RawSessionWorkflowFinding>,
+}
+
+#[derive(Deserialize)]
+struct RawSessionWorkflowFinding {
+    session: String,
+    summary: String,
+    candidates: Vec<RawWorkflowCandidate>,
+}
+
+#[derive(Deserialize)]
+struct RawWorkflowCandidate {
+    workflow_key: String,
+    workflow_label: Option<String>,
+    note: String,
+    start_event: usize,
+    end_event: usize,
+}
+
 fn sort_sessions_newest_first(sessions: &mut [Session]) {
     sessions.sort_by(|left, right| {
         right
@@ -473,6 +647,29 @@ fn create_temp_dir_path(prefix: &str) -> Result<PathBuf> {
             Err(err) => {
                 return Err(err)
                     .with_context(|| format!("Failed to create directory {}", path.display()));
+            }
+        }
+    }
+}
+
+fn create_temp_file_path(prefix: &str, extension: &str) -> Result<PathBuf> {
+    let tmp_dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let mut attempt = 0u32;
+    loop {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = tmp_dir.join(format!("{prefix}-{pid}-{nanos}-{attempt}.{extension}"));
+        match OpenOptions::new().create_new(true).write(true).open(&path) {
+            Ok(_) => return Ok(path),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                attempt += 1;
+            }
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("Failed to create file {}", path.display()));
             }
         }
     }
@@ -564,6 +761,27 @@ fn scan_batch_size() -> Result<usize> {
     }
 }
 
+fn scan_max_raw_bytes() -> Result<Option<u64>> {
+    match std::env::var("DISTILL_SCAN_MAX_RAW_BYTES") {
+        Ok(raw) => {
+            let max_raw_bytes: u64 = raw.parse().with_context(|| {
+                format!(
+                    "Failed to parse DISTILL_SCAN_MAX_RAW_BYTES={raw:?} as a non-negative integer"
+                )
+            })?;
+            if max_raw_bytes == 0 {
+                Ok(None)
+            } else {
+                Ok(Some(max_raw_bytes))
+            }
+        }
+        Err(std::env::VarError::NotPresent) => Ok(Some(DEFAULT_SCAN_MAX_RAW_BYTES)),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            bail!("DISTILL_SCAN_MAX_RAW_BYTES must be valid Unicode.")
+        }
+    }
+}
+
 fn scan_debug_dir() -> Result<Option<PathBuf>> {
     match std::env::var("DISTILL_SCAN_DEBUG_DIR") {
         Ok(raw) => {
@@ -630,24 +848,29 @@ pub fn run_scan(agents: &[Box<dyn Agent>], scan_config: &ScanConfig) -> Result<V
     );
 
     let result = (|| -> Result<Vec<Proposal>> {
+        let mut phase_durations = ScanPhaseDurations::default();
+        let discovery_started = Instant::now();
         let last_scan = LastScan::load(&scan_config.last_scan_path)?;
         let discovery_since = last_scan
             .as_ref()
             .map(|last_scan| last_scan.timestamp)
             .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap());
         let batch_size = scan_batch_size()?;
+        let max_raw_bytes = scan_max_raw_bytes()?;
         let timeout = agent_timeout()?;
 
         let collected_sessions = reader::collect_sessions(agents, discovery_since)?;
         let collected_count = collected_sessions.len();
         let candidate_sessions =
             filter_low_signal_sessions(filter_distill_scan_artifacts(collected_sessions));
-        let skipped_internal = collected_count.saturating_sub(candidate_sessions.len());
+        let candidate_count = candidate_sessions.len();
+        let skipped_internal = collected_count.saturating_sub(candidate_count);
 
         let mut backlog = ScanBacklog::load(&scan_config.backlog_path)?;
         let seed_newest_first = last_scan.is_none() && backlog.sessions.is_empty();
         backlog.merge_new_sessions(candidate_sessions, seed_newest_first);
         backlog.save(&scan_config.backlog_path)?;
+        phase_durations.discovery = discovery_started.elapsed().as_millis() as u64;
 
         if skipped_internal > 0 {
             println!(
@@ -658,6 +881,33 @@ pub fn run_scan(agents: &[Box<dyn Agent>], scan_config: &ScanConfig) -> Result<V
 
         if backlog.sessions.is_empty() {
             println!("No pending sessions found for scan.");
+            debug_artifacts.write_status(&ScanRunStatus {
+                state: "completed".to_string(),
+                started_at: scan_started_at.to_rfc3339(),
+                updated_at: Utc::now().to_rfc3339(),
+                phase: "idle".to_string(),
+                scan_pid: std::process::id(),
+                agent_pid: None,
+                agent_command: scan_config.agent_command.clone(),
+                workspace_root: debug_artifacts.run_dir.display().to_string(),
+                batch_size: 0,
+                selected_raw_bytes: 0,
+                staged_bytes: 0,
+                discovered_sessions: collected_count,
+                candidate_sessions: candidate_count,
+                skipped_sessions: skipped_internal,
+                backlog_sessions: 0,
+                ready_workflows: 0,
+                proposals_written: 0,
+                prompt_bytes: 0,
+                timeout_secs: timeout.map(|value| value.as_secs()),
+                stdout_bytes: 0,
+                stderr_bytes: 0,
+                last_stdout_at: None,
+                last_stderr_at: None,
+                durations_ms: phase_durations,
+                note: Some("No pending sessions found for scan.".to_string()),
+            });
             let watermark = LastScan {
                 timestamp: scan_started_at,
                 session_ids: vec![],
@@ -669,11 +919,15 @@ pub fn run_scan(agents: &[Box<dyn Agent>], scan_config: &ScanConfig) -> Result<V
         println!("Found {} session(s) to analyze.", backlog.sessions.len());
         println!("Pending scan backlog: {}", backlog.sessions.len());
 
-        let batch = backlog.batch(batch_size);
+        let selection_started = Instant::now();
+        let batch = select_session_batch(&backlog.sessions, batch_size, max_raw_bytes)?;
+        phase_durations.selection = selection_started.elapsed().as_millis() as u64;
+        let selected_raw_bytes = batch.iter().map(|session| session.raw_bytes).sum::<u64>();
         if batch.len() < backlog.sessions.len() {
             println!(
-                "Capped this scan to {} newest pending session(s); rerun scan to continue draining the backlog.",
-                batch.len()
+                "Capped this scan to {} pending session(s) totaling {} bytes; rerun scan to continue draining the backlog.",
+                batch.len(),
+                selected_raw_bytes
             );
         }
 
@@ -697,93 +951,350 @@ pub fn run_scan(agents: &[Box<dyn Agent>], scan_config: &ScanConfig) -> Result<V
             );
         }
 
-        let workspace = stage_scan_workspace(&batch, &skill_sources, debug_run_dir)?;
-        let prompt = build_prompt(&workspace.manifest, &preferences);
-        write_debug_text(debug_run_dir, "prompt.txt", &prompt);
+        let staging_started = Instant::now();
+        let (workspace, staged_bytes) = stage_timeline_workspace(&batch, &skill_sources, debug_run_dir)?;
+        phase_durations.staging = staging_started.elapsed().as_millis() as u64;
+        let prompt = build_workflow_detection_prompt(&workspace.manifest, &preferences);
+        write_debug_text(debug_run_dir, "workflow-detection-prompt.txt", &prompt);
 
         println!(
-            "Inspecting {} staged session file(s) with `{}` (prompt: {} bytes)...",
+            "Inspecting {} staged session timeline file(s) with `{}` (prompt: {} bytes)...",
             batch.len(),
             scan_config.agent_command,
             prompt.len()
         );
-        println!("Waiting for agent response (this may take several minutes)...");
+        println!("Waiting for workflow detection response...");
 
+        let detection_started = Instant::now();
         let invocation = invoke_agent(
             &scan_config.agent_command,
             &scan_config.agent_args,
             &prompt,
             &workspace.root,
             AgentRunContext {
+                phase: "detection_agent",
                 timeout,
                 debug_run_dir,
                 debug_artifacts: Some(&debug_artifacts),
                 batch_size: batch.len(),
+                selected_raw_bytes,
+                staged_bytes,
+                discovered_sessions: collected_count,
+                candidate_sessions: candidate_count,
+                skipped_sessions: skipped_internal,
+                backlog_sessions: backlog.sessions.len(),
+                ready_workflows: 0,
+                proposals_written: 0,
+                durations: phase_durations.clone(),
+                output_schema: Some(WORKFLOW_DETECTION_SCHEMA),
+                candidate_paths: workspace
+                    .staged_sessions
+                    .iter()
+                    .map(|session| canonicalize_path(&session.staged_path))
+                    .collect(),
             },
         )?;
+        phase_durations.detection_agent = detection_started.elapsed().as_millis() as u64;
         println!("Agent responded ({} bytes).", invocation.final_output.len());
 
-        let parsed = parse_scan_response(&invocation.final_output, &workspace.root)?;
-        write_debug_text(
-            debug_run_dir,
-            "parsed-response.json",
-            &serde_json::to_string_pretty(&serde_json::json!({
-                "inspected_files": parsed
-                    .inspected_files
-                    .iter()
-                    .map(|path| path.to_string_lossy().to_string())
-                    .collect::<Vec<_>>(),
-                "file_findings": parsed
-                    .file_findings
-                    .iter()
-                    .map(|finding| serde_json::json!({
-                        "session": finding.session.to_string_lossy().to_string(),
-                        "summary": finding.summary,
-                    }))
-                    .collect::<Vec<_>>(),
-                "proposals": parsed
-                    .proposals
-                    .iter()
-                    .map(|proposal| serde_json::json!({
-                        "type": format!("{:?}", proposal.frontmatter.proposal_type).to_lowercase(),
-                        "confidence": format!("{:?}", proposal.frontmatter.confidence).to_lowercase(),
-                        "target_skill": match proposal.frontmatter.resolved_target() {
-                            Some(ProposalTarget::Skill { name }) => Some(name),
-                            _ => None,
-                        },
-                        "evidence": proposal.frontmatter.evidence,
-                        "body": proposal.body,
-                    }))
-                    .collect::<Vec<_>>(),
-            }))
-            .unwrap_or_else(|_| "{}".to_string()),
-        );
+        let parsed_workflow = parse_workflow_response(&invocation.final_output, &workspace.root);
+        let mut scan_state = ScanState::load(&scan_config.state_path)?;
+        let mut written_proposals = Vec::new();
 
-        let mut proposals = validate_and_finalize_response(&parsed, &workspace, &invocation)?;
-        println!("Agent proposed {} skill(s).", proposals.len());
+        if let Ok(parsed_workflow) = parsed_workflow {
+            validate_workflow_response(&parsed_workflow, &workspace, &invocation)?;
+            write_debug_text(
+                debug_run_dir,
+                "parsed-workflow-response.json",
+                &serde_json::to_string_pretty(&serde_json::json!({
+                    "inspected_files": parsed_workflow
+                        .inspected_files
+                        .iter()
+                        .map(|path| path.to_string_lossy().to_string())
+                        .collect::<Vec<_>>(),
+                    "session_findings": parsed_workflow
+                        .session_findings
+                        .iter()
+                        .map(|finding| serde_json::json!({
+                            "session": finding.session.to_string_lossy().to_string(),
+                            "summary": finding.summary,
+                            "candidates": finding.candidates,
+                        }))
+                        .collect::<Vec<_>>(),
+                }))
+                .unwrap_or_else(|_| "{}".to_string()),
+            );
 
-        std::fs::create_dir_all(&scan_config.proposals_dir)?;
-        for (index, proposal) in proposals.iter_mut().enumerate() {
-            let filename = proposal_filename(proposal, index);
-            let path = scan_config.proposals_dir.join(&filename);
-            let markdown = proposal
-                .to_markdown()
-                .context("Failed to serialize proposal to markdown")?;
-            std::fs::write(&path, markdown)
-                .with_context(|| format!("Failed to write proposal {}", path.display()))?;
-            proposal.filename = Some(filename);
+            let batch_by_original = batch
+                .iter()
+                .map(|descriptor| {
+                    (
+                        canonicalize_path(&descriptor.session.path),
+                        descriptor.clone(),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            let staged_to_original = workspace
+                .staged_sessions
+                .iter()
+                .map(|session| {
+                    (
+                        canonicalize_path(&session.staged_path),
+                        canonicalize_path(&session.source_session.path),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+
+            let mut detected_candidates = 0usize;
+            for finding in &parsed_workflow.session_findings {
+                detected_candidates += finding.candidates.len();
+                let Some(original_path) = staged_to_original.get(&finding.session) else {
+                    bail!(
+                        "Failed to map staged workflow finding {} back to original session path",
+                        finding.session.display()
+                    );
+                };
+                let Some(descriptor) = batch_by_original.get(original_path) else {
+                    bail!(
+                        "Failed to locate descriptor for workflow finding {}",
+                        original_path.display()
+                    );
+                };
+                scan_state.record_session_findings(
+                    descriptor,
+                    finding.candidates.clone(),
+                    Utc::now(),
+                );
+            }
+            println!(
+                "Stored {} workflow candidate span(s) across {} session(s).",
+                detected_candidates,
+                parsed_workflow.session_findings.len()
+            );
+
+            let ready_workflows = scan_state.ready_workflows(MIN_WORKFLOW_MATCHES_FOR_PROPOSAL);
+            if !ready_workflows.is_empty() {
+                println!(
+                    "{} workflow group(s) reached the proposal threshold.",
+                    ready_workflows.len()
+                );
+            }
+
+            for workflow in ready_workflows {
+                println!(
+                    "Running proposal pass for workflow `{}` across {} session(s).",
+                    workflow.workflow_key,
+                    workflow.matches.len()
+                );
+                let workflow_raw_bytes = workflow
+                    .matches
+                    .iter()
+                    .filter_map(|item| {
+                        let Some(agent) = AgentKind::from_name(&item.agent) else {
+                            return None;
+                        };
+                        discover_session(&Session {
+                            id: item.session_id.clone(),
+                            agent,
+                            path: item.session_path.clone(),
+                            timestamp: item.timestamp,
+                            content: String::new(),
+                        })
+                        .ok()
+                        .map(|descriptor| descriptor.raw_bytes)
+                    })
+                    .sum::<u64>();
+
+                let workflow_staging_started = Instant::now();
+                let (workflow_workspace, workflow_staged_bytes) =
+                    stage_workflow_workspace(&workflow, &skill_sources, debug_run_dir)?;
+                phase_durations.staging = phase_durations
+                    .staging
+                    .saturating_add(workflow_staging_started.elapsed().as_millis() as u64);
+                let workflow_prompt =
+                    build_workflow_proposal_prompt(&workflow_workspace.manifest, &preferences, &workflow);
+                write_debug_text(
+                    debug_run_dir,
+                    &format!(
+                        "workflow-proposal-prompt-{}.txt",
+                        sanitize_filename(&workflow.workflow_key)
+                    ),
+                    &workflow_prompt,
+                );
+
+                let proposal_started = Instant::now();
+                let proposal_invocation = invoke_agent(
+                    &scan_config.agent_command,
+                    &scan_config.agent_args,
+                    &workflow_prompt,
+                    &workflow_workspace.root,
+                    AgentRunContext {
+                        phase: "proposal_agent",
+                        timeout,
+                        debug_run_dir,
+                        debug_artifacts: Some(&debug_artifacts),
+                        batch_size: workflow.matches.len(),
+                        selected_raw_bytes: workflow_raw_bytes,
+                        staged_bytes: workflow_staged_bytes,
+                        discovered_sessions: collected_count,
+                        candidate_sessions: candidate_count,
+                        skipped_sessions: skipped_internal,
+                        backlog_sessions: backlog.sessions.len(),
+                        ready_workflows: 1,
+                        proposals_written: written_proposals.len(),
+                        durations: phase_durations.clone(),
+                        output_schema: Some(PROPOSAL_SCHEMA),
+                        candidate_paths: workflow_workspace
+                            .staged_sessions
+                            .iter()
+                            .map(|session| canonicalize_path(&session.staged_path))
+                            .collect(),
+                    },
+                )?;
+                phase_durations.proposal_agent = phase_durations
+                    .proposal_agent
+                    .saturating_add(proposal_started.elapsed().as_millis() as u64);
+
+                let parsed = parse_scan_response(&proposal_invocation.final_output, &workflow_workspace.root)?;
+                write_debug_text(
+                    debug_run_dir,
+                    &format!(
+                        "parsed-proposal-response-{}.json",
+                        sanitize_filename(&workflow.workflow_key)
+                    ),
+                    &serde_json::to_string_pretty(&serde_json::json!({
+                        "inspected_files": parsed
+                            .inspected_files
+                            .iter()
+                            .map(|path| path.to_string_lossy().to_string())
+                            .collect::<Vec<_>>(),
+                        "file_findings": parsed
+                            .file_findings
+                            .iter()
+                            .map(|finding| serde_json::json!({
+                                "session": finding.session.to_string_lossy().to_string(),
+                                "summary": finding.summary,
+                            }))
+                            .collect::<Vec<_>>(),
+                        "proposals": parsed
+                            .proposals
+                            .iter()
+                            .map(|proposal| serde_json::json!({
+                                "type": format!("{:?}", proposal.frontmatter.proposal_type).to_lowercase(),
+                                "confidence": format!("{:?}", proposal.frontmatter.confidence).to_lowercase(),
+                                "target_skill": match proposal.frontmatter.resolved_target() {
+                                    Some(ProposalTarget::Skill { name }) => Some(name),
+                                    _ => None,
+                                },
+                                "evidence": proposal.frontmatter.evidence,
+                                "body": proposal.body,
+                            }))
+                            .collect::<Vec<_>>(),
+                    }))
+                    .unwrap_or_else(|_| "{}".to_string()),
+                );
+
+                let proposals =
+                    validate_and_finalize_response(&parsed, &workflow_workspace, &proposal_invocation)?;
+                scan_state.mark_workflow_attempted(
+                    &workflow.workflow_key,
+                    workflow.matches.len(),
+                    Utc::now(),
+                );
+                if !proposals.is_empty() {
+                    scan_state.mark_workflow_proposed(
+                        &workflow.workflow_key,
+                        workflow.matches.len(),
+                        Utc::now(),
+                    );
+                }
+                write_proposals(&scan_config.proposals_dir, &mut written_proposals, proposals)?;
+            }
+        } else {
+            let parsed = parse_scan_response(&invocation.final_output, &workspace.root)?;
+            write_debug_text(
+                debug_run_dir,
+                "parsed-response.json",
+                &serde_json::to_string_pretty(&serde_json::json!({
+                    "inspected_files": parsed
+                        .inspected_files
+                        .iter()
+                        .map(|path| path.to_string_lossy().to_string())
+                        .collect::<Vec<_>>(),
+                    "file_findings": parsed
+                        .file_findings
+                        .iter()
+                        .map(|finding| serde_json::json!({
+                            "session": finding.session.to_string_lossy().to_string(),
+                            "summary": finding.summary,
+                        }))
+                        .collect::<Vec<_>>(),
+                    "proposals": parsed
+                        .proposals
+                        .iter()
+                        .map(|proposal| serde_json::json!({
+                            "type": format!("{:?}", proposal.frontmatter.proposal_type).to_lowercase(),
+                            "confidence": format!("{:?}", proposal.frontmatter.confidence).to_lowercase(),
+                            "target_skill": match proposal.frontmatter.resolved_target() {
+                                Some(ProposalTarget::Skill { name }) => Some(name),
+                                _ => None,
+                            },
+                            "evidence": proposal.frontmatter.evidence,
+                            "body": proposal.body,
+                        }))
+                        .collect::<Vec<_>>(),
+                }))
+                .unwrap_or_else(|_| "{}".to_string()),
+            );
+            let proposals = validate_and_finalize_response(&parsed, &workspace, &invocation)?;
+            write_proposals(&scan_config.proposals_dir, &mut written_proposals, proposals)?;
         }
 
-        backlog.remove_batch(&batch);
+        let finalize_started = Instant::now();
+        let batch_sessions = batch
+            .iter()
+            .map(|descriptor| descriptor.session.clone())
+            .collect::<Vec<_>>();
+        backlog.remove_batch(&batch_sessions);
         backlog.save(&scan_config.backlog_path)?;
-
+        scan_state.save(&scan_config.state_path)?;
         let watermark = LastScan {
             timestamp: scan_started_at,
             session_ids: vec![],
         };
         watermark.save(&scan_config.last_scan_path)?;
+        phase_durations.finalize = finalize_started.elapsed().as_millis() as u64;
 
-        Ok(proposals)
+        debug_artifacts.write_status(&ScanRunStatus {
+            state: "completed".to_string(),
+            started_at: scan_started_at.to_rfc3339(),
+            updated_at: Utc::now().to_rfc3339(),
+            phase: "finalize".to_string(),
+            scan_pid: std::process::id(),
+            agent_pid: None,
+            agent_command: scan_config.agent_command.clone(),
+            workspace_root: workspace.root.display().to_string(),
+            batch_size: batch.len(),
+            selected_raw_bytes,
+            staged_bytes,
+            discovered_sessions: collected_count,
+            candidate_sessions: candidate_count,
+            skipped_sessions: skipped_internal,
+            backlog_sessions: backlog.sessions.len(),
+            ready_workflows: scan_state.ready_workflows(MIN_WORKFLOW_MATCHES_FOR_PROPOSAL).len(),
+            proposals_written: written_proposals.len(),
+            prompt_bytes: 0,
+            timeout_secs: timeout.map(|value| value.as_secs()),
+            stdout_bytes: 0,
+            stderr_bytes: 0,
+            last_stdout_at: None,
+            last_stderr_at: None,
+            durations_ms: phase_durations,
+            note: Some("Scan completed successfully.".to_string()),
+        });
+
+        println!("Agent proposed {} skill(s).", written_proposals.len());
+        Ok(written_proposals)
     })();
 
     match &result {
@@ -792,6 +1303,31 @@ pub fn run_scan(agents: &[Box<dyn Agent>], scan_config: &ScanConfig) -> Result<V
     }
 
     result
+}
+
+fn write_proposals(
+    proposals_dir: &Path,
+    written_proposals: &mut Vec<Proposal>,
+    mut proposals: Vec<Proposal>,
+) -> Result<()> {
+    if proposals.is_empty() {
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(proposals_dir)?;
+    let existing_count = written_proposals.len();
+    for (index, proposal) in proposals.iter_mut().enumerate() {
+        let filename = proposal_filename(proposal, existing_count + index);
+        let path = proposals_dir.join(&filename);
+        let markdown = proposal
+            .to_markdown()
+            .context("Failed to serialize proposal to markdown")?;
+        std::fs::write(&path, markdown)
+            .with_context(|| format!("Failed to write proposal {}", path.display()))?;
+        proposal.filename = Some(filename);
+    }
+    written_proposals.extend(proposals);
+    Ok(())
 }
 
 fn filter_distill_scan_artifacts(sessions: Vec<Session>) -> Vec<Session> {
@@ -851,6 +1387,266 @@ fn load_existing_skill_sources(skill_dirs: &[PathBuf]) -> Result<Vec<SkillSource
     crate::sync::load_skill_sources_from_dirs(skill_dirs)
 }
 
+fn select_session_batch(
+    backlog: &[Session],
+    batch_size: usize,
+    max_raw_bytes: Option<u64>,
+) -> Result<Vec<SessionDescriptor>> {
+    let mut selected = Vec::new();
+    let mut selected_bytes = 0u64;
+
+    for session in backlog {
+        if selected.len() >= batch_size {
+            break;
+        }
+
+        let descriptor = discover_session(session)?;
+        let would_exceed = max_raw_bytes
+            .map(|limit| !selected.is_empty() && selected_bytes + descriptor.raw_bytes > limit)
+            .unwrap_or(false);
+        if would_exceed {
+            break;
+        }
+
+        selected_bytes = selected_bytes.saturating_add(descriptor.raw_bytes);
+        selected.push(descriptor);
+    }
+
+    Ok(selected)
+}
+
+fn stage_timeline_workspace(
+    batch: &[SessionDescriptor],
+    skill_sources: &[SkillSource],
+    debug_run_dir: Option<&Path>,
+) -> Result<(StagedWorkspace, u64)> {
+    let (root, cleanup_on_drop) = if let Some(run_dir) = debug_run_dir {
+        let root = run_dir.join("workspace");
+        std::fs::create_dir_all(&root)?;
+        (root, false)
+    } else {
+        (create_temp_dir_path("distill-scan-workspace")?, true)
+    };
+
+    let sessions_root = root.join("sessions");
+    let skills_root = root.join("skills");
+    std::fs::create_dir_all(&sessions_root)?;
+    std::fs::create_dir_all(&skills_root)?;
+
+    let mut session_roots = BTreeMap::new();
+    let mut staged_sessions = Vec::new();
+    let mut manifest_sessions = Vec::new();
+    let mut staged_bytes = 0u64;
+
+    for (index, descriptor) in batch.iter().enumerate() {
+        let agent_dir = sessions_root.join(descriptor.session.agent.to_string());
+        std::fs::create_dir_all(&agent_dir)?;
+        session_roots.insert(
+            descriptor.session.agent.to_string(),
+            agent_dir.to_string_lossy().to_string(),
+        );
+
+        let basename = descriptor
+            .session
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("session.jsonl");
+        let staged_path = agent_dir.join(format!("{:04}-{}", index + 1, basename));
+        let timeline = build_session_timeline(descriptor)?;
+        let rendered = render_timeline(&timeline);
+        staged_bytes = staged_bytes.saturating_add(rendered.len() as u64);
+        std::fs::write(&staged_path, rendered).with_context(|| {
+            format!(
+                "Failed to stage timeline {} from {}",
+                staged_path.display(),
+                descriptor.session.path.display()
+            )
+        })?;
+
+        staged_sessions.push(StagedSession {
+            source_session: descriptor.session.clone(),
+            staged_path: staged_path.clone(),
+        });
+        manifest_sessions.push(ManifestSession {
+            agent: descriptor.session.agent.to_string(),
+            session_id: descriptor.session.id.clone(),
+            timestamp: descriptor.session.timestamp.to_rfc3339(),
+            original_path: descriptor.session.path.to_string_lossy().to_string(),
+            staged_path: staged_path.to_string_lossy().to_string(),
+        });
+    }
+
+    let (staged_skills, manifest_skills) = stage_skill_files(skill_sources, &skills_root)?;
+    let manifest_path = root.join("manifest.json");
+    let manifest = ScanManifest {
+        workspace_root: root.to_string_lossy().to_string(),
+        manifest_path: manifest_path.to_string_lossy().to_string(),
+        session_roots,
+        candidate_sessions: manifest_sessions,
+        existing_skills: manifest_skills,
+    };
+    std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)
+        .with_context(|| format!("Failed to write {}", manifest_path.display()))?;
+
+    Ok((
+        StagedWorkspace {
+            root,
+            manifest,
+            staged_sessions,
+            staged_skills,
+            cleanup_on_drop,
+        },
+        staged_bytes,
+    ))
+}
+
+fn stage_workflow_workspace(
+    workflow: &ReadyWorkflow,
+    skill_sources: &[SkillSource],
+    debug_run_dir: Option<&Path>,
+) -> Result<(StagedWorkspace, u64)> {
+    let (root, cleanup_on_drop) = if let Some(run_dir) = debug_run_dir {
+        let root = run_dir.join(format!("workflow-{}", sanitize_filename(&workflow.workflow_key)));
+        if root.exists() {
+            std::fs::remove_dir_all(&root)?;
+        }
+        std::fs::create_dir_all(&root)?;
+        (root, false)
+    } else {
+        (
+            create_temp_dir_path(&format!(
+                "distill-workflow-{}",
+                sanitize_filename(&workflow.workflow_key)
+            ))?,
+            true,
+        )
+    };
+
+    let sessions_root = root.join("sessions");
+    let skills_root = root.join("skills");
+    std::fs::create_dir_all(&sessions_root)?;
+    std::fs::create_dir_all(&skills_root)?;
+
+    let mut session_roots = BTreeMap::new();
+    let mut staged_sessions = Vec::new();
+    let mut manifest_sessions = Vec::new();
+    let mut staged_bytes = 0u64;
+
+    for (index, workflow_match) in workflow.matches.iter().enumerate() {
+        let Some(agent) = AgentKind::from_name(&workflow_match.agent) else {
+            bail!("Unknown agent in scan-state.json: {}", workflow_match.agent);
+        };
+        let session = Session {
+            id: workflow_match.session_id.clone(),
+            agent,
+            path: workflow_match.session_path.clone(),
+            timestamp: workflow_match.timestamp,
+            content: String::new(),
+        };
+        let descriptor = discover_session(&session)?;
+        let agent_dir = sessions_root.join(descriptor.session.agent.to_string());
+        std::fs::create_dir_all(&agent_dir)?;
+        session_roots.insert(
+            descriptor.session.agent.to_string(),
+            agent_dir.to_string_lossy().to_string(),
+        );
+
+        let basename = descriptor
+            .session
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("session.jsonl");
+        let staged_path = agent_dir.join(format!("{:04}-{}", index + 1, basename));
+        let rendered = render_timeline_window(
+            &descriptor,
+            &TimelineWindowRequest {
+                workflow_key: workflow.workflow_key.clone(),
+                workflow_label: workflow_match.finding.workflow_label.clone(),
+                note: workflow_match.finding.note.clone(),
+                start_event: workflow_match.finding.start_event,
+                end_event: workflow_match.finding.end_event,
+            },
+        )?;
+        staged_bytes = staged_bytes.saturating_add(rendered.len() as u64);
+        std::fs::write(&staged_path, rendered).with_context(|| {
+            format!(
+                "Failed to stage workflow window {} from {}",
+                staged_path.display(),
+                descriptor.session.path.display()
+            )
+        })?;
+
+        staged_sessions.push(StagedSession {
+            source_session: descriptor.session.clone(),
+            staged_path: staged_path.clone(),
+        });
+        manifest_sessions.push(ManifestSession {
+            agent: descriptor.session.agent.to_string(),
+            session_id: descriptor.session.id.clone(),
+            timestamp: descriptor.session.timestamp.to_rfc3339(),
+            original_path: descriptor.session.path.to_string_lossy().to_string(),
+            staged_path: staged_path.to_string_lossy().to_string(),
+        });
+    }
+
+    let (staged_skills, manifest_skills) = stage_skill_files(skill_sources, &skills_root)?;
+    let manifest_path = root.join("manifest.json");
+    let manifest = ScanManifest {
+        workspace_root: root.to_string_lossy().to_string(),
+        manifest_path: manifest_path.to_string_lossy().to_string(),
+        session_roots,
+        candidate_sessions: manifest_sessions,
+        existing_skills: manifest_skills,
+    };
+    std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)
+        .with_context(|| format!("Failed to write {}", manifest_path.display()))?;
+
+    Ok((
+        StagedWorkspace {
+            root,
+            manifest,
+            staged_sessions,
+            staged_skills,
+            cleanup_on_drop,
+        },
+        staged_bytes,
+    ))
+}
+
+fn stage_skill_files(
+    skill_sources: &[SkillSource],
+    skills_root: &Path,
+) -> Result<(Vec<StagedSkill>, Vec<ManifestSkill>)> {
+    let mut staged_skills = Vec::new();
+    let mut manifest_skills = Vec::new();
+    for (index, skill_source) in skill_sources.iter().enumerate() {
+        let staged_path = skills_root.join(format!(
+            "{:04}-{}.md",
+            index + 1,
+            sanitize_filename(&skill_source.skill.name)
+        ));
+        std::fs::write(&staged_path, &skill_source.skill.content).with_context(|| {
+            format!(
+                "Failed to stage skill {} from {}",
+                skill_source.skill.name,
+                skill_source.source_path.display()
+            )
+        })?;
+        staged_skills.push(StagedSkill {
+            staged_path: staged_path.clone(),
+        });
+        manifest_skills.push(ManifestSkill {
+            name: skill_source.skill.name.clone(),
+            original_path: skill_source.source_path.to_string_lossy().to_string(),
+            staged_path: staged_path.to_string_lossy().to_string(),
+        });
+    }
+    Ok((staged_skills, manifest_skills))
+}
+
+#[cfg(test)]
 fn stage_scan_workspace(
     batch: &[Session],
     skill_sources: &[SkillSource],
@@ -889,7 +1685,7 @@ fn stage_scan_workspace(
         stage_session_file_for_scan(session, &staged_path)?;
 
         staged_sessions.push(StagedSession {
-            session: session.clone(),
+            source_session: session.clone(),
             staged_path: staged_path.clone(),
         });
         manifest_sessions.push(ManifestSession {
@@ -946,6 +1742,7 @@ fn stage_scan_workspace(
     })
 }
 
+#[cfg(test)]
 fn stage_session_file_for_scan(session: &Session, destination: &Path) -> Result<()> {
     let raw = crate::agents::read_session_source(session)?;
     let summary = build_staged_session_summary(session, &raw);
@@ -958,6 +1755,7 @@ fn stage_session_file_for_scan(session: &Session, destination: &Path) -> Result<
     })
 }
 
+#[cfg(test)]
 #[derive(Default)]
 struct SessionDigest {
     user_messages: Vec<String>,
@@ -965,6 +1763,7 @@ struct SessionDigest {
     tool_calls: Vec<String>,
 }
 
+#[cfg(test)]
 fn build_staged_session_summary(session: &Session, raw: &str) -> String {
     let digest = extract_session_digest(session.agent, raw);
     let mut lines = vec![
@@ -1010,6 +1809,7 @@ fn build_staged_session_summary(session: &Session, raw: &str) -> String {
     lines.join("\n")
 }
 
+#[cfg(test)]
 fn append_summary_section(lines: &mut Vec<String>, items: &[String], empty_message: &str) {
     let mut recent = items
         .iter()
@@ -1036,6 +1836,7 @@ fn append_summary_section(lines: &mut Vec<String>, items: &[String], empty_messa
     }
 }
 
+#[cfg(test)]
 fn extract_session_digest(agent: crate::agents::AgentKind, raw: &str) -> SessionDigest {
     if agent == crate::agents::AgentKind::OpenCode {
         return extract_opencode_session_digest(raw);
@@ -1111,6 +1912,7 @@ fn extract_session_digest(agent: crate::agents::AgentKind, raw: &str) -> Session
     digest
 }
 
+#[cfg(test)]
 fn extract_opencode_session_digest(raw: &str) -> SessionDigest {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
         return SessionDigest::default();
@@ -1121,6 +1923,7 @@ fn extract_opencode_session_digest(raw: &str) -> SessionDigest {
     digest
 }
 
+#[cfg(test)]
 fn collect_opencode_digest(value: &serde_json::Value, digest: &mut SessionDigest, depth: usize) {
     const MAX_DEPTH: usize = 8;
     if depth > MAX_DEPTH {
@@ -1171,6 +1974,7 @@ fn collect_opencode_digest(value: &serde_json::Value, digest: &mut SessionDigest
     }
 }
 
+#[cfg(test)]
 fn extract_opencode_tool_name(map: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
     let type_name = map
         .get("type")
@@ -1189,6 +1993,7 @@ fn extract_opencode_tool_name(map: &serde_json::Map<String, serde_json::Value>) 
         .map(ToOwned::to_owned)
 }
 
+#[cfg(test)]
 fn extract_opencode_message_text(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::String(text) => text.clone(),
@@ -1216,6 +2021,7 @@ fn extract_opencode_message_text(value: &serde_json::Value) -> String {
     }
 }
 
+#[cfg(test)]
 fn extract_response_message_text(payload: &serde_json::Value) -> String {
     payload
         .get("content")
@@ -1228,6 +2034,7 @@ fn extract_response_message_text(payload: &serde_json::Value) -> String {
         .join("\n")
 }
 
+#[cfg(test)]
 fn summarize_session_excerpt(input: &str) -> String {
     let normalized = input.split_whitespace().collect::<Vec<_>>().join(" ");
     if normalized.chars().count() <= MAX_STAGED_SUMMARY_EXCERPT_CHARS {
@@ -1259,6 +2066,167 @@ fn sanitize_filename(raw: &str) -> String {
     }
 }
 
+fn build_workflow_detection_prompt(
+    manifest: &ScanManifest,
+    preferences: &PreferenceProfile,
+) -> String {
+    let mut prompt = String::new();
+    prompt.push_str(
+        "You are a workflow detection engine for the `distill` tool.\n\n\
+         Your job: inspect each staged session timeline file and mark reusable workflow spans that could become skills later.\n\n\
+         Each staged session file is already a compact ordered timeline. It keeps meaningful events from the full session, including middle-of-thread commands and tool calls.\n\
+         Read every listed session file once. Do not search the workspace. Do not re-parse raw JSONL logs. Do not modify files.\n\
+         If you use commands at all, restrict them to direct single-file reads of staged session timelines or staged skill files.\n\
+         Do not use Python, jq, shell scripts, or helper programs to assemble JSON.\n\
+         Do not make network requests.\n\n\
+         Detection rules:\n\
+         - Focus on repeated workflows, not topics or projects\n\
+         - Ignore project names, ticket ids, and product-specific nouns when naming a workflow\n\
+         - A workflow can appear in the middle of a long session; do not bias toward the start or end\n\
+         - It is acceptable to return zero candidates for a session if nothing looks reusable\n\
+         - Use stable kebab-case for `workflow_key`\n\
+         - `start_event` and `end_event` must refer to event numbers from the staged timeline file\n\
+         - Prefer 0-2 strong candidates per session; do not invent weak ones\n\n\
+         IMPORTANT: Respond ONLY with valid JSON in this exact shape:\n\
+         {\"inspected_files\": [...], \"session_findings\": [...]}.\n\
+         No markdown fences. No commentary.\n\n\
+         Response requirements:\n\
+         - `inspected_files`: every candidate session file path exactly once\n\
+         - `session_findings`: one object per candidate session file\n\
+         - each `session_findings` object must include:\n\
+           - `session`: exact staged session path\n\
+           - `summary`: one short sentence about the session's main work\n\
+           - `candidates`: array of repeated workflow spans, possibly empty\n\
+         - each candidate in `candidates` must include:\n\
+           - `workflow_key`: stable kebab-case workflow identifier\n\
+           - `workflow_label`: short human label or null\n\
+           - `note`: why this span looks reusable\n\
+           - `start_event`: first event number in the workflow span\n\
+           - `end_event`: last event number in the workflow span\n\n",
+    );
+
+    prompt.push_str(&format!(
+        "## Workspace\n\n- Workspace root: {}\n- Manifest: {}\n\n",
+        manifest.workspace_root, manifest.manifest_path
+    ));
+
+    prompt.push_str("## Candidate Session Files\n\n");
+    for candidate in &manifest.candidate_sessions {
+        prompt.push_str(&format!(
+            "- staged: {}\n  agent: {}\n  timestamp: {}\n  original: {}\n",
+            candidate.staged_path, candidate.agent, candidate.timestamp, candidate.original_path
+        ));
+    }
+    prompt.push('\n');
+
+    prompt.push_str("## Existing Skills\n\n");
+    if manifest.existing_skills.is_empty() {
+        prompt.push_str("None yet.\n\n");
+    } else {
+        for skill in &manifest.existing_skills {
+            prompt.push_str(&format!(
+                "- {} => staged: {} (original: {})\n",
+                skill.name, skill.staged_path, skill.original_path
+            ));
+        }
+        prompt.push('\n');
+    }
+
+    prompt.push_str(&preferences.to_prompt_block());
+    prompt.push_str(
+        "Inspect every candidate session file listed above before answering. Then return the JSON object with complete file coverage.\n",
+    );
+    prompt
+}
+
+fn build_workflow_proposal_prompt(
+    manifest: &ScanManifest,
+    preferences: &PreferenceProfile,
+    workflow: &ReadyWorkflow,
+) -> String {
+    let mut prompt = String::new();
+    prompt.push_str(
+        "You are a skill proposal engine for the `distill` tool.\n\n\
+         Your job: inspect staged workflow-window files for one repeated workflow group and decide whether they justify a reusable skill proposal.\n\n\
+         Each staged session file is a focused window cut from the original session around a repeated workflow span. Read every listed file once.\n\
+         Do not search the workspace. Do not re-parse raw JSONL logs. Do not modify files.\n\
+         If you use commands at all, restrict them to direct single-file reads of staged workflow windows or staged skill files.\n\
+         Do not use Python, jq, shell scripts, or helper programs to assemble JSON.\n\
+         Do not make network requests.\n\n\
+         Output quality bar:\n\
+         - Propose only if the workflow is truly reusable across sessions\n\
+         - Prefer `improve`/`edit` when an existing skill already overlaps\n\
+         - If evidence is still weak, return an empty proposals array, but still cover every file\n\
+         - Every proposal body must be concrete and actionable\n\n\
+         IMPORTANT: Respond ONLY with valid JSON in this exact wrapper shape:\n\
+         {\"inspected_files\": [...], \"file_findings\": [...], \"proposals\": [...]}.\n\
+         No markdown fences. No commentary.\n\n\
+         Response requirements:\n\
+         - `inspected_files`: every candidate session file path exactly once\n\
+         - `file_findings`: one object per candidate session file with fields `session` and `summary`\n\
+         - `proposals`: reusable skill proposals only\n\
+         - Use the exact staged session path for `inspected_files`, `file_findings.session`, and every `evidence.session`\n\n\
+         Each proposal object in `proposals` must have these fields:\n\
+         - \"type\": one of \"new\", \"improve\", \"edit\", \"remove\"\n\
+         - \"confidence\": one of \"high\", \"medium\", \"low\"\n\
+         - \"target_skill\": string containing the canonical skill name in kebab-case; for `new`, set it to the new skill's name, and for `improve`/`edit`/`remove`, set it to the existing skill name\n\
+         - \"evidence\": array of {\"session\": \"<staged path>\", \"pattern\": \"<description>\"}\n\
+         - \"body\": string containing the full proposed skill content in markdown\n\n\
+         For each proposal body, use this markdown structure:\n\
+         - `# <Skill Name>`\n\
+         - `## When to use`\n\
+         - `## Steps`\n\
+         - `## Verification`\n\
+         - `## Pitfalls`\n\
+         For `improve` and `edit` proposals targeting an existing skill:\n\
+         - treat the proposal body as the full replacement for that skill's `SKILL.md`\n\
+         - preserve any existing YAML frontmatter unless the evidence explicitly requires changing it\n\
+         - make the smallest complete-file update that fixes the evidence; do not drop unrelated sections or command arguments\n\n",
+    );
+
+    prompt.push_str(&format!(
+        "## Workflow Group\n\n- workflow_key: {}\n- workflow_label: {}\n\n",
+        workflow.workflow_key,
+        workflow
+            .workflow_label
+            .as_deref()
+            .unwrap_or("(not provided)")
+    ));
+    prompt.push_str(&format!(
+        "## Workspace\n\n- Workspace root: {}\n- Manifest: {}\n\n",
+        manifest.workspace_root, manifest.manifest_path
+    ));
+
+    prompt.push_str("## Candidate Workflow Windows\n\n");
+    for candidate in &manifest.candidate_sessions {
+        prompt.push_str(&format!(
+            "- staged: {}\n  agent: {}\n  timestamp: {}\n  original: {}\n",
+            candidate.staged_path, candidate.agent, candidate.timestamp, candidate.original_path
+        ));
+    }
+    prompt.push('\n');
+
+    prompt.push_str("## Existing Skills\n\n");
+    if manifest.existing_skills.is_empty() {
+        prompt.push_str("None yet.\n\n");
+    } else {
+        for skill in &manifest.existing_skills {
+            prompt.push_str(&format!(
+                "- {} => staged: {} (original: {})\n",
+                skill.name, skill.staged_path, skill.original_path
+            ));
+        }
+        prompt.push('\n');
+    }
+
+    prompt.push_str(&preferences.to_prompt_block());
+    prompt.push_str(
+        "Inspect every candidate workflow window file listed above before answering. Then return the JSON object with complete coverage and any high-signal proposals.\n",
+    );
+    prompt
+}
+
+#[cfg(test)]
 fn build_prompt(manifest: &ScanManifest, preferences: &PreferenceProfile) -> String {
     let mut prompt = String::new();
     prompt.push_str(
@@ -1362,17 +2330,27 @@ fn write_live_scan_status(debug_artifacts: &ScanDebugArtifacts, update: LiveScan
         state: update.state.to_string(),
         started_at: update.started_at.to_rfc3339(),
         updated_at: Utc::now().to_rfc3339(),
+        phase: update.phase.to_string(),
         scan_pid: std::process::id(),
         agent_pid: update.agent_pid,
         agent_command,
         workspace_root: update.workspace_root.display().to_string(),
         batch_size: update.batch_size,
+        selected_raw_bytes: update.selected_raw_bytes,
+        staged_bytes: update.staged_bytes,
+        discovered_sessions: update.discovered_sessions,
+        candidate_sessions: update.candidate_sessions,
+        skipped_sessions: update.skipped_sessions,
+        backlog_sessions: update.backlog_sessions,
+        ready_workflows: update.ready_workflows,
+        proposals_written: update.proposals_written,
         prompt_bytes: update.prompt_bytes,
         timeout_secs: update.timeout.map(|value| value.as_secs()),
         stdout_bytes: update.stdout_bytes,
         stderr_bytes: update.stderr_bytes,
         last_stdout_at: format_optional_system_time(update.last_stdout_at),
         last_stderr_at: format_optional_system_time(update.last_stderr_at),
+        durations_ms: update.durations,
         note: update.note,
     });
 }
@@ -1398,15 +2376,24 @@ fn invoke_agent_with_timeout(
     let debug_run_dir = context.debug_run_dir;
     let debug_artifacts = context.debug_artifacts;
     let batch_size = context.batch_size;
+    let selected_raw_bytes = context.selected_raw_bytes;
+    let staged_bytes = context.staged_bytes;
+    let discovered_sessions = context.discovered_sessions;
+    let candidate_sessions = context.candidate_sessions;
+    let skipped_sessions = context.skipped_sessions;
+    let backlog_sessions = context.backlog_sessions;
+    let ready_workflows = context.ready_workflows;
+    let proposals_written = context.proposals_written;
+    let durations = context.durations.clone();
     let prepared = prepare_proposal_command(
         command,
         args,
         workspace_root,
         debug_run_dir,
-        Some(PROPOSAL_SCHEMA),
+        context.output_schema,
     )?;
     let effective_args = prepared.args.clone();
-    let temp_files = prepared.temp_files.clone();
+    let mut temp_files = prepared.temp_files.clone();
     let mode = prepared.mode;
 
     let mut child_command = Command::new(command);
@@ -1426,24 +2413,38 @@ fn invoke_agent_with_timeout(
 
     let agent_started_at = Utc::now();
     let agent_pid = child.id();
+    let stdout_path = debug_artifacts
+        .map(|artifacts| artifacts.stdout_path())
+        .or_else(|| debug_run_dir.map(|dir| dir.join("agent-stdout.log")))
+        .unwrap_or(create_temp_file_path("distill-agent-stdout", "log")?);
+    let stderr_path = debug_artifacts
+        .map(|artifacts| artifacts.stderr_path())
+        .or_else(|| debug_run_dir.map(|dir| dir.join("agent-stderr.log")))
+        .unwrap_or(create_temp_file_path("distill-agent-stderr", "log")?);
+    if debug_artifacts.is_none() && debug_run_dir.is_none() {
+        temp_files.push(stdout_path.clone());
+        temp_files.push(stderr_path.clone());
+    }
     let stdout_capture = StreamCapture::spawn(
         child
             .stdout
             .take()
             .context("Failed to capture agent stdout pipe")?,
-        debug_artifacts
-            .map(|artifacts| artifacts.stdout_path())
-            .or_else(|| debug_run_dir.map(|dir| dir.join("agent-stdout.log"))),
+        stdout_path.clone(),
+        context.candidate_paths.clone(),
     );
     let stderr_capture = StreamCapture::spawn(
         child
             .stderr
             .take()
             .context("Failed to capture agent stderr pipe")?,
-        debug_artifacts
-            .map(|artifacts| artifacts.stderr_path())
-            .or_else(|| debug_run_dir.map(|dir| dir.join("agent-stderr.log"))),
+        stderr_path.clone(),
+        context.candidate_paths.clone(),
     );
+    let stdout_bytes = stdout_capture.bytes_captured.clone();
+    let stderr_bytes = stderr_capture.bytes_captured.clone();
+    let stdout_last_update = stdout_capture.last_update.clone();
+    let stderr_last_update = stderr_capture.last_update.clone();
 
     if let Some(debug_artifacts) = debug_artifacts {
         write_live_scan_status(
@@ -1451,10 +2452,19 @@ fn invoke_agent_with_timeout(
             LiveScanStatusUpdate {
                 started_at: agent_started_at,
                 state: "running",
+                phase: context.phase,
                 command,
                 args: &effective_args,
                 workspace_root,
                 batch_size,
+                selected_raw_bytes,
+                staged_bytes,
+                discovered_sessions,
+                candidate_sessions,
+                skipped_sessions,
+                backlog_sessions,
+                ready_workflows,
+                proposals_written,
                 prompt_bytes: prompt.len(),
                 timeout,
                 agent_pid: Some(agent_pid),
@@ -1462,6 +2472,7 @@ fn invoke_agent_with_timeout(
                 stderr_bytes: 0,
                 last_stdout_at: None,
                 last_stderr_at: None,
+                durations: durations.clone(),
                 note: Some("Waiting for agent response".to_string()),
             },
         );
@@ -1473,25 +2484,37 @@ fn invoke_agent_with_timeout(
         let status = child.wait().with_context(|| {
             format!("Failed to wait for agent command after stdin write failure: {command}")
         })?;
-        let stdout = String::from_utf8_lossy(&stdout_capture.finish("stdout")?).to_string();
-        let stderr = String::from_utf8_lossy(&stderr_capture.finish("stderr")?).to_string();
+        let (stdout_tail, _, stdout_path) = stdout_capture.finish("stdout")?;
+        let (stderr_tail, _, stderr_path) = stderr_capture.finish("stderr")?;
+        let _ = stdout_path;
+        let _ = stderr_path;
         if let Some(debug_artifacts) = debug_artifacts {
             write_live_scan_status(
                 debug_artifacts,
                 LiveScanStatusUpdate {
                     started_at: agent_started_at,
                     state: "failed",
+                    phase: context.phase,
                     command,
                     args: &effective_args,
                     workspace_root,
                     batch_size,
+                    selected_raw_bytes,
+                    staged_bytes,
+                    discovered_sessions,
+                    candidate_sessions,
+                    skipped_sessions,
+                    backlog_sessions,
+                    ready_workflows,
+                    proposals_written,
                     prompt_bytes: prompt.len(),
                     timeout,
                     agent_pid: Some(agent_pid),
-                    stdout_bytes: stdout.len() as u64,
-                    stderr_bytes: stderr.len() as u64,
+                    stdout_bytes: stdout_bytes.load(Ordering::Relaxed),
+                    stderr_bytes: stderr_bytes.load(Ordering::Relaxed),
                     last_stdout_at: Some(SystemTime::now()),
                     last_stderr_at: Some(SystemTime::now()),
+                    durations: durations.clone(),
                     note: Some("Failed to write prompt to agent stdin".to_string()),
                 },
             );
@@ -1499,10 +2522,10 @@ fn invoke_agent_with_timeout(
         if write_err.kind() == std::io::ErrorKind::BrokenPipe {
             let output = std::process::Output {
                 status,
-                stdout: stdout.as_bytes().to_vec(),
-                stderr: stderr.as_bytes().to_vec(),
+                stdout: stdout_tail,
+                stderr: stderr_tail,
             };
-            persist_agent_debug_output(debug_run_dir, prompt, &stdout, &stderr, None);
+            persist_agent_debug_output(debug_run_dir, prompt, None);
             cleanup_temp_files(&temp_files);
             return Err(write_err).with_context(|| format_agent_failure(command, &output, prompt));
         }
@@ -1512,12 +2535,6 @@ fn invoke_agent_with_timeout(
             .with_context(|| format!("Failed to write prompt to {command} stdin"));
     }
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop_clone = stop.clone();
-    let stdout_bytes = stdout_capture.bytes_captured.clone();
-    let stderr_bytes = stderr_capture.bytes_captured.clone();
-    let stdout_last_update = stdout_capture.last_update.clone();
-    let stderr_last_update = stderr_capture.last_update.clone();
     let heartbeat_stdout_last_update = stdout_last_update.clone();
     let heartbeat_stderr_last_update = stderr_last_update.clone();
     let heartbeat_args = effective_args.clone();
@@ -1525,43 +2542,59 @@ fn invoke_agent_with_timeout(
     let heartbeat_workspace_root = workspace_root.to_path_buf();
     let heartbeat_debug_artifacts = debug_artifacts.cloned();
     let prompt_len = prompt.len();
+    let phase = context.phase.to_string();
+    let heartbeat_stdout_bytes = stdout_bytes.clone();
+    let heartbeat_stderr_bytes = stderr_bytes.clone();
+    let heartbeat_durations = durations.clone();
+    let (heartbeat_tx, heartbeat_rx) = std::sync::mpsc::channel::<()>();
     let heartbeat = std::thread::spawn(move || {
         let mut elapsed = 0u64;
-        while !stop_clone.load(Ordering::Relaxed) {
-            std::thread::sleep(Duration::from_secs(10));
-            if stop_clone.load(Ordering::Relaxed) {
-                break;
-            }
-            elapsed += 10;
-            eprint!("\r  ...agent working ({elapsed}s)   ");
-            if let Some(debug_artifacts) = heartbeat_debug_artifacts.as_ref() {
-                let last_stdout_at = heartbeat_stdout_last_update
-                    .lock()
-                    .ok()
-                    .and_then(|value| *value);
-                let last_stderr_at = heartbeat_stderr_last_update
-                    .lock()
-                    .ok()
-                    .and_then(|value| *value);
-                write_live_scan_status(
-                    debug_artifacts,
-                    LiveScanStatusUpdate {
-                        started_at: agent_started_at,
-                        state: "running",
-                        command: &heartbeat_command,
-                        args: &heartbeat_args,
-                        workspace_root: &heartbeat_workspace_root,
-                        batch_size,
-                        prompt_bytes: prompt_len,
-                        timeout,
-                        agent_pid: Some(agent_pid),
-                        stdout_bytes: stdout_bytes.load(Ordering::Relaxed),
-                        stderr_bytes: stderr_bytes.load(Ordering::Relaxed),
-                        last_stdout_at,
-                        last_stderr_at,
-                        note: Some(format!("Agent running for {elapsed}s")),
-                    },
-                );
+        loop {
+            match heartbeat_rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    elapsed += 10;
+                    eprint!("\r  ...agent working ({elapsed}s)   ");
+                    if let Some(debug_artifacts) = heartbeat_debug_artifacts.as_ref() {
+                        let last_stdout_at = heartbeat_stdout_last_update
+                            .lock()
+                            .ok()
+                            .and_then(|value| *value);
+                        let last_stderr_at = heartbeat_stderr_last_update
+                            .lock()
+                            .ok()
+                            .and_then(|value| *value);
+                        write_live_scan_status(
+                            debug_artifacts,
+                            LiveScanStatusUpdate {
+                                started_at: agent_started_at,
+                                state: "running",
+                                phase: &phase,
+                                command: &heartbeat_command,
+                                args: &heartbeat_args,
+                                workspace_root: &heartbeat_workspace_root,
+                                batch_size,
+                                selected_raw_bytes,
+                                staged_bytes,
+                                discovered_sessions,
+                                candidate_sessions,
+                                skipped_sessions,
+                                backlog_sessions,
+                                ready_workflows,
+                                proposals_written,
+                                prompt_bytes: prompt_len,
+                                timeout,
+                                agent_pid: Some(agent_pid),
+                                stdout_bytes: heartbeat_stdout_bytes.load(Ordering::Relaxed),
+                                stderr_bytes: heartbeat_stderr_bytes.load(Ordering::Relaxed),
+                                last_stdout_at,
+                                last_stderr_at,
+                                durations: heartbeat_durations.clone(),
+                                note: Some(format!("Agent running for {elapsed}s")),
+                            },
+                        );
+                    }
+                }
             }
         }
         eprint!("\r                            \r");
@@ -1590,38 +2623,53 @@ fn invoke_agent_with_timeout(
         }
     };
 
-    stop.store(true, Ordering::Relaxed);
+    let _ = heartbeat_tx.send(());
     let _ = heartbeat.join();
-    let stdout = stdout_capture.finish("stdout")?;
-    let stderr = stderr_capture.finish("stderr")?;
-    let stdout_lossy = String::from_utf8_lossy(&stdout).to_string();
-    let stderr_lossy = String::from_utf8_lossy(&stderr).to_string();
+    let (stdout_tail, stdout_touched, stdout_path) = stdout_capture.finish("stdout")?;
+    let (stderr_tail, stderr_touched, stderr_path) = stderr_capture.finish("stderr")?;
+    let mut touched_paths = stdout_touched;
+    touched_paths.extend(stderr_touched);
+    let stdout_tail = String::from_utf8_lossy(&stdout_tail).to_string();
+    let stderr_tail = String::from_utf8_lossy(&stderr_tail).to_string();
+    let stdout = std::fs::read_to_string(&stdout_path)
+        .with_context(|| format!("Failed to read {}", stdout_path.display()))?;
+    let _ = stderr_path;
 
     if timed_out {
-        persist_agent_debug_output(debug_run_dir, prompt, &stdout_lossy, &stderr_lossy, None);
+        persist_agent_debug_output(debug_run_dir, prompt, None);
         if let Some(debug_artifacts) = debug_artifacts {
             write_live_scan_status(
                 debug_artifacts,
                 LiveScanStatusUpdate {
                     started_at: agent_started_at,
                     state: "timed_out",
+                    phase: context.phase,
                     command,
                     args: &effective_args,
                     workspace_root,
                     batch_size,
+                    selected_raw_bytes,
+                    staged_bytes,
+                    discovered_sessions,
+                    candidate_sessions,
+                    skipped_sessions,
+                    backlog_sessions,
+                    ready_workflows,
+                    proposals_written,
                     prompt_bytes: prompt.len(),
                     timeout,
                     agent_pid: Some(agent_pid),
-                    stdout_bytes: stdout.len() as u64,
-                    stderr_bytes: stderr.len() as u64,
-                    last_stdout_at: Some(SystemTime::now()),
-                    last_stderr_at: Some(SystemTime::now()),
+                    stdout_bytes: stdout_bytes.load(Ordering::Relaxed),
+                    stderr_bytes: stderr_bytes.load(Ordering::Relaxed),
+                    last_stdout_at: stdout_last_update.lock().ok().and_then(|value| *value),
+                    last_stderr_at: stderr_last_update.lock().ok().and_then(|value| *value),
+                    durations: durations.clone(),
                     note: Some("Agent timed out before producing a final response".to_string()),
                 },
             );
         }
-        let stderr = sanitize_agent_diagnostics(&stderr_lossy, prompt);
-        let stdout = sanitize_agent_diagnostics(&stdout_lossy, prompt);
+        let stderr = sanitize_agent_diagnostics(&stderr_tail, prompt);
+        let stdout = sanitize_agent_diagnostics(&stdout_tail, prompt);
         let details = match (stderr.is_empty(), stdout.is_empty()) {
             (true, true) => String::new(),
             (false, true) => format!("\nAgent stderr before timeout:\n{stderr}"),
@@ -1640,24 +2688,34 @@ fn invoke_agent_with_timeout(
     }
 
     if !status.success() {
-        persist_agent_debug_output(debug_run_dir, prompt, &stdout_lossy, &stderr_lossy, None);
+        persist_agent_debug_output(debug_run_dir, prompt, None);
         if let Some(debug_artifacts) = debug_artifacts {
             write_live_scan_status(
                 debug_artifacts,
                 LiveScanStatusUpdate {
                     started_at: agent_started_at,
                     state: "failed",
+                    phase: context.phase,
                     command,
                     args: &effective_args,
                     workspace_root,
                     batch_size,
+                    selected_raw_bytes,
+                    staged_bytes,
+                    discovered_sessions,
+                    candidate_sessions,
+                    skipped_sessions,
+                    backlog_sessions,
+                    ready_workflows,
+                    proposals_written,
                     prompt_bytes: prompt.len(),
                     timeout,
                     agent_pid: Some(agent_pid),
-                    stdout_bytes: stdout.len() as u64,
-                    stderr_bytes: stderr.len() as u64,
+                    stdout_bytes: stdout_bytes.load(Ordering::Relaxed),
+                    stderr_bytes: stderr_bytes.load(Ordering::Relaxed),
                     last_stdout_at: stdout_last_update.lock().ok().and_then(|value| *value),
                     last_stderr_at: stderr_last_update.lock().ok().and_then(|value| *value),
+                    durations: durations.clone(),
                     note: Some(format!("Agent exited with status {status}")),
                 },
             );
@@ -1665,36 +2723,43 @@ fn invoke_agent_with_timeout(
         cleanup_temp_files(&temp_files);
         let output = std::process::Output {
             status,
-            stdout,
-            stderr,
+            stdout: stdout_tail.into_bytes(),
+            stderr: stderr_tail.into_bytes(),
         };
         bail!("{}", format_agent_failure(command, &output, prompt));
     }
 
-    let stdout = String::from_utf8(stdout).context("Agent stdout is not valid UTF-8")?;
-    let stderr = String::from_utf8(stderr).context("Agent stderr is not valid UTF-8")?;
-
     let final_output =
         finalize_proposal_output(mode, &stdout, prepared.sidecar_output_path.as_deref())?;
 
-    persist_agent_debug_output(debug_run_dir, prompt, &stdout, &stderr, Some(&final_output));
+    persist_agent_debug_output(debug_run_dir, prompt, Some(&final_output));
     if let Some(debug_artifacts) = debug_artifacts {
         write_live_scan_status(
             debug_artifacts,
             LiveScanStatusUpdate {
                 started_at: agent_started_at,
                 state: "completed",
+                phase: context.phase,
                 command,
                 args: &effective_args,
                 workspace_root,
                 batch_size,
+                selected_raw_bytes,
+                staged_bytes,
+                discovered_sessions,
+                candidate_sessions,
+                skipped_sessions,
+                backlog_sessions,
+                ready_workflows,
+                proposals_written,
                 prompt_bytes: prompt.len(),
                 timeout,
                 agent_pid: Some(agent_pid),
-                stdout_bytes: stdout.len() as u64,
-                stderr_bytes: stderr.len() as u64,
-                last_stdout_at: Some(SystemTime::now()),
-                last_stderr_at: Some(SystemTime::now()),
+                stdout_bytes: stdout_bytes.load(Ordering::Relaxed),
+                stderr_bytes: stderr_bytes.load(Ordering::Relaxed),
+                last_stdout_at: stdout_last_update.lock().ok().and_then(|value| *value),
+                last_stderr_at: stderr_last_update.lock().ok().and_then(|value| *value),
+                durations: durations.clone(),
                 note: Some("Agent completed successfully".to_string()),
             },
         );
@@ -1703,10 +2768,7 @@ fn invoke_agent_with_timeout(
 
     Ok(AgentInvocation {
         final_output,
-        audit_log: match mode {
-            ProposalAgentMode::Generic => String::new(),
-            _ => stdout,
-        },
+        touched_paths,
         mode,
     })
 }
@@ -1714,13 +2776,9 @@ fn invoke_agent_with_timeout(
 fn persist_agent_debug_output(
     debug_run_dir: Option<&Path>,
     prompt: &str,
-    stdout: &str,
-    stderr: &str,
     final_output: Option<&str>,
 ) {
     write_debug_text(debug_run_dir, "prompt.txt", prompt);
-    write_debug_text(debug_run_dir, "agent-stdout.log", stdout);
-    write_debug_text(debug_run_dir, "agent-stderr.log", stderr);
     if let Some(final_output) = final_output {
         write_debug_text(debug_run_dir, "agent-final-output.txt", final_output);
     }
@@ -1755,6 +2813,46 @@ fn parse_scan_response(raw: &str, workspace_root: &Path) -> Result<ParsedScanRes
         inspected_files,
         file_findings,
         proposals,
+    })
+}
+
+fn parse_workflow_response(raw: &str, workspace_root: &Path) -> Result<ParsedWorkflowResponse> {
+    let response_value = extract_json_value(raw)?;
+    let raw_response: RawWorkflowResponse =
+        serde_json::from_value(response_value).context("Failed to parse workflow response")?;
+
+    let inspected_files = raw_response
+        .inspected_files
+        .into_iter()
+        .map(|path| normalize_reported_path(&path, workspace_root))
+        .collect::<Vec<_>>();
+
+    let session_findings = raw_response
+        .session_findings
+        .into_iter()
+        .map(|finding| SessionWorkflowFinding {
+            session: normalize_reported_path(&finding.session, workspace_root),
+            summary: finding.summary,
+            candidates: finding
+                .candidates
+                .into_iter()
+                .map(|candidate| WorkflowFinding {
+                    workflow_key: candidate.workflow_key.trim().to_string(),
+                    workflow_label: candidate
+                        .workflow_label
+                        .map(|value| value.trim().to_string())
+                        .filter(|value| !value.is_empty()),
+                    note: candidate.note.trim().to_string(),
+                    start_event: candidate.start_event,
+                    end_event: candidate.end_event,
+                })
+                .collect::<Vec<_>>(),
+        })
+        .collect::<Vec<_>>();
+
+    Ok(ParsedWorkflowResponse {
+        inspected_files,
+        session_findings,
     })
 }
 
@@ -1842,6 +2940,71 @@ fn convert_raw_proposal(raw_proposal: RawProposal, workspace_root: &Path) -> Res
     })
 }
 
+fn validate_workflow_response(
+    parsed: &ParsedWorkflowResponse,
+    workspace: &StagedWorkspace,
+    invocation: &AgentInvocation,
+) -> Result<()> {
+    let expected_paths = workspace
+        .staged_sessions
+        .iter()
+        .map(|session| canonicalize_path(&session.staged_path))
+        .collect::<Vec<_>>();
+
+    validate_full_coverage("inspected_files", &parsed.inspected_files, &expected_paths)?;
+
+    let finding_sessions = parsed
+        .session_findings
+        .iter()
+        .map(|finding| finding.session.clone())
+        .collect::<Vec<_>>();
+    validate_full_coverage("session_findings", &finding_sessions, &expected_paths)?;
+
+    for finding in &parsed.session_findings {
+        if finding.summary.trim().is_empty() {
+            bail!(
+                "Every session finding must include a non-empty summary (missing for {})",
+                finding.session.display()
+            );
+        }
+        for candidate in &finding.candidates {
+            if candidate.workflow_key.trim().is_empty() {
+                bail!(
+                    "Workflow candidates must include a non-empty workflow_key ({})",
+                    finding.session.display()
+                );
+            }
+            if candidate.note.trim().is_empty() {
+                bail!(
+                    "Workflow candidates must include a non-empty note ({})",
+                    finding.session.display()
+                );
+            }
+            if candidate.start_event == 0 || candidate.end_event == 0 {
+                bail!(
+                    "Workflow candidate ranges must use 1-based event numbers ({})",
+                    finding.session.display()
+                );
+            }
+            if candidate.end_event < candidate.start_event {
+                bail!(
+                    "Workflow candidate end_event must be >= start_event ({})",
+                    finding.session.display()
+                );
+            }
+        }
+    }
+
+    if matches!(
+        invocation.mode,
+        ProposalAgentMode::Claude | ProposalAgentMode::Codex
+    ) {
+        validate_touched_paths(&invocation.touched_paths, &expected_paths)?;
+    }
+
+    Ok(())
+}
+
 fn validate_and_finalize_response(
     parsed: &ParsedScanResponse,
     workspace: &StagedWorkspace,
@@ -1888,7 +3051,7 @@ fn validate_and_finalize_response(
         invocation.mode,
         ProposalAgentMode::Claude | ProposalAgentMode::Codex
     ) {
-        validate_audit_trail(&invocation.audit_log, &expected_paths)?;
+        validate_touched_paths(&invocation.touched_paths, &expected_paths)?;
     }
 
     let staged_to_original = workspace
@@ -1897,7 +3060,7 @@ fn validate_and_finalize_response(
         .map(|session| {
             (
                 canonicalize_path(&session.staged_path),
-                session.session.path.to_string_lossy().to_string(),
+                session.source_session.path.to_string_lossy().to_string(),
             )
         })
         .collect::<HashMap<_, _>>();
@@ -1917,6 +3080,22 @@ fn validate_and_finalize_response(
     }
 
     Ok(proposals)
+}
+
+fn validate_touched_paths(touched: &HashSet<PathBuf>, expected_paths: &[PathBuf]) -> Result<()> {
+    let missing = expected_paths
+        .iter()
+        .filter(|path| !touched.contains(*path))
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        bail!(
+            "Agent audit trail did not show read activity for staged file(s): {}",
+            missing.join(", ")
+        );
+    }
+
+    Ok(())
 }
 
 fn validate_full_coverage(label: &str, actual: &[PathBuf], expected: &[PathBuf]) -> Result<()> {
@@ -1955,6 +3134,8 @@ fn validate_full_coverage(label: &str, actual: &[PathBuf], expected: &[PathBuf])
     Ok(())
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn validate_audit_trail(audit_log: &str, expected_paths: &[PathBuf]) -> Result<()> {
     let touched = touched_paths_from_audit_log(audit_log, expected_paths);
     let missing = expected_paths
@@ -1972,6 +3153,7 @@ fn validate_audit_trail(audit_log: &str, expected_paths: &[PathBuf]) -> Result<(
     Ok(())
 }
 
+#[cfg(test)]
 fn touched_paths_from_audit_log(audit_log: &str, candidate_paths: &[PathBuf]) -> HashSet<PathBuf> {
     let mut touched = HashSet::new();
     for line in audit_log.lines() {
@@ -1985,10 +3167,13 @@ fn touched_paths_from_audit_log(audit_log: &str, candidate_paths: &[PathBuf]) ->
         let mut strings = Vec::new();
         collect_all_strings(&value, &mut strings, 0);
         let haystack = strings.join("\n");
+        let normalized_haystack = normalize_path_like_text(&haystack);
         for path in candidate_paths {
             if path_search_variants(path)
                 .iter()
-                .any(|variant| haystack.contains(variant))
+                .any(|variant| {
+                    haystack.contains(variant) || normalized_haystack.contains(variant)
+                })
             {
                 touched.insert(path.clone());
             }
@@ -2020,7 +3205,33 @@ fn path_search_variants(path: &Path) -> Vec<String> {
         }
     }
 
-    expanded
+    let mut normalized = expanded.clone();
+    for variant in expanded {
+        let collapsed = normalize_path_like_text(&variant);
+        if !normalized.contains(&collapsed) {
+            normalized.push(collapsed);
+        }
+    }
+
+    normalized
+}
+
+fn normalize_path_like_text(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len());
+    let mut previous_was_slash = false;
+    for ch in text.chars() {
+        if ch == '/' {
+            if !previous_was_slash {
+                normalized.push(ch);
+            }
+            previous_was_slash = true;
+        } else {
+            previous_was_slash = false;
+            normalized.push(ch);
+        }
+    }
+
+    normalized
 }
 
 fn looks_like_audit_event(value: &serde_json::Value) -> bool {
@@ -2084,12 +3295,31 @@ fn collect_all_strings(value: &serde_json::Value, out: &mut Vec<String>, depth: 
 mod tests {
     use super::*;
     use crate::agents::Skill;
+    use std::collections::HashSet;
+    use std::fs;
 
     fn sample_session(id: &str, agent: AgentKind, hours_ago: i64) -> Session {
         Session {
             id: id.to_string(),
             agent,
             path: PathBuf::from(format!("/tmp/{id}.jsonl")),
+            timestamp: Utc::now() - chrono::Duration::hours(hours_ago),
+            content: String::new(),
+        }
+    }
+
+    fn temp_session_file(
+        dir: &tempfile::TempDir,
+        name: &str,
+        bytes: usize,
+        hours_ago: i64,
+    ) -> Session {
+        let path = dir.path().join(name);
+        fs::write(&path, "x".repeat(bytes)).unwrap();
+        Session {
+            id: name.to_string(),
+            agent: AgentKind::Codex,
+            path,
             timestamp: Utc::now() - chrono::Duration::hours(hours_ago),
             content: String::new(),
         }
@@ -2133,6 +3363,38 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["existing", "newer", "older-new"]
         );
+    }
+
+    #[test]
+    fn test_select_session_batch_respects_count_and_raw_byte_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = vec![
+            temp_session_file(&dir, "one.jsonl", 10, 3),
+            temp_session_file(&dir, "two.jsonl", 20, 2),
+            temp_session_file(&dir, "three.jsonl", 30, 1),
+        ];
+
+        let selected = select_session_batch(&sessions, 3, Some(35)).unwrap();
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].session.id, "one.jsonl");
+        assert_eq!(selected[1].session.id, "two.jsonl");
+
+        let selected = select_session_batch(&sessions, 1, Some(100)).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].session.id, "one.jsonl");
+    }
+
+    #[test]
+    fn test_select_session_batch_keeps_single_oversized_first_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = vec![
+            temp_session_file(&dir, "huge.jsonl", 200, 2),
+            temp_session_file(&dir, "small.jsonl", 10, 1),
+        ];
+
+        let selected = select_session_batch(&sessions, 5, Some(64)).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].session.id, "huge.jsonl");
     }
 
     #[test]
@@ -2271,11 +3533,11 @@ mod tests {
             },
             staged_sessions: vec![
                 StagedSession {
-                    session: sample_session("one", AgentKind::Claude, 2),
+                    source_session: sample_session("one", AgentKind::Claude, 2),
                     staged_path: PathBuf::from("/tmp/workspace/sessions/claude/one.jsonl"),
                 },
                 StagedSession {
-                    session: sample_session("two", AgentKind::Claude, 1),
+                    source_session: sample_session("two", AgentKind::Claude, 1),
                     staged_path: PathBuf::from("/tmp/workspace/sessions/claude/two.jsonl"),
                 },
             ],
@@ -2297,7 +3559,7 @@ mod tests {
             &workspace,
             &AgentInvocation {
                 final_output: String::new(),
-                audit_log: String::new(),
+                touched_paths: HashSet::new(),
                 mode: ProposalAgentMode::Generic,
             },
         )
@@ -2325,6 +3587,25 @@ mod tests {
                 }
             })
         );
+
+        let touched = touched_paths_from_audit_log(&log, std::slice::from_ref(&path));
+        assert!(touched.contains(&path));
+        assert_eq!(touched.len(), 1);
+    }
+
+    #[test]
+    fn test_touched_paths_from_audit_log_matches_private_prefix_and_double_slashes() {
+        let path = PathBuf::from(
+            "/private/var/folders/test/workflow/sessions/codex/0001-example.jsonl",
+        );
+        let log = serde_json::json!({
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution",
+                "command": "/bin/zsh -lc \"sed -n '1,120p' '/var/folders/test//workflow/sessions/codex/0001-example.jsonl'\""
+            }
+        })
+        .to_string();
 
         let touched = touched_paths_from_audit_log(&log, std::slice::from_ref(&path));
         assert!(touched.contains(&path));
