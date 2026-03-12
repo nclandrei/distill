@@ -559,9 +559,7 @@ fn update_touched_paths_from_line(
         for path in candidate_paths {
             if path_search_variants(path)
                 .iter()
-                .any(|variant| {
-                    haystack.contains(variant) || normalized_haystack.contains(variant)
-                })
+                .any(|variant| haystack.contains(variant) || normalized_haystack.contains(variant))
             {
                 touched.insert(path.clone());
             }
@@ -952,7 +950,8 @@ pub fn run_scan(agents: &[Box<dyn Agent>], scan_config: &ScanConfig) -> Result<V
         }
 
         let staging_started = Instant::now();
-        let (workspace, staged_bytes) = stage_timeline_workspace(&batch, &skill_sources, debug_run_dir)?;
+        let (workspace, staged_bytes) =
+            stage_timeline_workspace(&batch, &skill_sources, debug_run_dir)?;
         phase_durations.staging = staging_started.elapsed().as_millis() as u64;
         let prompt = build_workflow_detection_prompt(&workspace.manifest, &preferences);
         write_debug_text(debug_run_dir, "workflow-detection-prompt.txt", &prompt);
@@ -1090,9 +1089,7 @@ pub fn run_scan(agents: &[Box<dyn Agent>], scan_config: &ScanConfig) -> Result<V
                     .matches
                     .iter()
                     .filter_map(|item| {
-                        let Some(agent) = AgentKind::from_name(&item.agent) else {
-                            return None;
-                        };
+                        let agent = AgentKind::from_name(&item.agent)?;
                         discover_session(&Session {
                             id: item.session_id.clone(),
                             agent,
@@ -1111,8 +1108,11 @@ pub fn run_scan(agents: &[Box<dyn Agent>], scan_config: &ScanConfig) -> Result<V
                 phase_durations.staging = phase_durations
                     .staging
                     .saturating_add(workflow_staging_started.elapsed().as_millis() as u64);
-                let workflow_prompt =
-                    build_workflow_proposal_prompt(&workflow_workspace.manifest, &preferences, &workflow);
+                let workflow_prompt = build_workflow_proposal_prompt(
+                    &workflow_workspace.manifest,
+                    &preferences,
+                    &workflow,
+                );
                 write_debug_text(
                     debug_run_dir,
                     &format!(
@@ -1155,7 +1155,10 @@ pub fn run_scan(agents: &[Box<dyn Agent>], scan_config: &ScanConfig) -> Result<V
                     .proposal_agent
                     .saturating_add(proposal_started.elapsed().as_millis() as u64);
 
-                let parsed = parse_scan_response(&proposal_invocation.final_output, &workflow_workspace.root)?;
+                let parsed = parse_scan_response(
+                    &proposal_invocation.final_output,
+                    &workflow_workspace.root,
+                )?;
                 write_debug_text(
                     debug_run_dir,
                     &format!(
@@ -1194,8 +1197,11 @@ pub fn run_scan(agents: &[Box<dyn Agent>], scan_config: &ScanConfig) -> Result<V
                     .unwrap_or_else(|_| "{}".to_string()),
                 );
 
-                let proposals =
-                    validate_and_finalize_response(&parsed, &workflow_workspace, &proposal_invocation)?;
+                let proposals = validate_and_finalize_response(
+                    &parsed,
+                    &workflow_workspace,
+                    &proposal_invocation,
+                )?;
                 scan_state.mark_workflow_attempted(
                     &workflow.workflow_key,
                     workflow.matches.len(),
@@ -1208,7 +1214,11 @@ pub fn run_scan(agents: &[Box<dyn Agent>], scan_config: &ScanConfig) -> Result<V
                         Utc::now(),
                     );
                 }
-                write_proposals(&scan_config.proposals_dir, &mut written_proposals, proposals)?;
+                write_proposals(
+                    &scan_config.proposals_dir,
+                    &mut written_proposals,
+                    proposals,
+                )?;
             }
         } else {
             let parsed = parse_scan_response(&invocation.final_output, &workspace.root)?;
@@ -1247,7 +1257,11 @@ pub fn run_scan(agents: &[Box<dyn Agent>], scan_config: &ScanConfig) -> Result<V
                 .unwrap_or_else(|_| "{}".to_string()),
             );
             let proposals = validate_and_finalize_response(&parsed, &workspace, &invocation)?;
-            write_proposals(&scan_config.proposals_dir, &mut written_proposals, proposals)?;
+            write_proposals(
+                &scan_config.proposals_dir,
+                &mut written_proposals,
+                proposals,
+            )?;
         }
 
         let finalize_started = Instant::now();
@@ -1281,7 +1295,9 @@ pub fn run_scan(agents: &[Box<dyn Agent>], scan_config: &ScanConfig) -> Result<V
             candidate_sessions: candidate_count,
             skipped_sessions: skipped_internal,
             backlog_sessions: backlog.sessions.len(),
-            ready_workflows: scan_state.ready_workflows(MIN_WORKFLOW_MATCHES_FOR_PROPOSAL).len(),
+            ready_workflows: scan_state
+                .ready_workflows(MIN_WORKFLOW_MATCHES_FOR_PROPOSAL)
+                .len(),
             proposals_written: written_proposals.len(),
             prompt_bytes: 0,
             timeout_secs: timeout.map(|value| value.as_secs()),
@@ -1507,7 +1523,10 @@ fn stage_workflow_workspace(
     debug_run_dir: Option<&Path>,
 ) -> Result<(StagedWorkspace, u64)> {
     let (root, cleanup_on_drop) = if let Some(run_dir) = debug_run_dir {
-        let root = run_dir.join(format!("workflow-{}", sanitize_filename(&workflow.workflow_key)));
+        let root = run_dir.join(format!(
+            "workflow-{}",
+            sanitize_filename(&workflow.workflow_key)
+        ));
         if root.exists() {
             std::fs::remove_dir_all(&root)?;
         }
@@ -3171,9 +3190,7 @@ fn touched_paths_from_audit_log(audit_log: &str, candidate_paths: &[PathBuf]) ->
         for path in candidate_paths {
             if path_search_variants(path)
                 .iter()
-                .any(|variant| {
-                    haystack.contains(variant) || normalized_haystack.contains(variant)
-                })
+                .any(|variant| haystack.contains(variant) || normalized_haystack.contains(variant))
             {
                 touched.insert(path.clone());
             }
@@ -3595,9 +3612,8 @@ mod tests {
 
     #[test]
     fn test_touched_paths_from_audit_log_matches_private_prefix_and_double_slashes() {
-        let path = PathBuf::from(
-            "/private/var/folders/test/workflow/sessions/codex/0001-example.jsonl",
-        );
+        let path =
+            PathBuf::from("/private/var/folders/test/workflow/sessions/codex/0001-example.jsonl");
         let log = serde_json::json!({
             "type": "item.completed",
             "item": {

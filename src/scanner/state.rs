@@ -151,7 +151,11 @@ impl ScanState {
                         .cmp(&left.timestamp)
                         .then_with(|| left.session_path.cmp(&right.session_path))
                 });
-                let workflow_state = self.workflows.get(&workflow_key).cloned().unwrap_or_default();
+                let workflow_state = self
+                    .workflows
+                    .get(&workflow_key)
+                    .cloned()
+                    .unwrap_or_default();
                 if workflow_state.proposed
                     || matches.len() < min_matches
                     || matches.len() <= workflow_state.last_attempted_count
@@ -159,10 +163,11 @@ impl ScanState {
                     return None;
                 }
                 Some(ReadyWorkflow {
-                    workflow_label: workflow_state
-                        .workflow_label
-                        .clone()
-                        .or_else(|| matches.iter().find_map(|item| item.finding.workflow_label.clone())),
+                    workflow_label: workflow_state.workflow_label.clone().or_else(|| {
+                        matches
+                            .iter()
+                            .find_map(|item| item.finding.workflow_label.clone())
+                    }),
                     workflow_key,
                     matches,
                 })

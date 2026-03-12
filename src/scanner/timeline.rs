@@ -93,7 +93,10 @@ pub fn render_timeline(timeline: &SessionTimeline) -> String {
             "Timestamp: {}",
             timeline.descriptor.session.timestamp.to_rfc3339()
         ),
-        format!("Original path: {}", timeline.descriptor.session.path.display()),
+        format!(
+            "Original path: {}",
+            timeline.descriptor.session.path.display()
+        ),
         format!("Raw bytes: {}", timeline.descriptor.raw_bytes),
     ];
 
@@ -272,14 +275,21 @@ fn collect_jsonl_entries(_agent: AgentKind, value: &Value, entries: &mut Vec<Tim
                 }
                 Some("agent_message") => {
                     if let Some(message) = payload.get("message").and_then(Value::as_str) {
-                        push_entry(entries, "ASSISTANT message".to_string(), message.to_string());
+                        push_entry(
+                            entries,
+                            "ASSISTANT message".to_string(),
+                            message.to_string(),
+                        );
                     }
                 }
                 Some("task_complete") => {
-                    if let Some(message) =
-                        payload.get("last_agent_message").and_then(Value::as_str)
+                    if let Some(message) = payload.get("last_agent_message").and_then(Value::as_str)
                     {
-                        push_entry(entries, "ASSISTANT outcome".to_string(), message.to_string());
+                        push_entry(
+                            entries,
+                            "ASSISTANT outcome".to_string(),
+                            message.to_string(),
+                        );
                     }
                 }
                 _ => {}
@@ -328,15 +338,11 @@ fn collect_opencode_entries(value: &Value, entries: &mut Vec<TimelineEntry>, dep
             }
         }
         Value::Object(map) => {
-            if let Some(role) = map
-                .get("role")
-                .and_then(Value::as_str)
-                .or_else(|| {
-                    map.get("info")
-                        .and_then(|info| info.get("role"))
-                        .and_then(Value::as_str)
-                })
-            {
+            if let Some(role) = map.get("role").and_then(Value::as_str).or_else(|| {
+                map.get("info")
+                    .and_then(|info| info.get("role"))
+                    .and_then(Value::as_str)
+            }) {
                 let text = extract_opencode_message_text(
                     map.get("content")
                         .or_else(|| map.get("parts"))
@@ -497,8 +503,7 @@ fn discover_session_cwd(session: &Session) -> Result<Option<String>> {
 }
 
 fn derive_project(session: &Session, cwd: Option<&str>) -> Option<String> {
-    derive_project_from_cwd(cwd)
-        .or_else(|| derive_project_from_path(&session.path, session.agent))
+    derive_project_from_cwd(cwd).or_else(|| derive_project_from_path(&session.path, session.agent))
 }
 
 fn derive_project_from_cwd(cwd: Option<&str>) -> Option<String> {
@@ -522,7 +527,9 @@ fn derive_claude_project_from_path(path: &Path) -> Option<String> {
         .components()
         .map(|component| component.as_os_str().to_string_lossy().to_string())
         .collect::<Vec<_>>();
-    let index = components.iter().position(|component| component == "projects")?;
+    let index = components
+        .iter()
+        .position(|component| component == "projects")?;
     components
         .get(index + 1)
         .map(|value| sanitize_project_name(value))
@@ -571,7 +578,9 @@ mod tests {
     #[test]
     fn test_codex_timeline_keeps_middle_command_execution() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(".codex/sessions/2026/03/12/rollout-demo.jsonl");
+        let path = dir
+            .path()
+            .join(".codex/sessions/2026/03/12/rollout-demo.jsonl");
         write_session(
             &path,
             &[

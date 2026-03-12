@@ -1,7 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root="${JJ_WORKSPACE_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
+repo_root="$(
+  if [ -n "${JJ_WORKSPACE_ROOT:-}" ]; then
+    printf '%s\n' "$JJ_WORKSPACE_ROOT"
+  elif jj root >/dev/null 2>&1; then
+    jj root
+  elif git rev-parse --show-toplevel >/dev/null 2>&1; then
+    git rev-parse --show-toplevel
+  else
+    pwd
+  fi
+)"
 cd "$repo_root"
 
 echo "[local-checks] cargo fmt --all"

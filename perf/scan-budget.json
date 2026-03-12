@@ -1,0 +1,15 @@
+{
+  "thresholds": {
+    "max_wall_seconds": 30.0,
+    "max_max_rss_bytes": 268435456,
+    "max_peak_memory_footprint_bytes": 134217728,
+    "max_batch_size": 20,
+    "max_selected_raw_bytes": 67108864,
+    "min_candidate_sessions": 40,
+    "min_proposals_written": 1,
+    "require_backlog_drain": true,
+    "required_workflow_keys": [
+      "land-and-test-changes"
+    ]
+  }
+}

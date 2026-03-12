@@ -6,6 +6,7 @@ import os
 import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import List
 
 RUNTIME_FILES = [
     ".codex-global-state.json",
@@ -134,7 +135,7 @@ def write_config(temp_home: Path) -> Path:
     return config_path
 
 
-def newest_real_sessions(source_codex_home: Path, count: int) -> list[Path]:
+def newest_real_sessions(source_codex_home: Path, count: int) -> List[Path]:
     sessions_root = source_codex_home / "sessions"
     if count <= 0 or not sessions_root.exists():
         return []
@@ -144,7 +145,7 @@ def newest_real_sessions(source_codex_home: Path, count: int) -> list[Path]:
     return files[:count]
 
 
-def copy_real_sessions(source_codex_home: Path, temp_home: Path, count: int) -> list[str]:
+def copy_real_sessions(source_codex_home: Path, temp_home: Path, count: int) -> List[str]:
     copied = []
     sessions_root = source_codex_home / "sessions"
     destination_root = temp_home / ".codex" / "sessions"
@@ -157,7 +158,7 @@ def copy_real_sessions(source_codex_home: Path, temp_home: Path, count: int) -> 
     return copied
 
 
-def copy_runtime_support(source_codex_home: Path, temp_home: Path) -> list[str]:
+def copy_runtime_support(source_codex_home: Path, temp_home: Path) -> List[str]:
     destination_root = temp_home / ".codex"
     destination_root.mkdir(parents=True, exist_ok=True)
     copied = []

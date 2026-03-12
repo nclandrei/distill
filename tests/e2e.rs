@@ -181,15 +181,22 @@ fn write_codex_session(
     filler_width: usize,
     include_workflow: bool,
 ) -> std::path::PathBuf {
-    let sessions_dir = home.join(".codex").join("sessions").join("2026").join("03").join("12");
+    let sessions_dir = home
+        .join(".codex")
+        .join("sessions")
+        .join("2026")
+        .join("03")
+        .join("12");
     fs::create_dir_all(&sessions_dir).unwrap();
     let path = sessions_dir.join(format!("{session_name}.jsonl"));
 
-    let mut lines = vec![serde_json::json!({
-        "type": "session_meta",
-        "payload": { "cwd": format!("/Users/test/code/{project}") }
-    })
-    .to_string()];
+    let mut lines = vec![
+        serde_json::json!({
+            "type": "session_meta",
+            "payload": { "cwd": format!("/Users/test/code/{project}") }
+        })
+        .to_string(),
+    ];
 
     for index in 0..filler_before {
         let filler = format!(
@@ -928,7 +935,8 @@ printf ']}'
         .success()
         .stdout(predicate::str::contains("Capped this scan to"));
 
-    let seen_after_first = fs::read_to_string(dir.path().join(".distill/seen-batches.txt")).unwrap();
+    let seen_after_first =
+        fs::read_to_string(dir.path().join(".distill/seen-batches.txt")).unwrap();
     let first_count = seen_after_first.lines().count();
     assert!(first_count > 0);
     assert!(first_count < 18);
@@ -1123,9 +1131,10 @@ printf '%s' "{\"inspected_files\":[\"$staged_session\"],\"session_findings\":[{\
     assert!(run_dir.join("scan-status.json").is_file());
     assert!(run_dir.join("workspace/manifest.json").is_file());
 
-    let scan_status =
-        serde_json::from_str::<serde_json::Value>(&fs::read_to_string(run_dir.join("scan-status.json")).unwrap())
-            .unwrap();
+    let scan_status = serde_json::from_str::<serde_json::Value>(
+        &fs::read_to_string(run_dir.join("scan-status.json")).unwrap(),
+    )
+    .unwrap();
     assert_eq!(scan_status["phase"], "finalize");
     assert!(scan_status["selected_raw_bytes"].as_u64().unwrap() > 0);
     assert!(scan_status["staged_bytes"].as_u64().unwrap() > 0);

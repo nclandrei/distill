@@ -81,10 +81,32 @@ jobs:
           git tag "${{ steps.release.outputs.release_tag }}"
           git push origin "refs/tags/${{ steps.release.outputs.release_tag }}"
 
+  perf-gate:
+    name: Performance gate
+    runs-on: macos-latest
+    needs: prepare-release
+    if: needs.prepare-release.outputs.release_needed == 'true'
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-perf-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-release-perf-
+
+      - name: make perf-check
+        run: make perf-check
+
   dist-local:
     name: Build local artifacts (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
-    needs: prepare-release
+    needs: [prepare-release, perf-gate]
     if: needs.prepare-release.outputs.release_needed == 'true'
     strategy:
       matrix:

@@ -1,4 +1,4 @@
-.PHONY: build test lint fmt check local-checks hooks-install clean
+.PHONY: build test lint fmt check local-checks hooks-install clean perf-check perf-benchmark
 
 build:
 	cargo build
@@ -17,6 +17,15 @@ check: fmt lint test
 
 local-checks:
 	./scripts/local-checks.sh
+
+perf-benchmark: build
+	@mkdir -p .distill-runtime/perf
+	./scripts/benchmark_scan.sh --report .distill-runtime/perf/scan-report.json
+
+perf-check: build
+	@mkdir -p .distill-runtime/perf
+	./scripts/benchmark_scan.sh --report .distill-runtime/perf/scan-report.json
+	./scripts/check_scan_perf.py --budget perf/scan-budget.json .distill-runtime/perf/scan-report.json
 
 hooks-install:
 	./scripts/install-hooks.sh
