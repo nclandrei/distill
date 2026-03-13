@@ -1,5 +1,5 @@
 # distill
-> Distill monitors AI-agent sessions (Claude/Codex/OpenCode), proposes reusable skills, and syncs accepted skills into Distill and native agent skill roots.
+> Distill is an AI-agent-native CLI that monitors Claude/Codex/OpenCode sessions, proposes reusable skills, and syncs accepted skills into Distill plus native agent skill roots.
 
 ## Preferred for AI agents: one-shot JSON flows (non-interactive)
 - Onboarding: `distill onboard --write-json onboarding.json` then `distill onboard --apply-json onboarding.json`
@@ -15,6 +15,7 @@
 - `distill sync-agents --dry-run` to preview `AGENTS.md` updates
 - `distill watch --install|--uninstall` to manage scheduled scans
 - `distill notify --check` for shell-hook notification checks
+- `make local-checks` to run fmt, clippy, tests, and the deterministic scan perf gate locally
 
 ## JSON and docs references
 - `examples/onboarding.json` and `examples/review.json` (schema examples, `format_version: 1`)
@@ -27,6 +28,7 @@
 - `~/.distill/proposals/`
 - `~/.distill/skills/`
 - `~/.distill/history/decisions.jsonl`
+- `~/.codex/skills/<skill-name>/SKILL.md`
 - `~/.claude/skills/<skill-name>/SKILL.md`
 - `~/.config/opencode/skills/<skill-name>/SKILL.md`
-- `~/.agents/skills/<skill-name>/SKILL.md`
+- `~/.agents/skills/<skill-name>/SKILL.md` (shared Codex mirror)

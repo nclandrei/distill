@@ -2,7 +2,7 @@
 
 ![distill icon](assets/icons/png/color/distill-color-256.png)
 
-`distill` helps you turn repeated AI-agent work into reusable skills. It watches Claude/Codex/OpenCode sessions, proposes improvements, and lets you accept them with a quick review flow.
+`distill` is an AI-agent-native CLI for turning repeated Claude/Codex/OpenCode work into reusable skills. It watches local agent sessions, proposes improvements, and lets you accept them with a quick review flow.
 
 ## Install
 
@@ -58,19 +58,21 @@ This configures:
   - `jj safe-commit ...`
   - `jj safe-describe ...`
 
-The shared check pipeline auto-applies format/fixes, then verifies tests:
+The shared check pipeline auto-applies format/fixes, verifies tests, and runs the deterministic scan performance gate:
 
 ```bash
 cargo fmt --all
-cargo clippy --fix --allow-dirty --allow-staged -- -D warnings
+cargo clippy --fix --allow-dirty --allow-staged --allow-no-vcs -- -D warnings
 cargo fmt --all
 cargo clippy -- -D warnings
 cargo test
+make perf-check
 ```
 
 Notes:
 - `jj` currently does not have native commit hooks, so the practical equivalent is using the `safe-*` aliases for commit-time enforcement.
-- You can run the same pipeline anytime with `make local-checks`.
+- `make local-checks` runs this full pipeline, including the perf smoke check.
+- CI and Release also gate scanner performance with `make perf-check`.
 
 ## Release Automation
 
@@ -81,6 +83,7 @@ Pushing to `main` triggers the release workflow. When the version in `Cargo.toml
 
 The workflow creates the `v<version>` tag automatically. You do not need to push tags manually.
 If a non-draft GitHub release for the current version already exists, automatic `push` runs exit without rebuilding artifacts.
+Release publishing is gated on a successful `make perf-check` run first.
 For an intentional retry of the current version, use GitHub Actions `workflow_dispatch` on the `Release` workflow.
 
 Required GitHub Actions secrets:
@@ -178,7 +181,8 @@ distill review --apply-json review.json
 - Missing decisions default to `skip`
 - Applying decisions writes skills, logs history, and removes processed proposals
 - Accepted skills are synced to:
-  - `~/.agents/skills/<skill-name>/SKILL.md` (default shared target)
+  - `~/.codex/skills/<skill-name>/SKILL.md` when Codex is enabled
+  - `~/.agents/skills/<skill-name>/SKILL.md` as the shared mirror written alongside Codex sync
   - `~/.claude/skills/<skill-name>/SKILL.md` when Claude is enabled
   - `~/.config/opencode/skills/<skill-name>/SKILL.md` when OpenCode is enabled
 

@@ -91,7 +91,7 @@ Examples:
 #[command(
     name = "distill",
     version,
-    about = "Monitor AI agent sessions and distill them into reusable skills",
+    about = "AI-agent-native CLI for distilling agent sessions into reusable skills",
     after_long_help = CLI_AFTER_HELP
 )]
 struct Cli {

@@ -28,3 +28,6 @@ cargo clippy -- -D warnings
 
 echo "[local-checks] cargo test"
 cargo test
+
+echo "[local-checks] make perf-check"
+make perf-check

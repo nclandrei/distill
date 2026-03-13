@@ -67,7 +67,7 @@ fn test_help_flag() {
         .arg("--help")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Monitor AI agent sessions"));
+        .stdout(predicate::str::contains("AI-agent-native CLI"));
 }
 
 #[test]
