@@ -163,6 +163,7 @@ screencapture -x -i /absolute/path/selection.png
 - For repository code changes, run `make local-checks` before committing.
 - To enforce the same checks at commit time, run `make hooks-install` once per clone (installs Git `pre-commit` plus `jj safe-commit` / `jj safe-describe` aliases).
 - CI also validates `cargo package --locked` and smoke-tests release artifacts via `scripts/smoke-test-installed-distill.sh`; run the smoke script locally when changing packaging/release flow.
+- CI and Release both run `make perf-check`; run it locally when changing scan behavior, fixtures, or performance-sensitive scanner code.
 - For test/demo review runs, prefer an isolated home (`HOME="$TMPDIR/...")` so real `~/.distill` data is not modified.
 - For one-proposal review flows, pressing `a` can immediately complete the app and stop tmux.
 - If tmux exits right after action, treat that as expected completion and verify outcomes via filesystem artifacts:
