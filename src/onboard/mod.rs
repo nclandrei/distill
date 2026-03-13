@@ -208,6 +208,7 @@ enum OnboardingStep {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConfirmAction {
+    SaveAndScan,
     Save,
     Back,
     Cancel,
@@ -516,6 +517,8 @@ impl OnboardingUiState {
                 ],
             },
             OnboardingStep::Confirm => vec![
+                "Save + Scan writes ~/.distill/config.yaml, installs scheduler integration, and starts the first scan now."
+                    .to_string(),
                 "Save writes ~/.distill/config.yaml and installs scheduler integration."
                     .to_string(),
                 "Cancel leaves your environment unchanged.".to_string(),
@@ -544,13 +547,14 @@ impl OnboardingUiState {
 
     fn on_step_changed(&mut self) {
         if self.step == OnboardingStep::Confirm {
-            self.confirm_action = ConfirmAction::Save;
+            self.confirm_action = ConfirmAction::SaveAndScan;
         }
     }
 
     fn cycle_confirm_action_prev(&mut self) {
         self.confirm_action = match self.confirm_action {
-            ConfirmAction::Save => ConfirmAction::Cancel,
+            ConfirmAction::SaveAndScan => ConfirmAction::Cancel,
+            ConfirmAction::Save => ConfirmAction::SaveAndScan,
             ConfirmAction::Back => ConfirmAction::Save,
             ConfirmAction::Cancel => ConfirmAction::Back,
         };
@@ -558,9 +562,10 @@ impl OnboardingUiState {
 
     fn cycle_confirm_action_next(&mut self) {
         self.confirm_action = match self.confirm_action {
+            ConfirmAction::SaveAndScan => ConfirmAction::Save,
             ConfirmAction::Save => ConfirmAction::Back,
             ConfirmAction::Back => ConfirmAction::Cancel,
-            ConfirmAction::Cancel => ConfirmAction::Save,
+            ConfirmAction::Cancel => ConfirmAction::SaveAndScan,
         };
     }
 
@@ -758,7 +763,7 @@ impl Drop for TuiSession {
 }
 
 enum OnboardingExit {
-    Completed(OnboardingAnswers, bool),
+    Completed(OnboardingAnswers, bool, bool),
     Canceled,
 }
 
@@ -1144,6 +1149,8 @@ fn draw_onboarding_ui(frame: &mut Frame<'_>, state: &OnboardingUiState) {
             Line::from("Choose an action, then press Enter."),
             Line::from(""),
             Line::from(vec![
+                button(ConfirmAction::SaveAndScan, "Save + Scan"),
+                Span::raw("   "),
                 button(ConfirmAction::Save, "Save"),
                 Span::raw("   "),
                 button(ConfirmAction::Back, "Back"),
@@ -1254,7 +1261,9 @@ fn run_tui_flow(state: &mut OnboardingUiState) -> Result<OnboardingExit> {
             KeyCode::Enter => {
                 if state.step == OnboardingStep::Confirm {
                     match state.confirm_action {
-                        ConfirmAction::Save => {
+                        ConfirmAction::SaveAndScan | ConfirmAction::Save => {
+                            let run_initial_scan =
+                                state.confirm_action == ConfirmAction::SaveAndScan;
                             if state.selected_agents.is_empty() {
                                 state.status_line =
                                     "Select at least one monitored agent before saving."
@@ -1272,6 +1281,7 @@ fn run_tui_flow(state: &mut OnboardingUiState) -> Result<OnboardingExit> {
                             return Ok(OnboardingExit::Completed(
                                 answers,
                                 state.install_hook_effective(),
+                                run_initial_scan,
                             ));
                         }
                         ConfirmAction::Back => {
@@ -1313,7 +1323,7 @@ pub fn run_interactive() -> Result<()> {
     let mut state = OnboardingUiState::new(detected);
 
     let exit = run_tui_flow(&mut state)?;
-    let OnboardingExit::Completed(answers, install_shell_hook) = exit else {
+    let OnboardingExit::Completed(answers, install_shell_hook, run_initial_scan) = exit else {
         println!();
         println!("Onboarding canceled. No configuration was written.");
         return Ok(());
@@ -1364,10 +1374,21 @@ pub fn run_interactive() -> Result<()> {
         "  Scheduler        : installed ({})",
         post_setup.scheduler_path.display()
     );
-    println!();
-    println!("Run 'distill scan --now' to start your first scan.");
-    println!("Run 'distill review' to review pending proposals.");
+    finalize_onboarding(run_initial_scan)?;
 
+    Ok(())
+}
+
+pub fn finalize_onboarding(run_initial_scan: bool) -> Result<()> {
+    println!();
+    if run_initial_scan {
+        println!("Starting first scan now...");
+        crate::commands::scan::run(true)?;
+    } else {
+        println!("Future scheduled runs will continue automatically.");
+        println!("Run 'distill scan --now' any time to start your first scan sooner.");
+    }
+    println!("Run 'distill review' to review pending proposals.");
     Ok(())
 }
 
@@ -1695,24 +1716,26 @@ mod tests {
         let mut state = OnboardingUiState::new(detected);
 
         state.step = OnboardingStep::Confirm;
-        state.confirm_action = ConfirmAction::Save;
+        state.confirm_action = ConfirmAction::SaveAndScan;
+        state.cycle_confirm_action_next();
+        assert_eq!(state.confirm_action, ConfirmAction::Save);
         state.cycle_confirm_action_next();
         assert_eq!(state.confirm_action, ConfirmAction::Back);
         state.cycle_confirm_action_next();
         assert_eq!(state.confirm_action, ConfirmAction::Cancel);
         state.cycle_confirm_action_next();
-        assert_eq!(state.confirm_action, ConfirmAction::Save);
+        assert_eq!(state.confirm_action, ConfirmAction::SaveAndScan);
     }
 
     #[test]
-    fn test_jump_to_confirm_resets_action_to_save() {
+    fn test_jump_to_confirm_resets_action_to_save_and_scan() {
         let detected = detect_agents_with_path(None);
         let mut state = OnboardingUiState::new(detected);
 
         state.confirm_action = ConfirmAction::Cancel;
         assert!(state.jump_to_step_number(state.step_sequence().len()));
         assert_eq!(state.step, OnboardingStep::Confirm);
-        assert_eq!(state.confirm_action, ConfirmAction::Save);
+        assert_eq!(state.confirm_action, ConfirmAction::SaveAndScan);
     }
 
     // --- post-onboarding setup side effects ---

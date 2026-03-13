@@ -35,6 +35,8 @@ struct OnboardingSpec {
     notification_icon: Option<String>,
     #[serde(default = "default_install_shell_hook")]
     install_shell_hook: bool,
+    #[serde(default)]
+    run_initial_scan: bool,
 }
 
 const JSON_STDIO_SENTINEL: &str = "-";
@@ -106,6 +108,7 @@ fn apply_spec_json(path: &Path) -> Result<()> {
         "  Scheduler        : installed ({})",
         post_setup.scheduler_path.display()
     );
+    onboard::finalize_onboarding(spec.run_initial_scan)?;
 
     Ok(())
 }
@@ -146,6 +149,7 @@ fn export_spec(home: &Path) -> Result<OnboardingSpec> {
         notifications: config.notifications,
         notification_icon: config.notification_icon,
         install_shell_hook,
+        run_initial_scan: false,
     })
 }
 
@@ -376,6 +380,7 @@ mod tests {
             notifications: NotificationPref::Both,
             notification_icon: None,
             install_shell_hook: true,
+            run_initial_scan: false,
         };
         assert!(validate_spec(&spec).is_err());
     }
@@ -401,6 +406,7 @@ mod tests {
             notifications: NotificationPref::Both,
             notification_icon: None,
             install_shell_hook: true,
+            run_initial_scan: false,
         };
         assert!(validate_spec(&spec).is_err());
     }
@@ -426,6 +432,7 @@ mod tests {
             notifications: NotificationPref::Both,
             notification_icon: None,
             install_shell_hook: true,
+            run_initial_scan: false,
         };
         assert!(validate_spec(&spec).is_err());
     }
@@ -451,6 +458,7 @@ mod tests {
             notifications: NotificationPref::Native,
             notification_icon: Some("/tmp/icon.png".to_string()),
             install_shell_hook: false,
+            run_initial_scan: false,
         };
         let config = config_from_spec(&spec);
         assert_eq!(config.agents, spec.agents);

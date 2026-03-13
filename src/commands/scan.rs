@@ -1,12 +1,36 @@
 use anyhow::{Context, Result};
+use serde::Deserialize;
+use std::path::Path;
 
 use crate::agents::{Agent, from_name};
 use crate::config::Config;
 use crate::notify::notify_scan_complete;
 use crate::scanner::engine::{self, ScanConfig};
 
+#[derive(Debug, Clone, Copy)]
+pub struct ScanRunOptions {
+    pub now: bool,
+    pub notify: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanOutcome {
+    pub proposals_written: usize,
+    pub backlog_remaining: usize,
+}
+
+#[derive(Deserialize)]
+struct StoredBacklog {
+    #[serde(default)]
+    sessions: Vec<serde_json::Value>,
+}
+
 pub fn run(now: bool) -> Result<()> {
-    let trigger = scan_trigger_label(now);
+    run_with_options(ScanRunOptions { now, notify: true }).map(|_| ())
+}
+
+pub fn run_with_options(options: ScanRunOptions) -> Result<ScanOutcome> {
+    let trigger = scan_trigger_label(options.now);
     println!("distill scan: running {trigger} scan...");
 
     // Load config
@@ -19,7 +43,10 @@ pub fn run(now: bool) -> Result<()> {
     let agents = build_agents(&config);
     if agents.is_empty() {
         println!("No agents enabled in config. Nothing to scan.");
-        return Ok(());
+        return Ok(ScanOutcome {
+            proposals_written: 0,
+            backlog_remaining: 0,
+        });
     }
 
     let enabled_names: Vec<_> = agents.iter().map(|a| a.kind().to_string()).collect();
@@ -28,6 +55,7 @@ pub fn run(now: bool) -> Result<()> {
     // Run the scan engine
     let scan_config = ScanConfig::from_config(&config);
     let proposals = engine::run_scan(&agents, &scan_config)?;
+    let backlog_remaining = load_pending_scan_backlog(&scan_config.backlog_path)?;
 
     // Report results
     if proposals.is_empty() {
@@ -40,16 +68,24 @@ pub fn run(now: bool) -> Result<()> {
         );
         println!("Run 'distill review' to review them.");
     }
+    if backlog_remaining > 0 {
+        println!("Remaining scan backlog after this run: {backlog_remaining} session(s).");
+    }
 
     // Send notification according to the user's preference.
     // notify_scan_complete is a no-op when proposal_count == 0.
-    notify_scan_complete(
-        proposals.len(),
-        &config.notifications,
-        config.notification_icon.as_deref(),
-    )?;
+    if options.notify {
+        notify_scan_complete(
+            proposals.len(),
+            &config.notifications,
+            config.notification_icon.as_deref(),
+        )?;
+    }
 
-    Ok(())
+    Ok(ScanOutcome {
+        proposals_written: proposals.len(),
+        backlog_remaining,
+    })
 }
 
 fn scan_trigger_label(now: bool) -> &'static str {
@@ -79,6 +115,16 @@ fn build_agents(config: &Config) -> Vec<Box<dyn Agent>> {
     }
 
     agents
+}
+
+fn load_pending_scan_backlog(path: &Path) -> Result<usize> {
+    if !path.exists() {
+        return Ok(0);
+    }
+
+    let contents = std::fs::read_to_string(path)?;
+    let backlog: StoredBacklog = serde_json::from_str(&contents)?;
+    Ok(backlog.sessions.len())
 }
 
 #[cfg(test)]

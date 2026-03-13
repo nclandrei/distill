@@ -923,7 +923,7 @@ pub fn run_scan(agents: &[Box<dyn Agent>], scan_config: &ScanConfig) -> Result<V
         let selected_raw_bytes = batch.iter().map(|session| session.raw_bytes).sum::<u64>();
         if batch.len() < backlog.sessions.len() {
             println!(
-                "Capped this scan to {} pending session(s) totaling {} bytes; rerun scan to continue draining the backlog.",
+                "Capped this scan to {} pending session(s) totaling {} bytes; future scheduled runs will continue draining the backlog automatically, or rerun `distill scan --now` to speed it up.",
                 batch.len(),
                 selected_raw_bytes
             );

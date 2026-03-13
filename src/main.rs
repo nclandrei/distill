@@ -33,7 +33,7 @@ Default behavior is the interactive TUI. For agent automation, use JSON mode:
   distill onboard --write-json onboarding.json
   distill onboard --apply-json onboarding.json
 
-The JSON includes all configuration values and install_shell_hook.
+The JSON includes all configuration values, install_shell_hook, and run_initial_scan.
 Use '-' as the path to read from stdin or write to stdout.
 ";
 
@@ -51,7 +51,8 @@ Example onboarding JSON:
   \"shell\": \"zsh\",
   \"notifications\": \"both\",
   \"notification_icon\": null,
-  \"install_shell_hook\": true
+  \"install_shell_hook\": true,
+  \"run_initial_scan\": false
 }
 ";
 

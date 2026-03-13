@@ -385,6 +385,41 @@ fn copy_snapshot_path(source: &Path, destination: &Path) -> Result<()> {
         }
         let target = std::fs::read_link(source)
             .with_context(|| format!("Failed to read symlink {}", source.display()))?;
+        match std::fs::symlink_metadata(destination) {
+            Ok(existing) if existing.file_type().is_symlink() => {
+                if std::fs::read_link(destination).ok().as_ref() == Some(&target) {
+                    return Ok(());
+                }
+                std::fs::remove_file(destination).with_context(|| {
+                    format!(
+                        "Failed to replace snapshot symlink {}",
+                        destination.display()
+                    )
+                })?;
+            }
+            Ok(existing) if existing.is_dir() => {
+                std::fs::remove_dir_all(destination).with_context(|| {
+                    format!(
+                        "Failed to replace snapshot directory {}",
+                        destination.display()
+                    )
+                })?;
+            }
+            Ok(_) => {
+                std::fs::remove_file(destination).with_context(|| {
+                    format!("Failed to replace snapshot file {}", destination.display())
+                })?;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "Failed to inspect snapshot destination {}",
+                        destination.display()
+                    )
+                });
+            }
+        }
         symlink(&target, destination).with_context(|| {
             format!(
                 "Failed to create snapshot symlink {} -> {}",
@@ -945,6 +980,23 @@ mod tests {
 
         assert_eq!(isolated_path, debug_run_dir.path().join("codex-home"));
         assert!(isolated_path.join("auth.json").is_file());
+    }
+
+    #[test]
+    fn test_prepare_isolated_codex_home_under_debug_run_dir_reuses_existing_symlinks() {
+        let source = tempfile::tempdir().unwrap();
+        let debug_run_dir = tempfile::tempdir().unwrap();
+        let config_target = tempfile::NamedTempFile::new().unwrap();
+
+        fs::write(source.path().join("auth.json"), "{\"token\":\"secret\"}").unwrap();
+        symlink(config_target.path(), &source.path().join("config.toml")).unwrap();
+
+        prepare_isolated_codex_home_from_source(source.path(), Some(debug_run_dir.path())).unwrap();
+        prepare_isolated_codex_home_from_source(source.path(), Some(debug_run_dir.path())).unwrap();
+
+        let copied_config = debug_run_dir.path().join("codex-home/config.toml");
+        assert!(copied_config.is_symlink());
+        assert_eq!(fs::read_link(copied_config).unwrap(), config_target.path());
     }
 
     #[test]

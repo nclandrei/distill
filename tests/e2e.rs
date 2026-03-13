@@ -1080,6 +1080,77 @@ printf '%s' "{\"inspected_files\":[\"$staged_session\"],\"file_findings\":[{\"se
 
 #[cfg(unix)]
 #[test]
+fn test_e2e_scheduled_run_drains_multiple_batches_until_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_config_with(dir.path(), "fake-proposal-agent.sh", true, false);
+
+    let sessions_dir = dir.path().join(".claude").join("projects").join("demo");
+    fs::create_dir_all(&sessions_dir).unwrap();
+    for (name, touch_time) in [
+        ("session-old.jsonl", "202603101200"),
+        ("session-mid.jsonl", "202603101300"),
+        ("session-new.jsonl", "202603101400"),
+    ] {
+        let path = sessions_dir.join(name);
+        fs::write(&path, r#"{"role":"user","content":"repeat workflow"}"#).unwrap();
+        let status = std::process::Command::new("touch")
+            .args(["-t", touch_time, path.to_str().unwrap()])
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    let bin_dir = dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let fake_agent = bin_dir.join("fake-proposal-agent.sh");
+    write_executable_script(
+        &fake_agent,
+        r#"#!/bin/sh
+cat > /dev/null
+staged_session="$(find "$PWD/sessions" -name '*.jsonl' | head -n 1)"
+[ -n "$staged_session" ] || exit 51
+basename "$staged_session" >> "$HOME/.distill/seen-batches.txt"
+printf '%s' "{\"inspected_files\":[\"$staged_session\"],\"file_findings\":[{\"session\":\"$staged_session\",\"summary\":\"Covered.\"}],\"proposals\":[]}"
+"#,
+    );
+
+    let path_env = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    distill_cmd(dir.path())
+        .env("PATH", &path_env)
+        .env("DISTILL_SCAN_BATCH_SIZE", "1")
+        .env("DISTILL_SCHEDULED_RUN_MAX_BATCHES", "2")
+        .args(["scheduled-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "continuing automatic backlog catch-up",
+        ))
+        .stdout(predicate::str::contains(
+            "stopping automatic catch-up after 2 batch(es)",
+        ));
+
+    let seen = fs::read_to_string(dir.path().join(".distill/seen-batches.txt")).unwrap();
+    let lines = seen.lines().collect::<Vec<_>>();
+    assert_eq!(
+        lines,
+        vec!["0001-session-new.jsonl", "0001-session-mid.jsonl"]
+    );
+
+    let backlog = fs::read_to_string(dir.path().join(".distill/scan-backlog.json")).unwrap();
+    let backlog_count = serde_json::from_str::<serde_json::Value>(&backlog).unwrap()["sessions"]
+        .as_array()
+        .unwrap()
+        .len();
+    assert_eq!(backlog_count, 1);
+}
+
+#[cfg(unix)]
+#[test]
 fn test_e2e_scan_debug_dir_captures_workspace_and_outputs() {
     let dir = tempfile::tempdir().unwrap();
     seed_config_with(dir.path(), "fake-proposal-agent.sh", true, false);

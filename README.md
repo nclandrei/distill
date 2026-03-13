@@ -44,6 +44,9 @@ distill review       # Review proposals (accept/reject/edit/snooze/batch)
 distill status       # Check config + pending proposals + last scan
 ```
 
+Scheduled runs automatically keep draining pending scan backlog across future invocations.
+Each scheduled invocation uses a bounded catch-up loop so Distill keeps making progress without turning one timer fire into an unbounded background job.
+
 ## Local Commit Checks (Git + jj)
 
 For this repo, run:
@@ -167,6 +170,7 @@ distill onboard --apply-json onboarding.json
 - `notifications` (`terminal|native|both|none`)
 - `notification_icon` (`null` or absolute path)
 - `install_shell_hook` (`true|false`)
+- `run_initial_scan` (`true|false`) to start the first scan immediately after onboarding is applied
 
 ### 2) Review (non-interactive)
 

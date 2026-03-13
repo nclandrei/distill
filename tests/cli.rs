@@ -150,6 +150,7 @@ fn test_onboard_write_json_template() {
     assert!(written.contains("\"agents\""));
     assert!(written.contains("\"opencode\""));
     assert!(written.contains("\"install_shell_hook\""));
+    assert!(written.contains("\"run_initial_scan\""));
 }
 
 #[test]
@@ -163,7 +164,8 @@ fn test_onboard_write_json_stdout() {
         .stdout(predicate::str::contains("\"format_version\": 1"))
         .stdout(predicate::str::contains("\"agents\""))
         .stdout(predicate::str::contains("\"opencode\""))
-        .stdout(predicate::str::contains("\"install_shell_hook\""));
+        .stdout(predicate::str::contains("\"install_shell_hook\""))
+        .stdout(predicate::str::contains("\"run_initial_scan\""));
 }
 
 #[test]
@@ -183,7 +185,8 @@ fn test_onboard_apply_json() {
   "shell": "zsh",
   "notifications": "both",
   "notification_icon": null,
-  "install_shell_hook": false
+  "install_shell_hook": false,
+  "run_initial_scan": false
 }"#,
     )
     .unwrap();
@@ -221,7 +224,8 @@ fn test_onboard_apply_json_stdin() {
   "shell": "zsh",
   "notifications": "terminal",
   "notification_icon": null,
-  "install_shell_hook": false
+  "install_shell_hook": false,
+  "run_initial_scan": false
 }"#,
         )
         .assert()
@@ -234,6 +238,44 @@ fn test_onboard_apply_json_stdin() {
     let config = fs::read_to_string(config_path).unwrap();
     assert!(config.contains("scan_interval: monthly"));
     assert!(config.contains("notifications: terminal"));
+}
+
+#[test]
+fn test_onboard_apply_json_can_run_initial_scan_immediately() {
+    let dir = tempfile::tempdir().unwrap();
+    let input_path = dir.path().join("onboarding-input.json");
+    fs::write(
+        &input_path,
+        r#"{
+  "format_version": 1,
+  "agents": [
+    { "name": "claude", "enabled": true },
+    { "name": "codex", "enabled": false },
+    { "name": "opencode", "enabled": false }
+  ],
+  "scan_interval": "weekly",
+  "proposal_agent": "claude",
+  "shell": "zsh",
+  "notifications": "none",
+  "notification_icon": null,
+  "install_shell_hook": false,
+  "run_initial_scan": true
+}"#,
+    )
+    .unwrap();
+
+    distill_cmd(dir.path())
+        .args(["onboard", "--apply-json"])
+        .arg(&input_path)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Starting first scan now..."))
+        .stdout(predicate::str::contains(
+            "distill scan: running immediate scan",
+        ))
+        .stdout(predicate::str::contains(
+            "No pending sessions found for scan.",
+        ));
 }
 
 #[test]
