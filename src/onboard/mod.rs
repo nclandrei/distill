@@ -1385,7 +1385,8 @@ pub fn finalize_onboarding(run_initial_scan: bool) -> Result<()> {
         println!("Starting first scan now...");
         crate::commands::scan::run_initial()?;
     } else {
-        println!("Future scheduled runs will continue automatically.");
+        println!("Future scheduled runs will continue automatically at 09:00 local time.");
+        println!("Missed sleep windows are caught up on the next available wake.");
         println!("Run 'distill scan --now' any time to start your first scan sooner.");
     }
     println!("Run 'distill review' to review pending proposals.");

@@ -15,6 +15,71 @@ pub enum SchedulerStatus {
     NotInstalled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ScheduleCadence {
+    pub hour: u32,
+    pub minute: u32,
+    pub day_of_month: Option<u32>,
+    pub weekday: Option<u32>,
+}
+
+impl ScheduleCadence {
+    fn launchd_start_calendar_interval(self) -> String {
+        let mut lines = vec![
+            "    <key>StartCalendarInterval</key>".to_string(),
+            "    <dict>".to_string(),
+            "        <key>Minute</key>".to_string(),
+            format!("        <integer>{}</integer>", self.minute),
+            "        <key>Hour</key>".to_string(),
+            format!("        <integer>{}</integer>", self.hour),
+        ];
+
+        if let Some(day_of_month) = self.day_of_month {
+            lines.push("        <key>Day</key>".to_string());
+            lines.push(format!("        <integer>{day_of_month}</integer>"));
+        }
+        if let Some(weekday) = self.weekday {
+            lines.push("        <key>Weekday</key>".to_string());
+            lines.push(format!("        <integer>{weekday}</integer>"));
+        }
+
+        lines.push("    </dict>".to_string());
+        lines.join("\n")
+    }
+}
+
+pub(crate) fn schedule_cadence(interval: &Interval) -> ScheduleCadence {
+    match interval {
+        Interval::Daily => ScheduleCadence {
+            hour: 9,
+            minute: 0,
+            day_of_month: None,
+            weekday: None,
+        },
+        Interval::Weekly => ScheduleCadence {
+            hour: 9,
+            minute: 0,
+            day_of_month: None,
+            weekday: Some(1),
+        },
+        Interval::Monthly => ScheduleCadence {
+            hour: 9,
+            minute: 0,
+            day_of_month: Some(1),
+            weekday: None,
+        },
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn systemd_on_calendar(interval: &Interval) -> &'static str {
+    match interval {
+        Interval::Daily => "*-*-* 09:00:00",
+        Interval::Weekly => "Mon *-*-* 09:00:00",
+        Interval::Monthly => "*-*-01 09:00:00",
+    }
+}
+
 // ─── Trait ────────────────────────────────────────────────────────────────────
 
 pub trait Scheduler {
@@ -95,12 +160,8 @@ impl Scheduler for LaunchdScheduler {
             .unwrap_or_else(|_| PathBuf::from("distill"))
             .to_string_lossy()
             .to_string();
-
-        let start_interval: u32 = match interval {
-            Interval::Daily => 86400,
-            Interval::Weekly => 604800,
-            Interval::Monthly => 2592000,
-        };
+        let cadence = schedule_cadence(interval);
+        let start_calendar_interval = cadence.launchd_start_calendar_interval();
 
         let plist = format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -115,8 +176,7 @@ impl Scheduler for LaunchdScheduler {
         <string>{exe}</string>
         <string>scheduled-run</string>
     </array>
-    <key>StartInterval</key>
-    <integer>{start_interval}</integer>
+{start_calendar_interval}
     <key>RunAtLoad</key>
     <false/>
 </dict>
@@ -238,12 +298,7 @@ impl Scheduler for SystemdScheduler {
             .unwrap_or_else(|_| PathBuf::from("distill"))
             .to_string_lossy()
             .to_string();
-
-        let on_calendar = match interval {
-            Interval::Daily => "*-*-* 09:00:00",
-            Interval::Weekly => "Mon *-*-* 09:00:00",
-            Interval::Monthly => "*-*-01 09:00:00",
-        };
+        let on_calendar = systemd_on_calendar(interval);
 
         let service = format!(
             "[Unit]\n\
@@ -404,22 +459,56 @@ mod tests {
         scheduler.install(&Interval::Daily).unwrap();
         let content = fs::read_to_string(scheduler.plist_or_unit_path()).unwrap();
         assert!(
-            content.contains("<integer>86400</integer>"),
-            "daily plist missing 86400"
+            content.contains("<key>StartCalendarInterval</key>"),
+            "daily plist missing StartCalendarInterval"
+        );
+        assert!(
+            content.contains("<key>Hour</key>\n        <integer>9</integer>"),
+            "daily plist missing scheduled hour"
+        );
+        assert!(
+            content.contains("<key>Minute</key>\n        <integer>0</integer>"),
+            "daily plist missing scheduled minute"
         );
 
         scheduler.install(&Interval::Weekly).unwrap();
         let content = fs::read_to_string(scheduler.plist_or_unit_path()).unwrap();
         assert!(
-            content.contains("<integer>604800</integer>"),
-            "weekly plist missing 604800"
+            content.contains("<key>Weekday</key>\n        <integer>1</integer>"),
+            "weekly plist missing Monday weekday"
         );
 
         scheduler.install(&Interval::Monthly).unwrap();
         let content = fs::read_to_string(scheduler.plist_or_unit_path()).unwrap();
         assert!(
-            content.contains("<integer>2592000</integer>"),
-            "monthly plist missing 2592000"
+            content.contains("<key>Day</key>\n        <integer>1</integer>"),
+            "monthly plist missing first-of-month day"
+        );
+    }
+
+    #[test]
+    fn test_launchd_plist_uses_calendar_intervals_for_wake_catch_up() {
+        let dir = tempdir().unwrap();
+        let scheduler = launchd_scheduler_for_command_tests(dir.path().to_path_buf());
+
+        scheduler.install(&Interval::Daily).unwrap();
+        let content = fs::read_to_string(scheduler.plist_or_unit_path()).unwrap();
+
+        assert!(
+            content.contains("<key>StartCalendarInterval</key>"),
+            "daily plist should use StartCalendarInterval for wake catch-up"
+        );
+        assert!(
+            content.contains("<key>Hour</key>\n        <integer>9</integer>"),
+            "daily plist missing scheduled hour"
+        );
+        assert!(
+            content.contains("<key>Minute</key>\n        <integer>0</integer>"),
+            "daily plist missing scheduled minute"
+        );
+        assert!(
+            !content.contains("<key>StartInterval</key>"),
+            "daily plist should not keep StartInterval because sleep misses those firings"
         );
     }
 

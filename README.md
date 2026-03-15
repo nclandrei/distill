@@ -46,6 +46,7 @@ distill status       # Check config + pending proposals + last scan
 
 Scheduled runs automatically keep draining pending scan backlog across future invocations.
 Each scheduled invocation uses a bounded catch-up loop so Distill keeps making progress without turning one timer fire into an unbounded background job.
+Daily, weekly, and monthly schedules target `09:00` in the local time zone.
 
 ## Local Commit Checks (Git + jj)
 
@@ -142,6 +143,8 @@ git push origin main
 ## Platform Notes
 
 - Scheduled scans use `launchd` on macOS and `systemd --user` on Linux.
+- On macOS, calendar-based scheduled runs that are missed during sleep fire on the next wake. Full power-off or logged-out periods still wait for the next matching scheduled slot after the user session returns.
+- On Linux, `systemd --user` timers use `Persistent=true`, so missed calendar slots catch up after the timer becomes active again.
 - Native notifications use `terminal-notifier` on macOS and `notify-send` on Linux when available.
 - If those native notifier tools are missing, terminal notifications still work when `notifications` is `terminal` or `both`.
 

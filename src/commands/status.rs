@@ -1,7 +1,8 @@
 use crate::config::{Config, Interval};
 use crate::scanner::reader::LastScan;
+use crate::schedule::{ScheduleCadence, schedule_cadence};
 use anyhow::Result;
-use chrono::{DateTime, Duration, SecondsFormat, Utc};
+use chrono::{DateTime, Datelike, Local, SecondsFormat, TimeZone, Utc, Weekday};
 use std::path::Path;
 
 #[derive(serde::Deserialize)]
@@ -19,22 +20,204 @@ pub struct StatusInfo {
     /// Human-readable timestamp string from `last-scan.json`, or `None` when
     /// the file does not exist (i.e. the tool has never run a scan).
     pub last_scan: Option<String>,
-    /// Human-readable timestamp of the next expected scan run derived from the
-    /// configured interval and the last scan timestamp.
+    /// Human-readable schedule status. This is either the next scheduled slot
+    /// or an overdue marker when the last scan missed the latest slot.
     pub next_scheduled_scan: Option<String>,
 }
 
-fn interval_duration(interval: &Interval) -> Duration {
-    match interval {
-        Interval::Daily => Duration::days(1),
-        Interval::Weekly => Duration::weeks(1),
-        // Keep this aligned with launchd's 2,592,000 second interval.
-        Interval::Monthly => Duration::days(30),
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScheduledScanTiming {
+    Next(DateTime<Utc>),
+    Overdue(DateTime<Utc>),
 }
 
 fn format_utc_timestamp(timestamp: DateTime<Utc>) -> String {
     timestamp.to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+fn format_scheduled_scan_timing(timing: ScheduledScanTiming) -> String {
+    match timing {
+        ScheduledScanTiming::Next(timestamp) => format_utc_timestamp(timestamp),
+        ScheduledScanTiming::Overdue(timestamp) => {
+            format!("overdue since {}", format_utc_timestamp(timestamp))
+        }
+    }
+}
+
+fn scheduled_scan_timing_in_timezone<Tz>(
+    interval: &Interval,
+    last_scan: DateTime<Utc>,
+    now_utc: DateTime<Utc>,
+    timezone: &Tz,
+) -> ScheduledScanTiming
+where
+    Tz: TimeZone,
+    Tz::Offset: Copy,
+{
+    let now_local = now_utc.with_timezone(timezone);
+    let last_scan_local = last_scan.with_timezone(timezone);
+    let (latest_slot, next_slot) = surrounding_schedule_slots(interval, now_local, timezone);
+
+    if last_scan_local < latest_slot {
+        ScheduledScanTiming::Overdue(latest_slot.with_timezone(&Utc))
+    } else {
+        ScheduledScanTiming::Next(next_slot.with_timezone(&Utc))
+    }
+}
+
+fn surrounding_schedule_slots<Tz>(
+    interval: &Interval,
+    now_local: DateTime<Tz>,
+    timezone: &Tz,
+) -> (DateTime<Tz>, DateTime<Tz>)
+where
+    Tz: TimeZone,
+    Tz::Offset: Copy,
+{
+    let cadence = schedule_cadence(interval);
+    let today = now_local.date_naive();
+
+    match (cadence.day_of_month, cadence.weekday) {
+        (None, None) => {
+            let today_slot = local_slot(timezone, today, cadence);
+            if today_slot <= now_local {
+                (
+                    today_slot,
+                    local_slot(
+                        timezone,
+                        today
+                            .succ_opt()
+                            .expect("daily schedule should have next day"),
+                        cadence,
+                    ),
+                )
+            } else {
+                (
+                    local_slot(
+                        timezone,
+                        today
+                            .pred_opt()
+                            .expect("daily schedule should have previous day"),
+                        cadence,
+                    ),
+                    today_slot,
+                )
+            }
+        }
+        (None, Some(weekday_number)) => {
+            let target_weekday = launchd_weekday_to_chrono(weekday_number);
+            let days_since_target = days_since_weekday(today.weekday(), target_weekday);
+            let candidate_date = today - chrono::Duration::days(days_since_target);
+            let candidate_slot = local_slot(timezone, candidate_date, cadence);
+
+            if candidate_slot <= now_local {
+                (
+                    candidate_slot,
+                    local_slot(
+                        timezone,
+                        candidate_date + chrono::Duration::weeks(1),
+                        cadence,
+                    ),
+                )
+            } else {
+                (
+                    local_slot(
+                        timezone,
+                        candidate_date - chrono::Duration::weeks(1),
+                        cadence,
+                    ),
+                    candidate_slot,
+                )
+            }
+        }
+        (Some(day_of_month), None) => {
+            let current_month_slot = local_slot(
+                timezone,
+                month_day(today.year(), today.month(), day_of_month),
+                cadence,
+            );
+            if current_month_slot <= now_local {
+                let (next_year, next_month) = next_month(today.year(), today.month());
+                (
+                    current_month_slot,
+                    local_slot(
+                        timezone,
+                        month_day(next_year, next_month, day_of_month),
+                        cadence,
+                    ),
+                )
+            } else {
+                let (previous_year, previous_month) = previous_month(today.year(), today.month());
+                (
+                    local_slot(
+                        timezone,
+                        month_day(previous_year, previous_month, day_of_month),
+                        cadence,
+                    ),
+                    current_month_slot,
+                )
+            }
+        }
+        (Some(_), Some(_)) => unreachable!("distill schedules never mix day-of-month and weekday"),
+    }
+}
+
+fn local_slot<Tz>(timezone: &Tz, date: chrono::NaiveDate, cadence: ScheduleCadence) -> DateTime<Tz>
+where
+    Tz: TimeZone,
+    Tz::Offset: Copy,
+{
+    timezone
+        .with_ymd_and_hms(
+            date.year(),
+            date.month(),
+            date.day(),
+            cadence.hour,
+            cadence.minute,
+            0,
+        )
+        .single()
+        .expect("distill schedule should map to one local wall-clock time")
+}
+
+fn launchd_weekday_to_chrono(weekday: u32) -> Weekday {
+    match weekday {
+        0 | 7 => Weekday::Sun,
+        1 => Weekday::Mon,
+        2 => Weekday::Tue,
+        3 => Weekday::Wed,
+        4 => Weekday::Thu,
+        5 => Weekday::Fri,
+        6 => Weekday::Sat,
+        _ => panic!("unsupported launchd weekday: {weekday}"),
+    }
+}
+
+fn days_since_weekday(current: Weekday, target: Weekday) -> i64 {
+    let current = current.num_days_from_monday() as i64;
+    let target = target.num_days_from_monday() as i64;
+    (7 + current - target) % 7
+}
+
+fn month_day(year: i32, month: u32, day: u32) -> chrono::NaiveDate {
+    chrono::NaiveDate::from_ymd_opt(year, month, day)
+        .expect("distill schedule should use valid month/day combinations")
+}
+
+fn previous_month(year: i32, month: u32) -> (i32, u32) {
+    if month == 1 {
+        (year - 1, 12)
+    } else {
+        (year, month - 1)
+    }
+}
+
+fn next_month(year: i32, month: u32) -> (i32, u32) {
+    if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    }
 }
 
 /// Pure formatting function — takes pre-collected data and returns the full
@@ -80,13 +263,28 @@ pub fn format_status(info: &StatusInfo) -> String {
 /// timestamp) from the given `base_dir` rather than the hard-coded default
 /// `~/.distill`.  This makes the function fully testable with `tempfile`.
 pub fn collect_status_info(config: &Config, base_dir: &Path) -> Result<StatusInfo> {
-    collect_status_info_with_shared_dir(config, base_dir, &Config::shared_skills_dir())
+    collect_status_info_with_shared_dir_at(
+        config,
+        base_dir,
+        &Config::shared_skills_dir(),
+        Utc::now(),
+    )
 }
 
+#[cfg(test)]
 fn collect_status_info_with_shared_dir(
     config: &Config,
     base_dir: &Path,
     shared_skills_dir: &Path,
+) -> Result<StatusInfo> {
+    collect_status_info_with_shared_dir_at(config, base_dir, shared_skills_dir, Utc::now())
+}
+
+fn collect_status_info_with_shared_dir_at(
+    config: &Config,
+    base_dir: &Path,
+    shared_skills_dir: &Path,
+    now_utc: DateTime<Utc>,
 ) -> Result<StatusInfo> {
     let proposals_dir = base_dir.join("proposals");
     let pending_proposals = if proposals_dir.exists() {
@@ -110,9 +308,12 @@ fn collect_status_info_with_shared_dir(
     let last_scan_data = LastScan::load(&last_scan_path)?;
     let (last_scan, next_scheduled_scan) = if let Some(last_scan_data) = last_scan_data {
         let last_scan = format_utc_timestamp(last_scan_data.timestamp);
-        let next_scan = format_utc_timestamp(
-            last_scan_data.timestamp + interval_duration(&config.scan_interval),
-        );
+        let next_scan = format_scheduled_scan_timing(scheduled_scan_timing_in_timezone(
+            &config.scan_interval,
+            last_scan_data.timestamp,
+            now_utc,
+            &Local,
+        ));
         (Some(last_scan), Some(next_scan))
     } else {
         (None, None)
@@ -160,6 +361,7 @@ mod tests {
     use crate::config::{
         AgentEntry, Config, Interval, NotificationPref, ShellType, SyncAgentsConfig,
     };
+    use chrono::{FixedOffset, TimeZone};
 
     // ── helpers ──────────────────────────────────────────────────────────────
 
@@ -172,6 +374,12 @@ mod tests {
             last_scan: None,
             next_scheduled_scan: None,
         }
+    }
+
+    fn utc_timestamp(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(year, month, day, hour, minute, 0)
+            .single()
+            .unwrap()
     }
 
     // ── format_status tests ───────────────────────────────────────────────────
@@ -327,16 +535,18 @@ mod tests {
         .unwrap();
 
         let config = Config::default();
-        let info =
-            collect_status_info_with_shared_dir(&config, base, &dir.path().join("shared")).unwrap();
+        let info = collect_status_info_with_shared_dir_at(
+            &config,
+            base,
+            &dir.path().join("shared"),
+            utc_timestamp(2024, 6, 3, 8, 0),
+        )
+        .unwrap();
 
         assert_eq!(info.pending_proposals, 2);
         assert_eq!(info.existing_skills, 3);
         assert_eq!(info.last_scan.as_deref(), Some("2024-06-01T12:00:00Z"));
-        assert_eq!(
-            info.next_scheduled_scan.as_deref(),
-            Some("2024-06-08T12:00:00Z")
-        );
+        assert!(info.next_scheduled_scan.is_some());
     }
 
     #[test]
@@ -471,37 +681,92 @@ mod tests {
         .unwrap();
 
         let config = Config::default();
-        let info =
-            collect_status_info_with_shared_dir(&config, base, &dir.path().join("shared")).unwrap();
+        let info = collect_status_info_with_shared_dir_at(
+            &config,
+            base,
+            &dir.path().join("shared"),
+            utc_timestamp(2025, 1, 11, 12, 0),
+        )
+        .unwrap();
 
         assert_eq!(info.last_scan.as_deref(), Some("2025-01-10T09:00:00Z"));
+        assert!(info.next_scheduled_scan.is_some());
+    }
+
+    #[test]
+    fn test_scheduled_scan_timing_returns_next_weekly_slot_after_recent_scan() {
+        let timezone = FixedOffset::east_opt(0).unwrap();
+        let timing = scheduled_scan_timing_in_timezone(
+            &Interval::Weekly,
+            utc_timestamp(2025, 1, 6, 10, 0),
+            utc_timestamp(2025, 1, 8, 12, 0),
+            &timezone,
+        );
+
         assert_eq!(
-            info.next_scheduled_scan.as_deref(),
-            Some("2025-01-17T09:00:00Z")
+            timing,
+            ScheduledScanTiming::Next(utc_timestamp(2025, 1, 13, 9, 0))
         );
     }
 
     #[test]
-    fn test_collect_status_info_next_scheduled_scan_monthly_interval() {
+    fn test_scheduled_scan_timing_marks_missed_daily_slot_overdue() {
+        let timezone = FixedOffset::east_opt(2 * 3600).unwrap();
+        let timing = scheduled_scan_timing_in_timezone(
+            &Interval::Daily,
+            utc_timestamp(2026, 3, 13, 8, 0),
+            utc_timestamp(2026, 3, 14, 12, 0),
+            &timezone,
+        );
+
+        assert_eq!(
+            timing,
+            ScheduledScanTiming::Overdue(utc_timestamp(2026, 3, 14, 7, 0))
+        );
+    }
+
+    #[test]
+    fn test_scheduled_scan_timing_returns_next_monthly_slot_after_catch_up() {
+        let timezone = FixedOffset::east_opt(0).unwrap();
+        let timing = scheduled_scan_timing_in_timezone(
+            &Interval::Monthly,
+            utc_timestamp(2025, 1, 1, 10, 0),
+            utc_timestamp(2025, 1, 10, 12, 0),
+            &timezone,
+        );
+
+        assert_eq!(
+            timing,
+            ScheduledScanTiming::Next(utc_timestamp(2025, 2, 1, 9, 0))
+        );
+    }
+
+    #[test]
+    fn test_collect_status_info_reports_overdue_schedule_state_for_missed_run() {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path();
 
         std::fs::write(
             base.join("last-scan.json"),
-            r#"{"timestamp":"2025-01-10T09:00:00Z","session_ids":[]}"#,
+            r#"{"timestamp":"2020-01-10T09:00:00Z","session_ids":[]}"#,
         )
         .unwrap();
 
-        let config = Config {
-            scan_interval: Interval::Monthly,
-            ..Config::default()
-        };
-        let info =
-            collect_status_info_with_shared_dir(&config, base, &dir.path().join("shared")).unwrap();
+        let config = Config::default();
+        let info = collect_status_info_with_shared_dir_at(
+            &config,
+            base,
+            &dir.path().join("shared"),
+            utc_timestamp(2026, 3, 15, 12, 31),
+        )
+        .unwrap();
 
-        assert_eq!(
-            info.next_scheduled_scan.as_deref(),
-            Some("2025-02-09T09:00:00Z")
+        assert_eq!(info.last_scan.as_deref(), Some("2020-01-10T09:00:00Z"));
+        assert!(
+            info.next_scheduled_scan
+                .as_deref()
+                .is_some_and(|value| value.starts_with("overdue since ")),
+            "missed scheduled runs should be reported as overdue instead of only showing last_scan + interval"
         );
     }
 }
