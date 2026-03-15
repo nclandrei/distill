@@ -2,6 +2,7 @@ pub mod dedupe;
 pub mod notify;
 pub mod onboard;
 pub mod review;
+pub mod runs;
 pub mod scan;
 pub mod scheduled_run;
 pub mod status;

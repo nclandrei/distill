@@ -1,22 +1,45 @@
 use anyhow::{Context, Result};
+use chrono::Utc;
 use serde::Deserialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::agents::{Agent, from_name};
 use crate::config::Config;
 use crate::notify::notify_scan_complete;
+use crate::run_history::{self, RunCommandKind, RunMetrics, RunRecord, RunTrigger};
 use crate::scanner::engine::{self, ScanConfig};
 
 #[derive(Debug, Clone, Copy)]
 pub struct ScanRunOptions {
     pub now: bool,
     pub notify: bool,
+    pub invocation: ScanInvocation,
+    pub record_history: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScanOutcome {
     pub proposals_written: usize,
     pub backlog_remaining: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanInvocation {
+    Manual,
+    Scheduled,
+    Onboarding,
+    ScheduledRun,
+}
+
+impl ScanInvocation {
+    fn history_trigger(self) -> Option<RunTrigger> {
+        match self {
+            Self::Manual => Some(RunTrigger::Manual),
+            Self::Scheduled => Some(RunTrigger::Scheduled),
+            Self::Onboarding => Some(RunTrigger::Onboarding),
+            Self::ScheduledRun => None,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -26,10 +49,72 @@ struct StoredBacklog {
 }
 
 pub fn run(now: bool) -> Result<()> {
-    run_with_options(ScanRunOptions { now, notify: true }).map(|_| ())
+    let invocation = if now {
+        ScanInvocation::Manual
+    } else {
+        ScanInvocation::Scheduled
+    };
+    run_with_options(ScanRunOptions {
+        now,
+        notify: true,
+        invocation,
+        record_history: true,
+    })
+    .map(|_| ())
+}
+
+pub fn run_initial() -> Result<()> {
+    run_with_options(ScanRunOptions {
+        now: true,
+        notify: true,
+        invocation: ScanInvocation::Onboarding,
+        record_history: true,
+    })
+    .map(|_| ())
 }
 
 pub fn run_with_options(options: ScanRunOptions) -> Result<ScanOutcome> {
+    let started_at = Utc::now();
+    let history_dir = Config::history_dir();
+    let result = run_scan_once(options);
+
+    if options.record_history
+        && let Some(trigger) = options.invocation.history_trigger()
+    {
+        let finished_at = Utc::now();
+        let record = match &result {
+            Ok(outcome) => RunRecord::succeeded(
+                RunCommandKind::Scan,
+                trigger,
+                started_at,
+                finished_at,
+                Some(scan_success_summary(outcome)),
+                RunMetrics {
+                    proposals_written: Some(outcome.proposals_written),
+                    backlog_remaining: Some(outcome.backlog_remaining),
+                    ..RunMetrics::default()
+                },
+                vec![],
+            ),
+            Err(err) => RunRecord::failed(
+                RunCommandKind::Scan,
+                trigger,
+                started_at,
+                finished_at,
+                Some("Scan failed.".to_string()),
+                err.to_string(),
+                last_scan_debug_artifact_path(),
+                RunMetrics::default(),
+                vec![],
+            ),
+        };
+        run_history::append_run_record_best_effort(&history_dir, &record);
+    }
+
+    result
+}
+
+fn run_scan_once(options: ScanRunOptions) -> Result<ScanOutcome> {
     let trigger = scan_trigger_label(options.now);
     println!("distill scan: running {trigger} scan...");
 
@@ -88,8 +173,37 @@ pub fn run_with_options(options: ScanRunOptions) -> Result<ScanOutcome> {
     })
 }
 
+fn scan_success_summary(outcome: &ScanOutcome) -> String {
+    if outcome.proposals_written == 0 {
+        "Scan completed with no new proposals.".to_string()
+    } else {
+        format!(
+            "Scan completed with {} proposal(s) written.",
+            outcome.proposals_written
+        )
+    }
+}
+
 fn scan_trigger_label(now: bool) -> &'static str {
     if now { "immediate" } else { "scheduled" }
+}
+
+pub(crate) fn last_scan_debug_artifact_path() -> Option<PathBuf> {
+    read_pointer_path(
+        &Config::base_dir()
+            .join("scan-debug")
+            .join("last-failed-run.txt"),
+    )
+}
+
+fn read_pointer_path(path: &Path) -> Option<PathBuf> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let trimmed = contents.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(trimmed))
+    }
 }
 
 fn build_agents(config: &Config) -> Vec<Box<dyn Agent>> {
@@ -139,6 +253,31 @@ mod tests {
     #[test]
     fn test_scan_trigger_label_now_false() {
         assert_eq!(scan_trigger_label(false), "scheduled");
+    }
+
+    #[test]
+    fn test_last_scan_debug_artifact_path_reads_pointer_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let original_home = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", dir.path()) };
+        let scan_debug_dir = Config::base_dir().join("scan-debug");
+        std::fs::create_dir_all(&scan_debug_dir).unwrap();
+        std::fs::write(
+            scan_debug_dir.join("last-failed-run.txt"),
+            "/tmp/distill/scan-debug/scan-20260315",
+        )
+        .unwrap();
+
+        let path = last_scan_debug_artifact_path();
+
+        match original_home {
+            Some(value) => unsafe { std::env::set_var("HOME", value) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        assert_eq!(
+            path,
+            Some(PathBuf::from("/tmp/distill/scan-debug/scan-20260315"))
+        );
     }
 
     #[test]

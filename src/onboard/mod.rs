@@ -1383,7 +1383,7 @@ pub fn finalize_onboarding(run_initial_scan: bool) -> Result<()> {
     println!();
     if run_initial_scan {
         println!("Starting first scan now...");
-        crate::commands::scan::run(true)?;
+        crate::commands::scan::run_initial()?;
     } else {
         println!("Future scheduled runs will continue automatically.");
         println!("Run 'distill scan --now' any time to start your first scan sooner.");

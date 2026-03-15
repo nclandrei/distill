@@ -166,6 +166,11 @@ impl Config {
         Self::base_dir().join("history")
     }
 
+    /// Returns the run-history JSONL path
+    pub fn run_history_path() -> PathBuf {
+        Self::history_dir().join("runs.jsonl")
+    }
+
     /// Returns the last-scan.json path
     pub fn last_scan_path() -> PathBuf {
         Self::base_dir().join("last-scan.json")

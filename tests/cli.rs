@@ -50,6 +50,16 @@ fn write_agent_script(path: &std::path::Path, body: &str) {
     }
 }
 
+fn read_run_history(home: &std::path::Path) -> Vec<serde_json::Value> {
+    let path = home.join(".distill").join("history").join("runs.jsonl");
+    let contents = std::fs::read_to_string(path).unwrap();
+    contents
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
 #[test]
 fn test_no_args_without_config() {
     let dir = tempfile::tempdir().unwrap();
@@ -91,6 +101,16 @@ fn test_status_without_config() {
 }
 
 #[test]
+fn test_runs_without_history() {
+    let dir = tempfile::tempdir().unwrap();
+    distill_cmd(dir.path())
+        .arg("runs")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No recorded runs yet."));
+}
+
+#[test]
 fn test_scan_now_without_config() {
     let dir = tempfile::tempdir().unwrap();
     distill_cmd(dir.path())
@@ -122,6 +142,31 @@ fn test_scan_without_now_flag() {
 }
 
 #[test]
+fn test_scan_now_writes_run_history_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let distill_dir = dir.path().join(".distill");
+    std::fs::create_dir_all(&distill_dir).unwrap();
+    std::fs::write(
+        distill_dir.join("config.yaml"),
+        "agents:\n  - name: claude\n    enabled: true\nscan_interval: weekly\nproposal_agent: claude\nshell: zsh\nnotifications: both\n",
+    )
+    .unwrap();
+
+    distill_cmd(dir.path())
+        .args(["scan", "--now"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("running immediate scan"));
+
+    let history = read_run_history(dir.path());
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0]["command"], "scan");
+    assert_eq!(history[0]["trigger"], "manual");
+    assert_eq!(history[0]["success"], true);
+    assert_eq!(history[0]["metrics"]["backlog_remaining"], 0);
+}
+
+#[test]
 fn test_review_no_proposals() {
     // With an empty proposals directory the command exits cleanly with a
     // human-friendly message and a zero exit code.
@@ -131,6 +176,26 @@ fn test_review_no_proposals() {
         .assert()
         .success()
         .stdout(predicate::str::contains("No pending proposals to review."));
+}
+
+#[test]
+fn test_runs_requires_interactive_terminal_when_history_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    let history_dir = dir.path().join(".distill").join("history");
+    fs::create_dir_all(&history_dir).unwrap();
+    fs::write(
+        history_dir.join("runs.jsonl"),
+        r#"{"command":"scan","trigger":"manual","started_at":"2026-03-15T08:00:00Z","finished_at":"2026-03-15T08:00:01Z","duration_ms":1000,"success":true,"summary":"Scan completed with no new proposals.","metrics":{"proposals_written":0,"backlog_remaining":0}}"#,
+    )
+    .unwrap();
+
+    distill_cmd(dir.path())
+        .arg("runs")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "distill runs requires an interactive terminal",
+        ));
 }
 
 #[test]
@@ -638,6 +703,60 @@ fn test_sync_agents_dry_run_does_not_write_proposals() {
 
     let proposals_dir = dir.path().join(".distill").join("proposals");
     assert!(!proposals_dir.exists() || std::fs::read_dir(proposals_dir).unwrap().next().is_none());
+}
+
+#[test]
+fn test_sync_agents_dry_run_writes_run_history_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("repo-history");
+    init_git_repo(&project);
+
+    let agents_path = project.join("AGENTS.md");
+    let script_path = dir.path().join("fake-agent-history.sh");
+    write_agent_script(
+        &script_path,
+        &format!(
+            "#!/bin/sh\ncat > /dev/null\nprintf '%s' '{{\"proposals\":[{{\"type\":\"edit\",\"confidence\":\"high\",\"target\":{{\"kind\":\"file\",\"path\":\"{}\"}},\"evidence\":[{{\"session\":\"s1\",\"pattern\":\"p1\"}}],\"body\":\"# AGENTS\\\\n\\\\nUpdated\"}}]}}'\n",
+            agents_path.display()
+        ),
+    );
+    write_minimal_config(dir.path(), script_path.to_string_lossy().as_ref());
+
+    distill_cmd(dir.path())
+        .args(["sync-agents", "--projects"])
+        .arg(project.display().to_string())
+        .arg("--dry-run")
+        .assert()
+        .success();
+
+    let history = read_run_history(dir.path());
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0]["command"], "sync-agents");
+    assert_eq!(history[0]["trigger"], "manual");
+    assert_eq!(history[0]["success"], true);
+    assert_eq!(history[0]["metrics"]["projects_evaluated"], 1);
+}
+
+#[test]
+fn test_scheduled_run_writes_combined_history_record() {
+    let dir = tempfile::tempdir().unwrap();
+    write_minimal_config(dir.path(), "claude");
+
+    distill_cmd(dir.path())
+        .arg("scheduled-run")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "distill scheduled-run: sync-agents skipped",
+        ));
+
+    let history = read_run_history(dir.path());
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0]["command"], "scheduled-run");
+    assert_eq!(history[0]["trigger"], "scheduled");
+    assert_eq!(history[0]["success"], true);
+    assert_eq!(history[0]["stages"][0]["name"], "scan");
+    assert_eq!(history[0]["stages"][1]["name"], "sync-agents");
 }
 
 #[test]

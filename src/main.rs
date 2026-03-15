@@ -7,6 +7,7 @@ mod preferences;
 mod proposal_runner;
 mod proposals;
 mod review;
+mod run_history;
 mod scanner;
 mod schedule;
 mod shell;
@@ -128,6 +129,8 @@ enum Commands {
         #[arg(long, value_name = "PATH", conflicts_with = "write_json")]
         apply_json: Option<PathBuf>,
     },
+    /// Inspect previous scan and sync runs
+    Runs,
     /// Detect duplicate global skills and create remove proposals
     Dedupe {
         /// Preview duplicates without writing proposals
@@ -214,6 +217,9 @@ fn main() -> anyhow::Result<()> {
             apply_json,
         }) => {
             commands::review::run(write_json.as_deref(), apply_json.as_deref())?;
+        }
+        Some(Commands::Runs) => {
+            commands::runs::run()?;
         }
         Some(Commands::Dedupe { dry_run }) => {
             commands::dedupe::run(dry_run)?;
