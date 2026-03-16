@@ -32,6 +32,7 @@ distill review --apply-json review.json
 ```
 
 - Use `distill scan --now` for a non-interactive scan run.
+- Use `distill runs` to inspect run history in the interactive TUI (requires a TTY when history exists).
 - `--write-json -` writes to stdout and `--apply-json -` reads from stdin.
 - If `distill` onboarding is invoked without a TTY, expect it to fail closed and print the JSON-mode commands instead of launching the TUI.
 
