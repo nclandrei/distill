@@ -1016,6 +1016,81 @@ printf '%s' '{"inspected_files":[],"file_findings":[],"proposals":[]}'
 
 #[cfg(unix)]
 #[test]
+fn test_e2e_scan_ignores_stale_backlog_session_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_config_with(dir.path(), "fake-proposal-agent.sh", false, true);
+
+    let live_session_path = write_codex_session(
+        dir.path(),
+        "live-session",
+        "demo",
+        "202603121200",
+        1,
+        1,
+        40,
+        false,
+    );
+    let stale_session_path = dir
+        .path()
+        .join(".codex/sessions/2026/03/13/rollout-missing.jsonl");
+
+    fs::write(
+        dir.path().join(".distill/scan-backlog.json"),
+        serde_json::json!({
+            "sessions": [
+                {
+                    "id": stale_session_path.to_string_lossy(),
+                    "agent": "codex",
+                    "path": stale_session_path,
+                    "timestamp": "2026-03-13T10:00:00Z",
+                    "content": ""
+                },
+                {
+                    "id": live_session_path.to_string_lossy(),
+                    "agent": "codex",
+                    "path": live_session_path,
+                    "timestamp": "2026-03-12T12:00:00Z",
+                    "content": ""
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let bin_dir = dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let fake_agent = bin_dir.join("fake-proposal-agent.sh");
+    write_executable_script(
+        &fake_agent,
+        r#"#!/bin/sh
+cat > /dev/null
+staged_session="$(find "$PWD/sessions" -name '*.jsonl' | head -n 1)"
+[ -n "$staged_session" ] || exit 71
+printf '%s' "{\"inspected_files\":[\"$staged_session\"],\"session_findings\":[{\"session\":\"$staged_session\",\"summary\":\"Covered.\",\"candidates\":[]}]}"
+"#,
+    );
+
+    let path_env = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    distill_cmd(dir.path())
+        .env("PATH", path_env)
+        .args(["scan", "--now"])
+        .assert()
+        .success();
+
+    assert!(
+        !dir.path().join(".distill/scan-backlog.json").exists(),
+        "stale backlog entries should be pruned once scan completes"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn test_e2e_scan_first_run_uses_newest_batch_then_drains_backlog() {
     let dir = tempfile::tempdir().unwrap();
     seed_config_with(dir.path(), "fake-proposal-agent.sh", true, false);

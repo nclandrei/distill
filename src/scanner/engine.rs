@@ -209,11 +209,22 @@ impl ScanBacklog {
         }
     }
 
+    fn prune_unavailable_sessions(&mut self) {
+        self.sessions.retain(session_source_is_available);
+    }
+
     fn remove_batch(&mut self, batch: &[Session]) {
         let batch_paths: HashSet<PathBuf> =
             batch.iter().map(|session| session.path.clone()).collect();
         self.sessions
             .retain(|session| !batch_paths.contains(&session.path));
+    }
+}
+
+fn session_source_is_available(session: &Session) -> bool {
+    match session.agent {
+        AgentKind::Claude | AgentKind::Codex => session.path.is_file(),
+        AgentKind::OpenCode => true,
     }
 }
 
@@ -867,6 +878,7 @@ pub fn run_scan(agents: &[Box<dyn Agent>], scan_config: &ScanConfig) -> Result<V
         let mut backlog = ScanBacklog::load(&scan_config.backlog_path)?;
         let seed_newest_first = last_scan.is_none() && backlog.sessions.is_empty();
         backlog.merge_new_sessions(candidate_sessions, seed_newest_first);
+        backlog.prune_unavailable_sessions();
         backlog.save(&scan_config.backlog_path)?;
         phase_durations.discovery = discovery_started.elapsed().as_millis() as u64;
 
