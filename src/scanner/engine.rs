@@ -1481,7 +1481,17 @@ fn stage_timeline_workspace(
             .and_then(|name| name.to_str())
             .unwrap_or("session.jsonl");
         let staged_path = agent_dir.join(format!("{:04}-{}", index + 1, basename));
-        let timeline = build_session_timeline(descriptor)?;
+        let timeline = match build_session_timeline(descriptor) {
+            Ok(t) => t,
+            Err(err) if !descriptor.session.path.exists() => {
+                eprintln!(
+                    "Warning: skipping unavailable session {}: {err:#}",
+                    descriptor.session.path.display()
+                );
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
         let rendered = render_timeline(&timeline);
         staged_bytes = staged_bytes.saturating_add(rendered.len() as u64);
         std::fs::write(&staged_path, rendered).with_context(|| {
@@ -3792,5 +3802,85 @@ mod tests {
         let summary = build_staged_session_summary(&session, raw);
         assert!(summary.contains("DISTILL_REAL_SCAN_20260311"));
         assert!(summary.contains("ACK"));
+    }
+
+    #[test]
+    fn test_stage_timeline_workspace_skips_missing_session_files() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create a valid codex session file.
+        let valid_path = dir.path().join("valid-session.jsonl");
+        fs::write(
+            &valid_path,
+            [
+                serde_json::json!({
+                    "type": "session_meta",
+                    "payload": { "cwd": "/Users/test/code/demo" }
+                })
+                .to_string(),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "Hello" }]
+                    }
+                })
+                .to_string(),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{ "type": "output_text", "text": "Hi" }]
+                    }
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let valid_session = Session {
+            id: "valid".to_string(),
+            agent: AgentKind::Codex,
+            path: valid_path.clone(),
+            timestamp: Utc::now(),
+            content: String::new(),
+        };
+
+        // A session whose file does not exist (deleted between prune and stage).
+        let missing_path = dir.path().join("missing-session.jsonl");
+        let missing_session = Session {
+            id: "missing".to_string(),
+            agent: AgentKind::Codex,
+            path: missing_path,
+            timestamp: Utc::now(),
+            content: String::new(),
+        };
+
+        let valid_descriptor = discover_session(&valid_session).unwrap();
+        let missing_descriptor = discover_session(&missing_session).unwrap();
+        assert_eq!(missing_descriptor.raw_bytes, 0);
+
+        let batch = vec![missing_descriptor, valid_descriptor];
+        let result = stage_timeline_workspace(&batch, &[], None);
+
+        assert!(
+            result.is_ok(),
+            "stage_timeline_workspace should skip missing files, not crash: {:?}",
+            result.err()
+        );
+
+        let (workspace, _staged_bytes) = result.unwrap();
+        assert_eq!(
+            workspace.staged_sessions.len(),
+            1,
+            "only the valid session should be staged"
+        );
+        assert_eq!(
+            workspace.staged_sessions[0].source_session.id, "valid",
+            "the staged session should be the valid one"
+        );
     }
 }
