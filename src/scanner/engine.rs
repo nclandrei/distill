@@ -710,9 +710,29 @@ fn sanitize_agent_diagnostics(text: &str, prompt: &str) -> String {
     clipped_multiline(&sanitized, MAX_AGENT_DIAGNOSTIC_CHARS)
 }
 
+/// Check agent stdout/stderr for known authentication failure patterns and return
+/// a user-friendly hint instead of dumping raw output.
+fn detect_agent_auth_hint(command: &str, stdout: &str, stderr: &str) -> Option<String> {
+    let combined = format!("{stdout}\n{stderr}");
+    let is_auth_failure =
+        combined.contains("authentication_failed") || combined.contains("Not logged in");
+    if is_auth_failure {
+        Some(format!(
+            "Agent `{command}` is not authenticated. Please run `{command}` and complete the login flow, then retry."
+        ))
+    } else {
+        None
+    }
+}
+
 fn format_agent_failure(command: &str, output: &std::process::Output, prompt: &str) -> String {
     let stdout = sanitize_agent_diagnostics(&String::from_utf8_lossy(&output.stdout), prompt);
     let stderr = sanitize_agent_diagnostics(&String::from_utf8_lossy(&output.stderr), prompt);
+
+    if let Some(hint) = detect_agent_auth_hint(command, &stdout, &stderr) {
+        return hint;
+    }
+
     let details = match (stderr.is_empty(), stdout.is_empty()) {
         (true, true) => String::new(),
         (false, true) => format!(":\n{stderr}"),
@@ -3882,5 +3902,46 @@ mod tests {
             workspace.staged_sessions[0].source_session.id, "valid",
             "the staged session should be the valid one"
         );
+    }
+
+    #[test]
+    fn test_detect_agent_auth_hint_claude_authentication_failed() {
+        let stdout = r#"{"type":"system","subtype":"init","session_id":"abc123"}
+{"type":"assistant","message":{"content":[{"type":"text","text":"Not logged in . Please run /login"}]},"error":"authentication_failed"}
+{"type":"result","subtype":"success","is_error":true,"result":"Not logged in . Please run /login"}"#;
+        let hint = detect_agent_auth_hint("claude", stdout, "");
+        assert!(
+            hint.is_some(),
+            "should detect Claude authentication failure"
+        );
+        let hint = hint.unwrap();
+        assert!(
+            hint.contains("not authenticated") || hint.contains("not logged in"),
+            "should mention authentication problem: {hint}"
+        );
+        assert!(
+            hint.contains("claude"),
+            "should mention the agent command: {hint}"
+        );
+        // The hint should NOT dump raw JSON
+        assert!(
+            !hint.contains(r#""type":"system""#),
+            "should not contain raw JSON from agent output: {hint}"
+        );
+    }
+
+    #[test]
+    fn test_detect_agent_auth_hint_not_logged_in_in_stderr() {
+        let hint = detect_agent_auth_hint("claude", "", "Not logged in . Please run /login");
+        assert!(
+            hint.is_some(),
+            "should detect 'Not logged in' in stderr too"
+        );
+    }
+
+    #[test]
+    fn test_detect_agent_auth_hint_returns_none_for_unrelated_errors() {
+        let hint = detect_agent_auth_hint("claude", "some random error output", "fatal: oops");
+        assert!(hint.is_none(), "should not trigger for non-auth errors");
     }
 }
