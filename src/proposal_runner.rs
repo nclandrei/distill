@@ -165,7 +165,12 @@ pub fn prepare_proposal_command(
 
     let isolated_home = match mode {
         ProposalAgentMode::Codex => Some(prepare_isolated_codex_home(debug_run_dir)?),
-        ProposalAgentMode::Claude => Some(prepare_isolated_claude_home(debug_run_dir)?),
+        // Claude Code stores OAuth tokens in the macOS keychain, which is
+        // resolved relative to the real HOME.  Overriding HOME with an
+        // isolated directory makes Claude unable to find its credentials and
+        // fail with "not authenticated".  The --no-session-persistence flag
+        // already prevents session pollution, so isolation is unnecessary.
+        ProposalAgentMode::Claude => None,
         ProposalAgentMode::OpenCode => Some(prepare_isolated_opencode_home(debug_run_dir)?),
         ProposalAgentMode::Generic => None,
     };
@@ -175,12 +180,6 @@ pub fn prepare_proposal_command(
         (ProposalAgentMode::Codex, Some(agent_home)) => {
             env_overrides.push((
                 "CODEX_HOME".to_string(),
-                agent_home.path.to_string_lossy().to_string(),
-            ));
-        }
-        (ProposalAgentMode::Claude, Some(agent_home)) => {
-            env_overrides.push((
-                "HOME".to_string(),
                 agent_home.path.to_string_lossy().to_string(),
             ));
         }
@@ -527,47 +526,6 @@ fn prepare_isolated_codex_home(debug_run_dir: Option<&Path>) -> Result<IsolatedA
     prepare_isolated_codex_home_from_source(&source_home, debug_run_dir)
 }
 
-fn populate_isolated_claude_home(source_home: &Path, isolated_home: &Path) -> Result<()> {
-    copy_snapshot_entries(
-        source_home,
-        isolated_home,
-        &[
-            ".claude.json",
-            ".claude/CLAUDE.md",
-            ".claude/settings.json",
-            ".claude/commands",
-            ".claude/skills",
-            ".claude/hooks",
-            ".claude/plugins",
-            ".claude/ide",
-            ".claude/plans",
-        ],
-    )
-}
-
-fn prepare_isolated_claude_home_from_source(
-    source_home: &Path,
-    debug_run_dir: Option<&Path>,
-) -> Result<IsolatedAgentHome> {
-    let (path, cleanup_on_drop) = if let Some(run_dir) = debug_run_dir {
-        (run_dir.join("claude-home"), false)
-    } else {
-        (create_temp_dir_path("distill-claude-home")?, true)
-    };
-
-    populate_isolated_claude_home(source_home, &path)?;
-
-    Ok(IsolatedAgentHome {
-        path,
-        cleanup_on_drop,
-    })
-}
-
-fn prepare_isolated_claude_home(debug_run_dir: Option<&Path>) -> Result<IsolatedAgentHome> {
-    let source_home = user_home_dir()?;
-    prepare_isolated_claude_home_from_source(&source_home, debug_run_dir)
-}
-
 fn populate_isolated_opencode_home(source_home: &Path, isolated_home: &Path) -> Result<()> {
     copy_snapshot_entries(
         source_home,
@@ -852,40 +810,6 @@ mod tests {
     }
 
     #[test]
-    fn test_populate_isolated_claude_home_copies_control_plane_only() {
-        let source = tempfile::tempdir().unwrap();
-        let destination = tempfile::tempdir().unwrap();
-
-        fs::write(source.path().join(".claude.json"), "{\"token\":\"secret\"}").unwrap();
-        fs::create_dir_all(source.path().join(".claude/hooks")).unwrap();
-        fs::create_dir_all(source.path().join(".claude/plugins")).unwrap();
-        fs::create_dir_all(source.path().join(".claude/plans")).unwrap();
-        fs::write(source.path().join(".claude/CLAUDE.md"), "# claude\n").unwrap();
-        fs::write(
-            source.path().join(".claude/settings.json"),
-            "{\"theme\":\"dark\"}",
-        )
-        .unwrap();
-        fs::write(source.path().join(".claude/hooks/pre.sh"), "echo hook\n").unwrap();
-        fs::write(source.path().join(".claude/plugins/plugin.js"), "plugin\n").unwrap();
-        fs::write(source.path().join(".claude/plans/plan.md"), "plan\n").unwrap();
-        fs::create_dir_all(source.path().join(".claude/projects")).unwrap();
-        fs::write(source.path().join(".claude/projects/session.jsonl"), "{}\n").unwrap();
-
-        populate_isolated_claude_home(source.path(), destination.path()).unwrap();
-
-        assert!(destination.path().join(".claude.json").is_file());
-        assert!(destination.path().join(".claude/hooks/pre.sh").is_file());
-        assert!(
-            destination
-                .path()
-                .join(".claude/plugins/plugin.js")
-                .is_file()
-        );
-        assert!(!destination.path().join(".claude/projects").exists());
-    }
-
-    #[test]
     fn test_populate_isolated_opencode_home_copies_control_plane_only() {
         let source = tempfile::tempdir().unwrap();
         let destination = tempfile::tempdir().unwrap();
@@ -1039,6 +963,26 @@ mod tests {
         assert_eq!(
             proposal_agent_mode("opencode", &proposal_agent_command("opencode").args),
             ProposalAgentMode::OpenCode
+        );
+    }
+
+    #[test]
+    fn test_prepare_proposal_command_for_claude_does_not_override_home() {
+        let prepared = prepare_proposal_command(
+            "claude",
+            &proposal_agent_command("claude").args,
+            Path::new("/tmp/workspace"),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(prepared.mode, ProposalAgentMode::Claude);
+        // Claude Code uses macOS keychain for OAuth tokens. Overriding HOME
+        // breaks keychain access and causes spurious "not authenticated" errors.
+        assert!(
+            !prepared.env_overrides.iter().any(|(key, _)| key == "HOME"),
+            "Claude mode must not override HOME — it breaks keychain auth"
         );
     }
 
