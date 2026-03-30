@@ -3325,7 +3325,30 @@ fn looks_like_audit_event(value: &serde_json::Value) -> bool {
                 .and_then(|item| item.get("type"))
                 .and_then(|value| value.as_str())
                 .unwrap_or("");
-            contains_audit_keyword(item_type)
+            if contains_audit_keyword(item_type) {
+                return true;
+            }
+
+            // Claude Code format: message.content[] may contain tool_use blocks
+            if let Some(content) = map
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_array())
+            {
+                for block in content {
+                    let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    if contains_audit_keyword(block_type) {
+                        return true;
+                    }
+                }
+            }
+
+            // Claude Code format: tool_use_result field indicates a tool result event
+            if map.contains_key("tool_use_result") {
+                return true;
+            }
+
+            false
         }
         _ => false,
     }
@@ -3677,6 +3700,44 @@ mod tests {
 
         let touched = touched_paths_from_audit_log(&log, std::slice::from_ref(&path));
         assert!(touched.contains(&path));
+        assert_eq!(touched.len(), 1);
+    }
+
+    #[test]
+    fn test_touched_paths_from_audit_log_matches_claude_code_tool_use_events() {
+        let path = PathBuf::from("/tmp/workspace/sessions/codex/0001-example.jsonl");
+        let log = format!(
+            "{}\n{}",
+            // Claude Code assistant event with tool_use in message.content
+            serde_json::json!({
+                "type": "assistant",
+                "message": {
+                    "content": [{
+                        "type": "tool_use",
+                        "name": "Read",
+                        "input": {
+                            "file_path": path.to_string_lossy().to_string()
+                        }
+                    }]
+                }
+            }),
+            // Claude Code user event with tool_use_result
+            serde_json::json!({
+                "type": "user",
+                "tool_use_result": {
+                    "type": "text",
+                    "file": {
+                        "filePath": path.to_string_lossy().to_string()
+                    }
+                }
+            })
+        );
+
+        let touched = touched_paths_from_audit_log(&log, std::slice::from_ref(&path));
+        assert!(
+            touched.contains(&path),
+            "Should detect file path from Claude Code tool_use events"
+        );
         assert_eq!(touched.len(), 1);
     }
 
