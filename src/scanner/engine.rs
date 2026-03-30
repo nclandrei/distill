@@ -712,11 +712,21 @@ fn sanitize_agent_diagnostics(text: &str, prompt: &str) -> String {
 
 /// Check agent stdout/stderr for known authentication failure patterns and return
 /// a user-friendly hint instead of dumping raw output.
+///
+/// Uses precise patterns to avoid false positives when the agent's AI-generated
+/// response content happens to mention auth-related terms (e.g. when analysing
+/// authentication code).
 fn detect_agent_auth_hint(command: &str, stdout: &str, stderr: &str) -> Option<String> {
-    let combined = format!("{stdout}\n{stderr}");
-    let is_auth_failure =
-        combined.contains("authentication_failed") || combined.contains("Not logged in");
-    if is_auth_failure {
+    // Match the JSON error field from Claude's stream-json output, not bare substrings
+    // that could appear inside AI-generated response text.
+    let json_auth_error = stdout.contains(r#""error":"authentication_failed""#)
+        || stdout.contains(r#""error": "authentication_failed""#)
+        || stderr.contains(r#""error":"authentication_failed""#)
+        || stderr.contains(r#""error": "authentication_failed""#);
+    // "Not logged in" in stderr is a direct diagnostic message from the agent,
+    // not AI-generated content (which goes to stdout in stream-json mode).
+    let stderr_not_logged_in = stderr.contains("Not logged in");
+    if json_auth_error || stderr_not_logged_in {
         Some(format!(
             "Agent `{command}` is not authenticated. Please run `{command}` and complete the login flow, then retry."
         ))
@@ -3943,5 +3953,19 @@ mod tests {
     fn test_detect_agent_auth_hint_returns_none_for_unrelated_errors() {
         let hint = detect_agent_auth_hint("claude", "some random error output", "fatal: oops");
         assert!(hint.is_none(), "should not trigger for non-auth errors");
+    }
+
+    #[test]
+    fn test_detect_agent_auth_hint_no_false_positive_from_response_content() {
+        // Claude's AI response mentions auth-related terms while analyzing code,
+        // but Claude itself is authenticated — the agent failed for an unrelated reason.
+        let stdout = r#"{"type":"system","subtype":"init","session_id":"abc123"}
+{"type":"assistant","message":{"content":[{"type":"text","text":"The error handler returns authentication_failed when the user is Not logged in"}]}}
+{"type":"result","subtype":"error","is_error":true,"result":"Token limit exceeded"}"#;
+        let hint = detect_agent_auth_hint("claude", stdout, "");
+        assert!(
+            hint.is_none(),
+            "should not falsely detect auth failure from AI response content: {hint:?}"
+        );
     }
 }
