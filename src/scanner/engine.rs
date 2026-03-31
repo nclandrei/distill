@@ -2229,6 +2229,8 @@ fn build_workflow_proposal_prompt(
          - Prefer `improve`/`edit` when an existing skill already overlaps\n\
          - If evidence is still weak, return an empty proposals array, but still cover every file\n\
          - Every proposal body must be concrete and actionable\n\n\
+         IMPORTANT: Before writing any proposal body, use the claude-code-guide agent to look up the current Claude Code skills format \
+         (frontmatter fields, recommended structure). Follow those guidelines for the skill body.\n\n\
          IMPORTANT: Respond ONLY with valid JSON in this exact wrapper shape:\n\
          {\"inspected_files\": [...], \"file_findings\": [...], \"proposals\": [...]}.\n\
          No markdown fences. No commentary.\n\n\
@@ -2243,12 +2245,15 @@ fn build_workflow_proposal_prompt(
          - \"target_skill\": string containing the canonical skill name in kebab-case; for `new`, set it to the new skill's name, and for `improve`/`edit`/`remove`, set it to the existing skill name\n\
          - \"evidence\": array of {\"session\": \"<staged path>\", \"pattern\": \"<description>\"}\n\
          - \"body\": string containing the full proposed skill content in markdown\n\n\
-         For each proposal body, use this markdown structure:\n\
-         - `# <Skill Name>`\n\
-         - `## When to use`\n\
-         - `## Steps`\n\
-         - `## Verification`\n\
-         - `## Pitfalls`\n\
+         For each proposal body:\n\
+         - The body must be a complete SKILL.md file with YAML frontmatter\n\
+         - Required frontmatter fields: `name` (kebab-case), `description` (concise, under 250 chars)\n\
+         - Include `argument-hint` in frontmatter when the skill is parameterized (e.g. \"[env]\", \"[filename]\")\n\
+         - Include `paths` in frontmatter as a list of glob patterns when the skill only applies to specific files/directories (e.g. [\"src/api/**/*.ts\"])\n\
+         - Include `allowed-tools` in frontmatter when the skill needs specific tools auto-approved (e.g. \"Bash, Read, Grep\")\n\
+         - After the frontmatter, write clear, actionable markdown instructions — no mandatory section structure\n\
+         - Keep the body under 2000 characters — concise skills are better skills\n\
+         - No placeholders — every instruction must be concrete\n\
          For `improve` and `edit` proposals targeting an existing skill:\n\
          - treat the proposal body as the full replacement for that skill's `SKILL.md`\n\
          - preserve any existing YAML frontmatter unless the evidence explicitly requires changing it\n\
@@ -2318,6 +2323,8 @@ fn build_prompt(manifest: &ScanManifest, preferences: &PreferenceProfile) -> Str
          Staged session files are already compact text summaries prepared by Distill.\n\
          Read them directly; do not re-parse them as raw JSONL logs.\n\
          After you have read the listed files once, stop inspecting and answer.\n\n\
+         IMPORTANT: Before writing any proposal body, use the claude-code-guide agent to look up the current Claude Code skills format \
+         (frontmatter fields, recommended structure). Follow those guidelines for the skill body.\n\n\
          IMPORTANT: Respond ONLY with valid JSON in this exact wrapper shape:\n\
          {\"inspected_files\": [...], \"file_findings\": [...], \"proposals\": [...]}.\n\
          No markdown fences. No commentary.\n\n\
@@ -2332,12 +2339,15 @@ fn build_prompt(manifest: &ScanManifest, preferences: &PreferenceProfile) -> Str
          - \"target_skill\": string containing the canonical skill name in kebab-case; for `new`, set it to the new skill's name, and for `improve`/`edit`/`remove`, set it to the existing skill name\n\
          - \"evidence\": array of {\"session\": \"<staged path>\", \"pattern\": \"<description>\"}\n\
          - \"body\": string containing the full proposed skill content in markdown\n\n\
-         For each proposal body, use this markdown structure:\n\
-         - `# <Skill Name>`\n\
-         - `## When to use`\n\
-         - `## Steps`\n\
-         - `## Verification`\n\
-         - `## Pitfalls`\n\
+         For each proposal body:\n\
+         - The body must be a complete SKILL.md file with YAML frontmatter\n\
+         - Required frontmatter fields: `name` (kebab-case), `description` (concise, under 250 chars)\n\
+         - Include `argument-hint` in frontmatter when the skill is parameterized (e.g. \"[env]\", \"[filename]\")\n\
+         - Include `paths` in frontmatter as a list of glob patterns when the skill only applies to specific files/directories (e.g. [\"src/api/**/*.ts\"])\n\
+         - Include `allowed-tools` in frontmatter when the skill needs specific tools auto-approved (e.g. \"Bash, Read, Grep\")\n\
+         - After the frontmatter, write clear, actionable markdown instructions — no mandatory section structure\n\
+         - Keep the body under 2000 characters — concise skills are better skills\n\
+         - No placeholders — every instruction must be concrete\n\
          For `improve` and `edit` proposals targeting an existing skill:\n\
          - treat the proposal body as the full replacement for that skill's `SKILL.md`\n\
          - preserve any existing YAML frontmatter unless the evidence explicitly requires changing it\n\

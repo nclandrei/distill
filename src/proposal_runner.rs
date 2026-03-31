@@ -57,7 +57,7 @@ pub fn proposal_agent_command(agent_name: &str) -> ProposalAgentCommand {
                 "--permission-mode".to_string(),
                 "bypassPermissions".to_string(),
                 "--tools".to_string(),
-                "Read,Grep,Glob,LS".to_string(),
+                "Read,Grep,Glob,LS,Agent".to_string(),
             ],
             mode: ProposalAgentMode::Claude,
         },
