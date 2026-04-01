@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use crossterm::{
     cursor,
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -864,7 +864,18 @@ impl PendingConfirmation {
     }
 }
 
-fn intent_from_key(code: KeyCode) -> UiIntent {
+fn intent_from_key(code: KeyCode, modifiers: KeyModifiers) -> UiIntent {
+    // Ctrl-modified keys for scrolling
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        return match code {
+            KeyCode::Char('u') => UiIntent::ScrollUp,
+            KeyCode::Char('d') => UiIntent::ScrollDown,
+            KeyCode::Char('b') => UiIntent::ScrollUp,
+            KeyCode::Char('f') => UiIntent::ScrollDown,
+            _ => UiIntent::Noop,
+        };
+    }
+
     match code {
         KeyCode::Up | KeyCode::Char('k') => UiIntent::MoveUp,
         KeyCode::Down | KeyCode::Char('j') => UiIntent::MoveDown,
@@ -1459,7 +1470,7 @@ fn draw_review_ui(frame: &mut Frame<'_>, state: &ReviewUiState, skills_dir: &Pat
     }
     frame.render_stateful_widget(proposals, body_chunks[0], &mut list_state);
 
-    let (details, inspect_title) = if let Some(proposal) = state.selected_proposal() {
+    let (details, inspect_title_base) = if let Some(proposal) = state.selected_proposal() {
         let is_diff_view = state.show_diff
             && matches!(
                 proposal.frontmatter.proposal_type,
@@ -1475,6 +1486,39 @@ fn draw_review_ui(frame: &mut Frame<'_>, state: &ReviewUiState, skills_dir: &Pat
     } else {
         (Text::from("No pending proposals."), "INSPECT")
     };
+
+    // Compute whether content overflows the visible area.
+    let inspect_area = body_chunks[1];
+    let inner_height = inspect_area.height.saturating_sub(2) as usize; // borders
+    let _inner_width = inspect_area.width.saturating_sub(2); // borders (for future wrap-aware calc)
+    let content_lines = details.lines.len();
+    let has_overflow = content_lines > inner_height;
+    let can_scroll_down =
+        has_overflow && (state.content_scroll as usize + inner_height) < content_lines;
+    let can_scroll_up = state.content_scroll > 0;
+
+    let inspect_title: Line<'_> = if can_scroll_down && can_scroll_up {
+        Line::from(vec![
+            Span::raw(format!("{inspect_title_base} ")),
+            Span::styled("Ctrl-d/u to scroll", Style::default().fg(muted)),
+        ])
+    } else if can_scroll_down {
+        Line::from(vec![
+            Span::raw(format!("{inspect_title_base} ")),
+            Span::styled(
+                "\u{25bc} Ctrl-d to scroll down",
+                Style::default().fg(accent),
+            ),
+        ])
+    } else if can_scroll_up {
+        Line::from(vec![
+            Span::raw(format!("{inspect_title_base} ")),
+            Span::styled("\u{25b2} Ctrl-u to scroll up", Style::default().fg(accent)),
+        ])
+    } else {
+        Line::from(inspect_title_base)
+    };
+
     let detail_pane = Paragraph::new(details)
         .block(
             Block::default()
@@ -1484,7 +1528,7 @@ fn draw_review_ui(frame: &mut Frame<'_>, state: &ReviewUiState, skills_dir: &Pat
         )
         .wrap(Wrap { trim: false })
         .scroll((state.content_scroll, 0));
-    frame.render_widget(detail_pane, body_chunks[1]);
+    frame.render_widget(detail_pane, inspect_area);
 
     let action_chip = |action: ReviewAction| -> Span<'static> {
         let marker = if state.focused_action == action {
@@ -1513,7 +1557,9 @@ fn draw_review_ui(frame: &mut Frame<'_>, state: &ReviewUiState, skills_dir: &Pat
             Span::styled("[Enter] ", Style::default().fg(Color::Green)),
             Span::raw("Run focused action  "),
             Span::styled("[a/r/s/e/d/A/q] ", Style::default().fg(emphasis)),
-            Span::raw("Direct hotkeys"),
+            Span::raw("Direct hotkeys  "),
+            Span::styled("[Ctrl-d/u] ", Style::default().fg(accent)),
+            Span::raw("Scroll"),
         ]),
         Line::from(""),
         Line::from(vec![
@@ -1910,7 +1956,7 @@ pub fn run_review_interactive(
                     state.status_line = "Confirmation cancelled.".to_string();
                 }
                 _ => {
-                    let quick_intent = intent_from_key(key.code);
+                    let quick_intent = intent_from_key(key.code, key.modifiers);
                     if quick_intent == confirmation.intent() {
                         state.clear_confirmation();
                         state.set_focus_from_intent(quick_intent);
@@ -1931,7 +1977,7 @@ pub fn run_review_interactive(
             continue;
         }
 
-        let mut intent = intent_from_key(key.code);
+        let mut intent = intent_from_key(key.code, key.modifiers);
         if intent == UiIntent::Noop {
             continue;
         }
