@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::agents::{Agent, from_name};
 use crate::config::Config;
@@ -54,13 +56,75 @@ pub fn run(now: bool) -> Result<()> {
     } else {
         ScanInvocation::Scheduled
     };
-    run_with_options(ScanRunOptions {
-        now,
-        notify: true,
-        invocation,
-        record_history: true,
-    })
-    .map(|_| ())
+
+    if !now {
+        return run_with_options(ScanRunOptions {
+            now: false,
+            notify: true,
+            invocation,
+            record_history: true,
+        })
+        .map(|_| ());
+    }
+
+    // Continuous mode: loop until backlog is drained or Ctrl+C
+    let interrupted = Arc::new(AtomicBool::new(false));
+    {
+        let flag = interrupted.clone();
+        ctrlc::set_handler(move || {
+            flag.store(true, Ordering::SeqCst);
+        })?;
+    }
+
+    let mut batches_run = 0usize;
+    let mut total_proposals = 0usize;
+
+    loop {
+        if interrupted.load(Ordering::SeqCst) {
+            println!("\nInterrupted — stopping before next batch.");
+            break;
+        }
+
+        match run_with_options(ScanRunOptions {
+            now: true,
+            notify: false,
+            invocation,
+            record_history: true,
+        }) {
+            Ok(outcome) => {
+                batches_run += 1;
+                total_proposals += outcome.proposals_written;
+
+                if outcome.backlog_remaining == 0 {
+                    println!(
+                        "Scan backlog drained after {batches_run} batch(es), \
+                         {total_proposals} proposal(s) written."
+                    );
+                    break;
+                }
+                if interrupted.load(Ordering::SeqCst) {
+                    println!(
+                        "\nInterrupted — stopping after completed batch \
+                         ({batches_run} batch(es), {total_proposals} proposal(s))."
+                    );
+                    break;
+                }
+                println!(
+                    "Batch {batches_run} complete. Continuing ({} session(s) remaining)...",
+                    outcome.backlog_remaining
+                );
+            }
+            Err(e) => {
+                if interrupted.load(Ordering::SeqCst) {
+                    println!("\nInterrupted during batch — partial batch discarded.");
+                    break;
+                }
+                return Err(e);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 pub fn run_initial() -> Result<()> {

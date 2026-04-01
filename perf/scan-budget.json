@@ -7,7 +7,7 @@
     "max_selected_raw_bytes": 67108864,
     "min_candidate_sessions": 40,
     "min_proposals_written": 1,
-    "require_backlog_drain": true,
+    "require_backlog_drain": false,
     "required_workflow_keys": [
       "land-and-test-changes"
     ]

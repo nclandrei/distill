@@ -926,6 +926,7 @@ printf ']}'
         std::env::var("PATH").unwrap_or_default()
     );
 
+    // Continuous mode: single invocation drains all batches, byte-capping each one
     distill_cmd(dir.path())
         .env("PATH", &path_env)
         .env("DISTILL_SCAN_BATCH_SIZE", "50")
@@ -935,41 +936,22 @@ printf ']}'
         .success()
         .stdout(predicate::str::contains("Capped this scan to"));
 
-    let seen_after_first =
-        fs::read_to_string(dir.path().join(".distill/seen-batches.txt")).unwrap();
-    let first_count = seen_after_first.lines().count();
-    assert!(first_count > 0);
-    assert!(first_count < 18);
+    // All 18 sessions should have been processed across multiple batches
+    let seen = fs::read_to_string(dir.path().join(".distill/seen-batches.txt")).unwrap();
+    assert_eq!(seen.lines().count(), 18);
 
-    let backlog_after_first =
-        fs::read_to_string(dir.path().join(".distill/scan-backlog.json")).unwrap();
-    let backlog_count_first = serde_json::from_str::<serde_json::Value>(&backlog_after_first)
-        .unwrap()["sessions"]
-        .as_array()
-        .unwrap()
-        .len();
-    assert!(backlog_count_first > 0);
-
-    distill_cmd(dir.path())
-        .env("PATH", &path_env)
-        .env("DISTILL_SCAN_BATCH_SIZE", "50")
-        .env("DISTILL_SCAN_MAX_RAW_BYTES", "12000")
-        .args(["scan", "--now"])
-        .assert()
-        .success();
-
-    let seen_after_second =
-        fs::read_to_string(dir.path().join(".distill/seen-batches.txt")).unwrap();
-    assert!(seen_after_second.lines().count() > first_count);
-
-    let backlog_after_second =
-        fs::read_to_string(dir.path().join(".distill/scan-backlog.json")).unwrap();
-    let backlog_count_second = serde_json::from_str::<serde_json::Value>(&backlog_after_second)
-        .unwrap()["sessions"]
-        .as_array()
-        .unwrap()
-        .len();
-    assert!(backlog_count_second < backlog_count_first);
+    // Backlog should be fully drained (file removed or empty sessions array)
+    let backlog_path = dir.path().join(".distill/scan-backlog.json");
+    let backlog_count = if backlog_path.exists() {
+        serde_json::from_str::<serde_json::Value>(&fs::read_to_string(&backlog_path).unwrap())
+            .unwrap()["sessions"]
+            .as_array()
+            .unwrap()
+            .len()
+    } else {
+        0
+    };
+    assert_eq!(backlog_count, 0);
 }
 
 #[cfg(unix)]
@@ -1145,13 +1127,7 @@ printf '%s' "{\"inspected_files\":[\"$staged_session\"],\"file_findings\":[{\"se
         std::env::var("PATH").unwrap_or_default()
     );
 
-    distill_cmd(dir.path())
-        .env("PATH", &path_env)
-        .env("DISTILL_SCAN_BATCH_SIZE", "1")
-        .args(["scan", "--now"])
-        .assert()
-        .success();
-
+    // Continuous mode: single invocation drains all batches (newest first)
     distill_cmd(dir.path())
         .env("PATH", &path_env)
         .env("DISTILL_SCAN_BATCH_SIZE", "1")
@@ -1163,7 +1139,11 @@ printf '%s' "{\"inspected_files\":[\"$staged_session\"],\"file_findings\":[{\"se
     let lines = seen.lines().collect::<Vec<_>>();
     assert_eq!(
         lines,
-        vec!["0001-session-new.jsonl", "0001-session-mid.jsonl"]
+        vec![
+            "0001-session-new.jsonl",
+            "0001-session-mid.jsonl",
+            "0001-session-old.jsonl"
+        ]
     );
 }
 

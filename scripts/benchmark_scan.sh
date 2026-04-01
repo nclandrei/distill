@@ -103,10 +103,10 @@ CODEX_HOME="$TEMP_HOME/.codex" \
 DISTILL_SCAN_DEBUG_DIR="$SCAN_DEBUG_DIR" \
 /usr/bin/time "${TIME_ARGS[@]}" "$DISTILL_BIN" scan --now >"$SCAN_LOG" 2>"$TIME_LOG" || SCAN_EXIT=$?
 
-SCAN_STATUS_FILE="$(find "$SCAN_DEBUG_DIR" -name scan-status.json -type f -print | sort | tail -1)"
+SCAN_STATUS_FILES="$(find "$SCAN_DEBUG_DIR" -name scan-status.json -type f -print | sort)"
 
 mkdir -p "$(dirname "$REPORT_PATH")"
-python3 - "$TEMP_HOME" "$RUN_DIR" "$SCAN_LOG" "$TIME_LOG" "$SCAN_STATUS_FILE" "$REPORT_PATH" "$SCAN_EXIT" <<'PY'
+python3 - "$TEMP_HOME" "$RUN_DIR" "$SCAN_LOG" "$TIME_LOG" "$REPORT_PATH" "$SCAN_EXIT" $SCAN_STATUS_FILES <<'PY'
 import json
 import re
 import sys
@@ -116,18 +116,35 @@ temp_home = Path(sys.argv[1])
 run_dir = Path(sys.argv[2])
 scan_log = Path(sys.argv[3])
 time_log = Path(sys.argv[4])
-scan_status_path = Path(sys.argv[5]) if sys.argv[5] else None
-report_path = Path(sys.argv[6])
-scan_exit = int(sys.argv[7])
+report_path = Path(sys.argv[5])
+scan_exit = int(sys.argv[6])
+scan_status_files = [Path(p) for p in sys.argv[7:] if p]
 
 fixture_manifest_path = temp_home / ".distill-runtime" / "real-codex-fixture.json"
 scan_state_path = temp_home / ".distill" / "scan-state.json"
 proposals_dir = temp_home / ".distill" / "proposals"
 
 fixture_manifest = json.loads(fixture_manifest_path.read_text(encoding="utf-8"))
-scan_status = {}
-if scan_status_path and scan_status_path.is_file():
-    scan_status = json.loads(scan_status_path.read_text(encoding="utf-8"))
+
+# Aggregate scan status across all batches (continuous scan produces multiple)
+all_statuses = []
+for sf in scan_status_files:
+    if sf.is_file():
+        all_statuses.append(json.loads(sf.read_text(encoding="utf-8")))
+
+if all_statuses:
+    scan_status = dict(all_statuses[-1])  # start from last batch
+    # Sum cumulative fields across all batches
+    for key in ("candidate_sessions", "proposals_written", "discovered_sessions",
+                "skipped_sessions", "ready_workflows"):
+        scan_status[key] = sum(s.get(key, 0) for s in all_statuses)
+    # Take max for per-batch limits
+    for key in ("batch_size", "selected_raw_bytes"):
+        scan_status[key] = max(s.get(key, 0) for s in all_statuses)
+    scan_status["_batch_count"] = len(all_statuses)
+else:
+    scan_status = {}
+scan_status_path = str(scan_status_files[-1]) if scan_status_files else None
 scan_state = {}
 if scan_state_path.is_file():
     scan_state = json.loads(scan_state_path.read_text(encoding="utf-8"))
