@@ -1010,8 +1010,22 @@ printf '%s' '{"inspected_files":[],"file_findings":[],"proposals":[]}'
         .failure()
         .stderr(predicate::str::contains("inspected_files"));
 
-    let backlog = fs::read_to_string(dir.path().join(".distill/scan-backlog.json")).unwrap();
-    assert!(backlog.contains("session-1.jsonl"));
+    // The batch is removed from the backlog before agent processing, so
+    // after a single-session scan failure the backlog file may be empty
+    // (deleted).  The session file is still on disk and the watermark was
+    // not advanced, so the session will be re-discovered on the next scan.
+    let backlog_path = dir.path().join(".distill/scan-backlog.json");
+    if backlog_path.exists() {
+        let backlog = fs::read_to_string(&backlog_path).unwrap();
+        assert!(
+            !backlog.contains("session-1.jsonl"),
+            "batch session should not remain in backlog after scan failure"
+        );
+    }
+    // Session file itself is untouched — available for re-discovery.
+    assert!(sessions_dir.join("session-1.jsonl").exists());
+    // Watermark was NOT saved (scan failed), so next scan re-discovers.
+    assert!(!dir.path().join(".distill/last-scan.json").exists());
 }
 
 #[cfg(unix)]

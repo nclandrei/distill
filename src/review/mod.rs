@@ -13,7 +13,7 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::{Line, Span},
+    text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap},
 };
 use serde::{Deserialize, Serialize};
@@ -631,6 +631,7 @@ struct ReviewUiState {
     confirmation_focus: ConfirmationActionFocus,
     status_line: String,
     confirmation: Option<PendingConfirmation>,
+    show_diff: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -648,6 +649,7 @@ enum UiIntent {
     Snooze,
     Edit,
     AcceptAll,
+    ToggleDiff,
     Quit,
     Noop,
 }
@@ -761,6 +763,7 @@ impl ReviewUiState {
             confirmation_focus: ConfirmationActionFocus::Confirm,
             status_line: "Select a proposal and choose an action.".to_string(),
             confirmation: None,
+            show_diff: true,
         }
     }
 
@@ -774,6 +777,7 @@ impl ReviewUiState {
         }
         self.selected = self.selected.saturating_sub(1);
         self.content_scroll = 0;
+        self.show_diff = true;
     }
 
     fn select_next(&mut self) {
@@ -783,6 +787,7 @@ impl ReviewUiState {
         let max_idx = self.pending.len().saturating_sub(1);
         self.selected = (self.selected + 1).min(max_idx);
         self.content_scroll = 0;
+        self.show_diff = true;
     }
 
     fn remove_selected(&mut self) {
@@ -873,6 +878,7 @@ fn intent_from_key(code: KeyCode) -> UiIntent {
         KeyCode::Char('r') => UiIntent::Reject,
         KeyCode::Char('s') => UiIntent::Snooze,
         KeyCode::Char('e') => UiIntent::Edit,
+        KeyCode::Char('d') => UiIntent::ToggleDiff,
         KeyCode::Char('A') => UiIntent::AcceptAll,
         KeyCode::Char('q') | KeyCode::Esc => UiIntent::Quit,
         _ => UiIntent::Noop,
@@ -1022,21 +1028,40 @@ fn proposal_label(proposal: &Proposal) -> String {
     format!("{filename} [{kind} | {confidence}]")
 }
 
-fn proposal_details_text(proposal: &Proposal, skills_dir: &Path) -> String {
+fn proposal_details_rich(proposal: &Proposal, skills_dir: &Path, show_diff: bool) -> Text<'static> {
     use crate::proposals::{Confidence, ProposalType};
 
+    let label_style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::BOLD);
+    let value_style = Style::default().fg(Color::White);
+
     let filename = proposal.filename.as_deref().unwrap_or("(unknown)");
-    let proposal_type = match proposal.frontmatter.proposal_type {
+
+    let type_str = match proposal.frontmatter.proposal_type {
         ProposalType::New => "new",
         ProposalType::Improve => "improve",
         ProposalType::Edit => "edit",
         ProposalType::Remove => "remove",
     };
-    let confidence = match proposal.frontmatter.confidence {
+    let type_color = match proposal.frontmatter.proposal_type {
+        ProposalType::New => Color::Green,
+        ProposalType::Improve => Color::Cyan,
+        ProposalType::Edit => Color::Yellow,
+        ProposalType::Remove => Color::Red,
+    };
+
+    let confidence_str = match proposal.frontmatter.confidence {
         Confidence::High => "high",
         Confidence::Medium => "medium",
         Confidence::Low => "low",
     };
+    let confidence_color = match proposal.frontmatter.confidence {
+        Confidence::High => Color::Green,
+        Confidence::Medium => Color::Yellow,
+        Confidence::Low => Color::Red,
+    };
+
     let target = match proposal.frontmatter.resolved_target() {
         Some(ProposalTarget::Skill { name }) => format!("skill:{name}"),
         Some(ProposalTarget::File { path }) => format!("file:{path}"),
@@ -1048,53 +1073,302 @@ fn proposal_details_text(proposal: &Proposal, skills_dir: &Path) -> String {
         None => "(new skill)".to_string(),
     };
 
-    let mut text = format!(
-        "File: {filename}\nType: {proposal_type}\nConfidence: {confidence}\nTarget: {target}\nCreated: {}\n",
-        proposal.frontmatter.created.to_rfc3339(),
-    );
+    let mut lines: Vec<Line<'static>> = vec![
+        Line::from(vec![
+            Span::styled("File: ", label_style),
+            Span::styled(filename.to_string(), value_style),
+        ]),
+        Line::from(vec![
+            Span::styled("Type: ", label_style),
+            Span::styled(type_str.to_string(), Style::default().fg(type_color)),
+        ]),
+        Line::from(vec![
+            Span::styled("Confidence: ", label_style),
+            Span::styled(
+                confidence_str.to_string(),
+                Style::default().fg(confidence_color),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Target: ", label_style),
+            Span::styled(target, value_style),
+        ]),
+        Line::from(vec![
+            Span::styled("Created: ", label_style),
+            Span::styled(proposal.frontmatter.created.to_rfc3339(), value_style),
+        ]),
+    ];
 
     if !proposal.frontmatter.evidence.is_empty() {
-        text.push_str("\nEvidence:\n");
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("Evidence:", label_style)));
         for ev in &proposal.frontmatter.evidence {
-            text.push_str(&format!("- {} ({})\n", ev.pattern, ev.session));
+            lines.push(Line::from(Span::styled(
+                format!("- {} ({})", ev.pattern, ev.session),
+                value_style,
+            )));
         }
     }
 
     if proposal.frontmatter.proposal_type == ProposalType::Remove {
-        text.push_str("\nWarning:\n");
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Warning:",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
         match proposal.frontmatter.resolved_target() {
             Some(ProposalTarget::Skill { name }) => {
                 let skill_file = normalize_target_skill_filename(&name);
                 let skill_path = skills_dir.join(&skill_file);
                 if !skill_path.exists() {
-                    text.push_str(&format!(
-                        "- Target skill file not found: {}\n",
-                        skill_path.display()
-                    ));
+                    lines.push(Line::from(Span::styled(
+                        format!("- Target skill file not found: {}", skill_path.display()),
+                        Style::default().fg(Color::Red),
+                    )));
                 } else {
-                    text.push_str("- This will permanently delete the target skill file.\n");
+                    lines.push(Line::from(Span::styled(
+                        "- This will permanently delete the target skill file.",
+                        Style::default().fg(Color::Red),
+                    )));
                 }
             }
             Some(ProposalTarget::File { path }) => {
                 let target_path = Path::new(&path);
                 if !target_path.exists() {
-                    text.push_str(&format!(
-                        "- Target file not found: {}\n",
-                        target_path.display()
-                    ));
+                    lines.push(Line::from(Span::styled(
+                        format!("- Target file not found: {}", target_path.display()),
+                        Style::default().fg(Color::Red),
+                    )));
                 } else {
-                    text.push_str("- This will permanently delete the target file.\n");
+                    lines.push(Line::from(Span::styled(
+                        "- This will permanently delete the target file.",
+                        Style::default().fg(Color::Red),
+                    )));
                 }
             }
             None => {
-                text.push_str("- Remove proposal is missing target and will fail.\n");
+                lines.push(Line::from(Span::styled(
+                    "- Remove proposal is missing target and will fail.",
+                    Style::default().fg(Color::Red),
+                )));
             }
         }
     }
 
-    text.push_str("\n--- Content ---\n");
-    text.push_str(&proposal.body);
-    text
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("--- Content ---", label_style)));
+
+    let is_improve_or_edit = matches!(
+        proposal.frontmatter.proposal_type,
+        ProposalType::Improve | ProposalType::Edit
+    );
+
+    if show_diff && is_improve_or_edit {
+        if let Some(ProposalTarget::Skill { name }) = proposal.frontmatter.resolved_target() {
+            let skill_roots = skill_source_roots(skills_dir, &[Config::shared_skills_dir()]);
+            if let Ok(Some(existing_path)) = resolve_existing_skill_source_path(&name, &skill_roots)
+                && let Ok(existing_content) = fs::read_to_string(&existing_path)
+            {
+                let existing_body = strip_frontmatter(&existing_content);
+                lines.extend(diff_lines(existing_body, &proposal.body));
+                return Text::from(lines);
+            }
+        }
+        // Fall through: could not resolve existing skill — show markdown with a note.
+        lines.push(Line::from(Span::styled(
+            "(existing skill not found — showing full content)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    lines.extend(markdown_to_lines(&proposal.body));
+    Text::from(lines)
+}
+
+/// Strip leading YAML frontmatter (if present) and return the body.
+fn strip_frontmatter(input: &str) -> &str {
+    if let Some(fm) = extract_leading_frontmatter(input) {
+        let rest = &input[fm.len()..];
+        rest.strip_prefix('\n').unwrap_or(rest)
+    } else {
+        input
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Markdown → styled ratatui lines
+// ---------------------------------------------------------------------------
+
+fn markdown_to_lines(input: &str) -> Vec<Line<'static>> {
+    use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+
+    let parser = Parser::new_ext(input, Options::empty());
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut style_stack: Vec<Style> = vec![Style::default()];
+    let mut in_code_block = false;
+    let mut list_depth: usize = 0;
+
+    let current_style = |stack: &[Style]| -> Style { stack.last().copied().unwrap_or_default() };
+
+    for event in parser {
+        match event {
+            Event::Start(Tag::Heading { level, .. }) => {
+                // Blank line before heading.
+                if !lines.is_empty() {
+                    lines.push(Line::from(""));
+                }
+                let style = match level {
+                    HeadingLevel::H1 => Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                    HeadingLevel::H2 => Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                    _ => Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                };
+                style_stack.push(style);
+            }
+            Event::End(TagEnd::Heading(_)) => {
+                style_stack.pop();
+                if !spans.is_empty() {
+                    lines.push(Line::from(std::mem::take(&mut spans)));
+                }
+            }
+            Event::Start(Tag::Strong) => {
+                let base = current_style(&style_stack);
+                style_stack.push(base.add_modifier(Modifier::BOLD));
+            }
+            Event::End(TagEnd::Strong) => {
+                style_stack.pop();
+            }
+            Event::Start(Tag::Emphasis) => {
+                let base = current_style(&style_stack);
+                style_stack.push(base.add_modifier(Modifier::ITALIC));
+            }
+            Event::End(TagEnd::Emphasis) => {
+                style_stack.pop();
+            }
+            Event::Start(Tag::CodeBlock(_)) => {
+                in_code_block = true;
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                in_code_block = false;
+            }
+            Event::Start(Tag::BlockQuote(_)) => {
+                style_stack.push(
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC),
+                );
+            }
+            Event::End(TagEnd::BlockQuote(_)) => {
+                style_stack.pop();
+            }
+            Event::Start(Tag::List(_)) => {
+                list_depth += 1;
+            }
+            Event::End(TagEnd::List(_)) => {
+                list_depth = list_depth.saturating_sub(1);
+            }
+            Event::Start(Tag::Item) => {
+                let indent = "  ".repeat(list_depth.saturating_sub(1));
+                spans.push(Span::styled(
+                    format!("{indent}• "),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            Event::End(TagEnd::Item) => {
+                if !spans.is_empty() {
+                    lines.push(Line::from(std::mem::take(&mut spans)));
+                }
+            }
+            Event::Start(Tag::Paragraph) | Event::End(TagEnd::Paragraph) => {
+                if !spans.is_empty() {
+                    lines.push(Line::from(std::mem::take(&mut spans)));
+                }
+            }
+            Event::Code(code) => {
+                spans.push(Span::styled(
+                    code.into_string(),
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+            Event::Text(text) => {
+                if in_code_block {
+                    // Split code block text into individual lines.
+                    for line in text.split('\n') {
+                        if !line.is_empty() || !spans.is_empty() {
+                            spans.push(Span::styled(
+                                line.to_string(),
+                                Style::default().fg(Color::Yellow),
+                            ));
+                        }
+                        if text.contains('\n') {
+                            lines.push(Line::from(std::mem::take(&mut spans)));
+                        }
+                    }
+                } else {
+                    spans.push(Span::styled(
+                        text.into_string(),
+                        current_style(&style_stack),
+                    ));
+                }
+            }
+            Event::SoftBreak | Event::HardBreak => {
+                if !spans.is_empty() {
+                    lines.push(Line::from(std::mem::take(&mut spans)));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Flush any remaining spans.
+    if !spans.is_empty() {
+        lines.push(Line::from(spans));
+    }
+
+    lines
+}
+
+// ---------------------------------------------------------------------------
+// Diff view
+// ---------------------------------------------------------------------------
+
+fn diff_lines(existing: &str, proposed: &str) -> Vec<Line<'static>> {
+    use similar::{ChangeTag, TextDiff};
+
+    let diff = TextDiff::from_lines(existing, proposed);
+    let mut lines = Vec::new();
+
+    for change in diff.iter_all_changes() {
+        let (prefix, style) = match change.tag() {
+            ChangeTag::Insert => ("+", Style::default().fg(Color::Green)),
+            ChangeTag::Delete => ("-", Style::default().fg(Color::Red)),
+            ChangeTag::Equal => (" ", Style::default().fg(Color::DarkGray)),
+        };
+        let value = change.as_str().unwrap_or("").trim_end_matches('\n');
+        lines.push(Line::from(Span::styled(format!("{prefix}{value}"), style)));
+    }
+
+    lines
+}
+
+#[cfg(test)]
+fn proposal_details_text(proposal: &Proposal, skills_dir: &Path) -> String {
+    let text = proposal_details_rich(proposal, skills_dir, false);
+    let mut out = String::new();
+    for line in text.lines {
+        for span in &line.spans {
+            out.push_str(&span.content);
+        }
+        out.push('\n');
+    }
+    out
 }
 
 fn draw_review_ui(frame: &mut Frame<'_>, state: &ReviewUiState, skills_dir: &Path) {
@@ -1185,16 +1459,28 @@ fn draw_review_ui(frame: &mut Frame<'_>, state: &ReviewUiState, skills_dir: &Pat
     }
     frame.render_stateful_widget(proposals, body_chunks[0], &mut list_state);
 
-    let details = state
-        .selected_proposal()
-        .map(|proposal| proposal_details_text(proposal, skills_dir))
-        .unwrap_or_else(|| "No pending proposals.".to_string());
+    let (details, inspect_title) = if let Some(proposal) = state.selected_proposal() {
+        let is_diff_view = state.show_diff
+            && matches!(
+                proposal.frontmatter.proposal_type,
+                ProposalType::Improve | ProposalType::Edit
+            );
+        let text = proposal_details_rich(proposal, skills_dir, state.show_diff);
+        let title = if is_diff_view {
+            "INSPECT [DIFF]"
+        } else {
+            "INSPECT"
+        };
+        (text, title)
+    } else {
+        (Text::from("No pending proposals."), "INSPECT")
+    };
     let detail_pane = Paragraph::new(details)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(muted))
-                .title("INSPECT"),
+                .title(inspect_title),
         )
         .wrap(Wrap { trim: false })
         .scroll((state.content_scroll, 0));
@@ -1226,7 +1512,7 @@ fn draw_review_ui(frame: &mut Frame<'_>, state: &ReviewUiState, skills_dir: &Pat
             Span::raw("Focus action  "),
             Span::styled("[Enter] ", Style::default().fg(Color::Green)),
             Span::raw("Run focused action  "),
-            Span::styled("[a/r/s/e/A/q] ", Style::default().fg(emphasis)),
+            Span::styled("[a/r/s/e/d/A/q] ", Style::default().fg(emphasis)),
             Span::raw("Direct hotkeys"),
         ]),
         Line::from(""),
@@ -1522,6 +1808,15 @@ fn execute_intent(
                     state.pending.len()
                 );
             }
+        }
+        UiIntent::ToggleDiff => {
+            state.show_diff = !state.show_diff;
+            state.content_scroll = 0;
+            state.status_line = if state.show_diff {
+                "Diff view enabled.".to_string()
+            } else {
+                "Full content view.".to_string()
+            };
         }
         UiIntent::Quit => {
             let remaining = state.pending.len();
@@ -2153,6 +2448,152 @@ mod tests {
         assert!(
             rendered.contains("Accepted alpha.md"),
             "status line should be visible in footer"
+        );
+    }
+
+    #[test]
+    fn test_markdown_to_lines_basic() {
+        let input = "# Heading\n\nSome **bold** and `code` text.\n\n- item one\n- item two\n";
+        let lines = markdown_to_lines(input);
+        let flat: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(flat.contains("Heading"), "heading text should appear");
+        assert!(flat.contains("bold"), "bold text should appear");
+        assert!(flat.contains("code"), "inline code should appear");
+        assert!(flat.contains("item one"), "list items should appear");
+
+        // Verify heading gets bold modifier.
+        let heading_line = lines
+            .iter()
+            .find(|l| {
+                l.spans
+                    .iter()
+                    .any(|s| s.content.as_ref().contains("Heading"))
+            })
+            .expect("should have heading line");
+        let heading_span = heading_line
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref().contains("Heading"))
+            .unwrap();
+        assert!(
+            heading_span.style.add_modifier.contains(Modifier::BOLD),
+            "heading should be bold"
+        );
+    }
+
+    #[test]
+    fn test_diff_lines_shows_changes() {
+        let existing = "line one\nline two\nline three\n";
+        let proposed = "line one\nline TWO\nline three\n";
+        let lines = diff_lines(existing, proposed);
+        let flat: Vec<(String, Color)> = lines
+            .iter()
+            .map(|l| {
+                let text: String = l
+                    .spans
+                    .iter()
+                    .map(|s| s.content.as_ref().to_string())
+                    .collect();
+                let color = l
+                    .spans
+                    .first()
+                    .map(|s| s.style.fg.unwrap_or(Color::Reset))
+                    .unwrap_or(Color::Reset);
+                (text, color)
+            })
+            .collect();
+        // Insertions should be green.
+        assert!(
+            flat.iter()
+                .any(|(t, c)| t.contains("+line TWO") && *c == Color::Green),
+            "inserted lines should be green with + prefix"
+        );
+        // Deletions should be red.
+        assert!(
+            flat.iter()
+                .any(|(t, c)| t.contains("-line two") && *c == Color::Red),
+            "deleted lines should be red with - prefix"
+        );
+        // Equal lines should be dark gray.
+        assert!(
+            flat.iter()
+                .any(|(t, c)| t.contains(" line one") && *c == Color::DarkGray),
+            "equal lines should be dark gray"
+        );
+    }
+
+    #[test]
+    fn test_proposal_details_rich_fallback_for_new() {
+        let dir = tempfile::tempdir().unwrap();
+        let proposal = make_proposal("new.md", None, "# New Skill\n\nDo the thing.\n");
+        let text = proposal_details_rich(&proposal, dir.path(), true);
+        let flat: String = text
+            .lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        // New proposals should show full content, not diff, even when show_diff=true.
+        assert!(flat.contains("New Skill"), "body should be rendered");
+        assert!(flat.contains("Do the thing"), "body content should appear");
+        // The body should be markdown-rendered, not diff-rendered (no green/red diff lines).
+        let content_separator_idx = text
+            .lines
+            .iter()
+            .position(|l| {
+                let t: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+                t.contains("--- Content ---")
+            })
+            .expect("should have content separator");
+        let body_lines = &text.lines[content_separator_idx + 1..];
+        let has_diff_color = body_lines.iter().any(|l| {
+            l.spans
+                .iter()
+                .any(|s| s.style.fg == Some(Color::Green) || s.style.fg == Some(Color::Red))
+        });
+        assert!(
+            !has_diff_color,
+            "new proposals should not show diff-colored lines"
+        );
+    }
+
+    #[test]
+    fn test_proposal_details_rich_diff_for_improve() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills_dir = dir.path().join("skills");
+        fs::create_dir_all(&skills_dir).unwrap();
+
+        // Write an existing skill file that the diff resolver can find.
+        fs::write(
+            skills_dir.join("my-skill.md"),
+            "---\nname: my-skill\ndescription: test\n---\n\n# My Skill\n\nOriginal content.\n",
+        )
+        .unwrap();
+
+        let mut proposal = make_proposal(
+            "improve-123.md",
+            Some("my-skill"),
+            "# My Skill\n\nUpdated content.\n",
+        );
+        proposal.frontmatter.proposal_type = ProposalType::Improve;
+
+        let text = proposal_details_rich(&proposal, &skills_dir, true);
+        let flat: String = text
+            .lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+
+        // The diff should show additions and deletions.
+        assert!(
+            flat.contains("+Updated content."),
+            "diff should show added line: got {flat}"
+        );
+        assert!(
+            flat.contains("-Original content."),
+            "diff should show removed line: got {flat}"
         );
     }
 

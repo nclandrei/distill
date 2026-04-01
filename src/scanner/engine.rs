@@ -909,7 +909,6 @@ pub fn run_scan(agents: &[Box<dyn Agent>], scan_config: &ScanConfig) -> Result<V
         let seed_newest_first = last_scan.is_none() && backlog.sessions.is_empty();
         backlog.merge_new_sessions(candidate_sessions, seed_newest_first);
         backlog.prune_unavailable_sessions();
-        backlog.save(&scan_config.backlog_path)?;
         phase_durations.discovery = discovery_started.elapsed().as_millis() as u64;
 
         if skipped_internal > 0 {
@@ -920,6 +919,7 @@ pub fn run_scan(agents: &[Box<dyn Agent>], scan_config: &ScanConfig) -> Result<V
         }
 
         if backlog.sessions.is_empty() {
+            backlog.save(&scan_config.backlog_path)?;
             println!("No pending sessions found for scan.");
             debug_artifacts.write_status(&ScanRunStatus {
                 state: "completed".to_string(),
@@ -970,6 +970,18 @@ pub fn run_scan(agents: &[Box<dyn Agent>], scan_config: &ScanConfig) -> Result<V
                 selected_raw_bytes
             );
         }
+
+        // Remove the batch from the backlog and persist BEFORE agent
+        // processing.  If the agent invocation or response parsing fails
+        // the backlog on disk already reflects the removal.  The batch
+        // sessions will be re-discovered on the next scan (the watermark
+        // is only advanced on success) so they are not lost — just retried.
+        let batch_sessions: Vec<Session> = batch
+            .iter()
+            .map(|descriptor| descriptor.session.clone())
+            .collect();
+        backlog.remove_batch(&batch_sessions);
+        backlog.save(&scan_config.backlog_path)?;
 
         let skill_sources = load_existing_skill_sources(&scan_config.skill_dirs)?;
         println!("Loaded {} existing skill(s).", skill_sources.len());
@@ -1307,12 +1319,6 @@ pub fn run_scan(agents: &[Box<dyn Agent>], scan_config: &ScanConfig) -> Result<V
         }
 
         let finalize_started = Instant::now();
-        let batch_sessions = batch
-            .iter()
-            .map(|descriptor| descriptor.session.clone())
-            .collect::<Vec<_>>();
-        backlog.remove_batch(&batch_sessions);
-        backlog.save(&scan_config.backlog_path)?;
         scan_state.save(&scan_config.state_path)?;
         let watermark = LastScan {
             timestamp: scan_started_at,
@@ -4038,5 +4044,58 @@ mod tests {
             hint.is_none(),
             "should not falsely detect auth failure from AI response content: {hint:?}"
         );
+    }
+
+    #[test]
+    fn test_backlog_on_disk_excludes_batch_after_pre_scan_save() {
+        // Regression test: the backlog must be saved with batch sessions
+        // already removed BEFORE agent processing begins. Previously the
+        // backlog was saved with all sessions first (early save), and only
+        // updated after processing. If processing failed, the batch
+        // remained in the backlog and those sessions were re-scanned.
+        let dir = tempfile::tempdir().unwrap();
+        let backlog_path = dir.path().join("scan-backlog.json");
+
+        let sessions = vec![
+            temp_session_file(&dir, "s1.jsonl", 10, 5),
+            temp_session_file(&dir, "s2.jsonl", 10, 4),
+            temp_session_file(&dir, "s3.jsonl", 10, 3),
+            temp_session_file(&dir, "s4.jsonl", 10, 2),
+            temp_session_file(&dir, "s5.jsonl", 10, 1),
+        ];
+
+        // --- Simulate the scan pre-processing phase (discovery) ---
+        let mut backlog = ScanBacklog::default();
+        backlog.merge_new_sessions(sessions, true);
+        assert_eq!(backlog.sessions.len(), 5);
+
+        // --- Select batch ---
+        let batch = select_session_batch(&backlog.sessions, 2, None).unwrap();
+        assert_eq!(batch.len(), 2);
+        let batch_paths: HashSet<PathBuf> = batch.iter().map(|d| d.session.path.clone()).collect();
+
+        // --- Remove batch and save (as run_scan does before agent processing) ---
+        let batch_sessions: Vec<_> = batch.iter().map(|d| d.session.clone()).collect();
+        backlog.remove_batch(&batch_sessions);
+        backlog.save(&backlog_path).unwrap();
+
+        // The backlog on disk should NOT contain the batch sessions.
+        // If it does, any scan failure after this point leaves processed
+        // sessions in the backlog, causing them to be re-scanned.
+        let on_disk = ScanBacklog::load(&backlog_path).unwrap();
+        assert_eq!(
+            on_disk.sessions.len(),
+            3,
+            "Backlog on disk should have 3 sessions (5 minus the 2-session batch), \
+             but has {}. The batch was not removed before saving.",
+            on_disk.sessions.len()
+        );
+        for session in &on_disk.sessions {
+            assert!(
+                !batch_paths.contains(&session.path),
+                "Batch session {} should not be in persisted backlog",
+                session.path.display()
+            );
+        }
     }
 }
