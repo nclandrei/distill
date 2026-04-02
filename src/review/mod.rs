@@ -1166,9 +1166,6 @@ fn proposal_details_rich(proposal: &Proposal, skills_dir: &Path, show_diff: bool
         }
     }
 
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled("--- Content ---", label_style)));
-
     let is_improve_or_edit = matches!(
         proposal.frontmatter.proposal_type,
         ProposalType::Improve | ProposalType::Edit
@@ -1180,16 +1177,23 @@ fn proposal_details_rich(proposal: &Proposal, skills_dir: &Path, show_diff: bool
             if let Ok(Some(existing_path)) = resolve_existing_skill_source_path(&name, &skill_roots)
                 && let Ok(existing_content) = fs::read_to_string(&existing_path)
             {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled("--- Diff ---", label_style)));
                 let existing_body = strip_frontmatter(&existing_content);
                 lines.extend(diff_lines(existing_body, &proposal.body));
                 return Text::from(lines);
             }
         }
         // Fall through: could not resolve existing skill — show markdown with a note.
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("--- Content ---", label_style)));
         lines.push(Line::from(Span::styled(
             "(existing skill not found — showing full content)",
             Style::default().fg(Color::DarkGray),
         )));
+    } else {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("--- Content ---", label_style)));
     }
 
     lines.extend(markdown_to_lines(&proposal.body));
@@ -1353,20 +1357,94 @@ fn markdown_to_lines(input: &str) -> Vec<Line<'static>> {
 fn diff_lines(existing: &str, proposed: &str) -> Vec<Line<'static>> {
     use similar::{ChangeTag, TextDiff};
 
+    let context_lines = 3;
     let diff = TextDiff::from_lines(existing, proposed);
     let mut lines = Vec::new();
 
-    for change in diff.iter_all_changes() {
-        let (prefix, style) = match change.tag() {
-            ChangeTag::Insert => ("+", Style::default().fg(Color::Green)),
-            ChangeTag::Delete => ("-", Style::default().fg(Color::Red)),
-            ChangeTag::Equal => (" ", Style::default().fg(Color::DarkGray)),
+    let hunk_style = Style::default().fg(Color::Cyan);
+    let insert_style = Style::default().fg(Color::Green);
+    let delete_style = Style::default().fg(Color::Red);
+    let equal_style = Style::default().fg(Color::DarkGray);
+
+    for group in diff.grouped_ops(context_lines) {
+        // Build @@ header from first and last ops in the group.
+        let (old_start, old_end, new_start, new_end) = {
+            let first = group.first().unwrap();
+            let last = group.last().unwrap();
+            let (os, _, ns, _) = op_range(first);
+            let (_, oe, _, ne) = op_range(last);
+            (os, oe, ns, ne)
         };
-        let value = change.as_str().unwrap_or("").trim_end_matches('\n');
-        lines.push(Line::from(Span::styled(format!("{prefix}{value}"), style)));
+        let old_count = old_end - old_start;
+        let new_count = new_end - new_start;
+        lines.push(Line::from(Span::styled(
+            format!(
+                "@@ -{},{} +{},{} @@",
+                old_start + 1,
+                old_count,
+                new_start + 1,
+                new_count
+            ),
+            hunk_style,
+        )));
+
+        for op in &group {
+            for change in diff.iter_changes(op) {
+                let (prefix, style) = match change.tag() {
+                    ChangeTag::Insert => ("+", insert_style),
+                    ChangeTag::Delete => ("-", delete_style),
+                    ChangeTag::Equal => (" ", equal_style),
+                };
+                let value = change.as_str().unwrap_or("").trim_end_matches('\n');
+                lines.push(Line::from(Span::styled(format!("{prefix}{value}"), style)));
+            }
+        }
+
+        // Blank line between hunks for readability.
+        lines.push(Line::from(""));
+    }
+
+    // Remove trailing blank line.
+    if lines
+        .last()
+        .is_some_and(|l| l.spans.is_empty() || l.to_string().is_empty())
+    {
+        lines.pop();
     }
 
     lines
+}
+
+/// Extract (old_start, old_end, new_start, new_end) from a `DiffOp`.
+fn op_range(op: &similar::DiffOp) -> (usize, usize, usize, usize) {
+    match *op {
+        similar::DiffOp::Equal {
+            old_index,
+            new_index,
+            len,
+        } => (old_index, old_index + len, new_index, new_index + len),
+        similar::DiffOp::Delete {
+            old_index,
+            old_len,
+            new_index,
+        } => (old_index, old_index + old_len, new_index, new_index),
+        similar::DiffOp::Insert {
+            old_index,
+            new_index,
+            new_len,
+        } => (old_index, old_index, new_index, new_index + new_len),
+        similar::DiffOp::Replace {
+            old_index,
+            old_len,
+            new_index,
+            new_len,
+        } => (
+            old_index,
+            old_index + old_len,
+            new_index,
+            new_index + new_len,
+        ),
+    }
 }
 
 #[cfg(test)]
