@@ -1,6 +1,5 @@
 use crate::config::Config;
 use crate::config::NotificationPref;
-use crate::notify::print_terminal_branding;
 use crate::notify::send_notification;
 use anyhow::Result;
 
@@ -56,8 +55,7 @@ pub fn run(check: bool) -> Result<()> {
     Ok(())
 }
 
-fn print_pending_proposals(count: usize, icon_path: Option<&str>) {
-    let _ = print_terminal_branding(icon_path);
+fn print_pending_proposals(count: usize, _icon_path: Option<&str>) {
     println!(
         "[distill] {count} new proposal{} ready",
         if count == 1 { "" } else { "s" }
