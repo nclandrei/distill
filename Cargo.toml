@@ -1,6 +1,6 @@
 [package]
 name = "distill-cli"
-version = "0.6.2"
+version = "0.6.3"
 edition = "2024"
 description = "CLI tool that monitors AI agent sessions, identifies patterns, and proposes skills"
 license = "MIT"
@@ -17,16 +17,13 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
-base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 ctrlc = "3"
 crossterm = "0.29"
-image = { version = "0.25", default-features = false, features = ["png"] }
 pulldown-cmark = { version = "0.12", default-features = false }
 ratatui = "0.30"
 similar = "2"
-resvg = "0.45"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
