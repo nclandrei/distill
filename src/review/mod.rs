@@ -865,7 +865,7 @@ impl PendingConfirmation {
 }
 
 fn intent_from_key(code: KeyCode, modifiers: KeyModifiers) -> UiIntent {
-    // Ctrl-modified keys for scrolling
+    // Ctrl-modified keys for scrolling (may not work in all terminals)
     if modifiers.contains(KeyModifiers::CONTROL) {
         return match code {
             KeyCode::Char('u') => UiIntent::ScrollUp,
@@ -879,6 +879,9 @@ fn intent_from_key(code: KeyCode, modifiers: KeyModifiers) -> UiIntent {
     match code {
         KeyCode::Up | KeyCode::Char('k') => UiIntent::MoveUp,
         KeyCode::Down | KeyCode::Char('j') => UiIntent::MoveDown,
+        // Shift+J/K scroll the inspect panel
+        KeyCode::Char('K') => UiIntent::ScrollUp,
+        KeyCode::Char('J') => UiIntent::ScrollDown,
         KeyCode::Left | KeyCode::Char('h') | KeyCode::BackTab => UiIntent::FocusPrevAction,
         KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => UiIntent::FocusNextAction,
         KeyCode::Enter => UiIntent::RunFocusedAction,
@@ -1578,20 +1581,20 @@ fn draw_review_ui(frame: &mut Frame<'_>, state: &ReviewUiState, skills_dir: &Pat
     let inspect_title: Line<'_> = if can_scroll_down && can_scroll_up {
         Line::from(vec![
             Span::raw(format!("{inspect_title_base} ")),
-            Span::styled("Ctrl-d/u to scroll", Style::default().fg(muted)),
+            Span::styled("J/K to scroll", Style::default().fg(muted)),
         ])
     } else if can_scroll_down {
         Line::from(vec![
             Span::raw(format!("{inspect_title_base} ")),
             Span::styled(
-                "\u{25bc} Ctrl-d to scroll down",
+                "\u{25bc} J to scroll down",
                 Style::default().fg(accent),
             ),
         ])
     } else if can_scroll_up {
         Line::from(vec![
             Span::raw(format!("{inspect_title_base} ")),
-            Span::styled("\u{25b2} Ctrl-u to scroll up", Style::default().fg(accent)),
+            Span::styled("\u{25b2} K to scroll up", Style::default().fg(accent)),
         ])
     } else {
         Line::from(inspect_title_base)
@@ -1636,7 +1639,7 @@ fn draw_review_ui(frame: &mut Frame<'_>, state: &ReviewUiState, skills_dir: &Pat
             Span::raw("Run focused action  "),
             Span::styled("[a/r/s/e/d/A/q] ", Style::default().fg(emphasis)),
             Span::raw("Direct hotkeys  "),
-            Span::styled("[Ctrl-d/u] ", Style::default().fg(accent)),
+            Span::styled("[J/K] ", Style::default().fg(accent)),
             Span::raw("Scroll"),
         ]),
         Line::from(""),
