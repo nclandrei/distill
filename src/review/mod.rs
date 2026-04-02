@@ -4,7 +4,10 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use crossterm::{
     cursor,
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        MouseEventKind,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -632,6 +635,16 @@ struct ReviewUiState {
     status_line: String,
     confirmation: Option<PendingConfirmation>,
     show_diff: bool,
+    focused_pane: FocusedPane,
+    /// Last-rendered areas for mouse hit-testing.
+    queue_area: Rect,
+    inspect_area: Rect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FocusedPane {
+    Queue,
+    Inspect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -644,6 +657,7 @@ enum UiIntent {
     FocusPrevAction,
     FocusNextAction,
     RunFocusedAction,
+    ToggleFocusPane,
     Accept,
     Reject,
     Snooze,
@@ -764,6 +778,9 @@ impl ReviewUiState {
             status_line: "Select a proposal and choose an action.".to_string(),
             confirmation: None,
             show_diff: true,
+            focused_pane: FocusedPane::Queue,
+            queue_area: Rect::default(),
+            inspect_area: Rect::default(),
         }
     }
 
@@ -864,7 +881,11 @@ impl PendingConfirmation {
     }
 }
 
-fn intent_from_key(code: KeyCode, modifiers: KeyModifiers) -> UiIntent {
+fn intent_from_key(
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    focused_pane: FocusedPane,
+) -> UiIntent {
     // Ctrl-modified keys for scrolling (may not work in all terminals)
     if modifiers.contains(KeyModifiers::CONTROL) {
         return match code {
@@ -877,13 +898,18 @@ fn intent_from_key(code: KeyCode, modifiers: KeyModifiers) -> UiIntent {
     }
 
     match code {
-        KeyCode::Up | KeyCode::Char('k') => UiIntent::MoveUp,
-        KeyCode::Down | KeyCode::Char('j') => UiIntent::MoveDown,
-        // Shift+J/K scroll the inspect panel
-        KeyCode::Char('K') => UiIntent::ScrollUp,
-        KeyCode::Char('J') => UiIntent::ScrollDown,
-        KeyCode::Left | KeyCode::Char('h') | KeyCode::BackTab => UiIntent::FocusPrevAction,
-        KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => UiIntent::FocusNextAction,
+        // j/k behave based on which pane is focused.
+        KeyCode::Char('j') | KeyCode::Down => match focused_pane {
+            FocusedPane::Queue => UiIntent::MoveDown,
+            FocusedPane::Inspect => UiIntent::ScrollDown,
+        },
+        KeyCode::Char('k') | KeyCode::Up => match focused_pane {
+            FocusedPane::Queue => UiIntent::MoveUp,
+            FocusedPane::Inspect => UiIntent::ScrollUp,
+        },
+        KeyCode::Tab | KeyCode::BackTab => UiIntent::ToggleFocusPane,
+        KeyCode::Left | KeyCode::Char('h') => UiIntent::FocusPrevAction,
+        KeyCode::Right | KeyCode::Char('l') => UiIntent::FocusNextAction,
         KeyCode::Enter => UiIntent::RunFocusedAction,
         KeyCode::PageUp => UiIntent::ScrollUp,
         KeyCode::PageDown => UiIntent::ScrollDown,
@@ -953,8 +979,13 @@ impl TuiSession {
     fn enter() -> Result<Self> {
         enable_raw_mode().context("Failed to enable raw mode")?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, cursor::Hide)
-            .context("Failed to enter alternate screen")?;
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            cursor::Hide
+        )
+        .context("Failed to enter alternate screen")?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend).context("Failed to initialize terminal")?;
         terminal.clear().context("Failed to clear terminal")?;
@@ -965,7 +996,7 @@ impl TuiSession {
         })
     }
 
-    fn draw(&mut self, state: &ReviewUiState, skills_dir: &Path) -> Result<()> {
+    fn draw(&mut self, state: &mut ReviewUiState, skills_dir: &Path) -> Result<()> {
         self.terminal
             .draw(|frame| draw_review_ui(frame, state, skills_dir))
             .context("Failed to render review UI")?;
@@ -979,6 +1010,7 @@ impl TuiSession {
         disable_raw_mode().context("Failed to disable raw mode")?;
         execute!(
             self.terminal.backend_mut(),
+            DisableMouseCapture,
             LeaveAlternateScreen,
             cursor::Show
         )
@@ -994,6 +1026,7 @@ impl TuiSession {
         execute!(
             self.terminal.backend_mut(),
             EnterAlternateScreen,
+            EnableMouseCapture,
             cursor::Hide
         )
         .context("Failed to resume TUI")?;
@@ -1010,6 +1043,7 @@ impl Drop for TuiSession {
             let _ = disable_raw_mode();
             let _ = execute!(
                 self.terminal.backend_mut(),
+                DisableMouseCapture,
                 LeaveAlternateScreen,
                 cursor::Show
             );
@@ -1463,7 +1497,7 @@ fn proposal_details_text(proposal: &Proposal, skills_dir: &Path) -> String {
     out
 }
 
-fn draw_review_ui(frame: &mut Frame<'_>, state: &ReviewUiState, skills_dir: &Path) {
+fn draw_review_ui(frame: &mut Frame<'_>, state: &mut ReviewUiState, skills_dir: &Path) {
     let accent = Color::Cyan;
     let muted = Color::DarkGray;
     let emphasis = Color::Yellow;
@@ -1528,6 +1562,24 @@ fn draw_review_ui(frame: &mut Frame<'_>, state: &ReviewUiState, skills_dir: &Pat
     );
     frame.render_widget(flow, chunks[1]);
 
+    // Save areas for mouse hit-testing.
+    state.queue_area = body_chunks[0];
+    state.inspect_area = body_chunks[1];
+
+    let queue_border = if state.focused_pane == FocusedPane::Queue {
+        accent
+    } else {
+        muted
+    };
+    let queue_title = if state.focused_pane == FocusedPane::Queue {
+        Line::from(Span::styled(
+            "QUEUE",
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        ))
+    } else {
+        Line::from("QUEUE")
+    };
+
     let items: Vec<ListItem<'_>> = state
         .pending
         .iter()
@@ -1540,8 +1592,8 @@ fn draw_review_ui(frame: &mut Frame<'_>, state: &ReviewUiState, skills_dir: &Pat
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(muted))
-                .title("QUEUE"),
+                .border_style(Style::default().fg(queue_border))
+                .title(queue_title),
         )
         .highlight_symbol("> ")
         .highlight_style(Style::default().fg(accent).add_modifier(Modifier::BOLD));
@@ -1569,47 +1621,55 @@ fn draw_review_ui(frame: &mut Frame<'_>, state: &ReviewUiState, skills_dir: &Pat
     };
 
     // Compute whether content overflows the visible area.
-    let inspect_area = body_chunks[1];
-    let inner_height = inspect_area.height.saturating_sub(2) as usize; // borders
-    let _inner_width = inspect_area.width.saturating_sub(2); // borders (for future wrap-aware calc)
+    let inspect_rect = body_chunks[1];
+    let inner_height = inspect_rect.height.saturating_sub(2) as usize; // borders
+    let _inner_width = inspect_rect.width.saturating_sub(2); // borders (for future wrap-aware calc)
     let content_lines = details.lines.len();
     let has_overflow = content_lines > inner_height;
     let can_scroll_down =
         has_overflow && (state.content_scroll as usize + inner_height) < content_lines;
     let can_scroll_up = state.content_scroll > 0;
 
-    let inspect_title: Line<'_> = if can_scroll_down && can_scroll_up {
-        Line::from(vec![
-            Span::raw(format!("{inspect_title_base} ")),
-            Span::styled("J/K to scroll", Style::default().fg(muted)),
-        ])
-    } else if can_scroll_down {
-        Line::from(vec![
-            Span::raw(format!("{inspect_title_base} ")),
-            Span::styled(
-                "\u{25bc} J to scroll down",
-                Style::default().fg(accent),
-            ),
-        ])
-    } else if can_scroll_up {
-        Line::from(vec![
-            Span::raw(format!("{inspect_title_base} ")),
-            Span::styled("\u{25b2} K to scroll up", Style::default().fg(accent)),
-        ])
+    let inspect_border = if state.focused_pane == FocusedPane::Inspect {
+        accent
     } else {
-        Line::from(inspect_title_base)
+        muted
+    };
+
+    let scroll_hint = if can_scroll_down && can_scroll_up {
+        Some("\u{25b2}\u{25bc} scroll")
+    } else if can_scroll_down {
+        Some("\u{25bc} scroll")
+    } else if can_scroll_up {
+        Some("\u{25b2} scroll")
+    } else {
+        None
+    };
+
+    let inspect_title: Line<'_> = {
+        let title_style = if state.focused_pane == FocusedPane::Inspect {
+            Style::default().fg(accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        let mut spans = vec![Span::styled(inspect_title_base.to_string(), title_style)];
+        if let Some(hint) = scroll_hint {
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(hint, Style::default().fg(muted)));
+        }
+        Line::from(spans)
     };
 
     let detail_pane = Paragraph::new(details)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(muted))
+                .border_style(Style::default().fg(inspect_border))
                 .title(inspect_title),
         )
         .wrap(Wrap { trim: false })
         .scroll((state.content_scroll, 0));
-    frame.render_widget(detail_pane, inspect_area);
+    frame.render_widget(detail_pane, inspect_rect);
 
     let action_chip = |action: ReviewAction| -> Span<'static> {
         let marker = if state.focused_action == action {
@@ -1633,14 +1693,14 @@ fn draw_review_ui(frame: &mut Frame<'_>, state: &ReviewUiState, skills_dir: &Pat
 
     let footer = Paragraph::new(vec![
         Line::from(vec![
-            Span::styled("[Left/Right] ", Style::default().fg(accent)),
+            Span::styled("[Tab] ", Style::default().fg(accent)),
+            Span::raw("Switch pane  "),
+            Span::styled("[h/l] ", Style::default().fg(accent)),
             Span::raw("Focus action  "),
             Span::styled("[Enter] ", Style::default().fg(Color::Green)),
-            Span::raw("Run focused action  "),
+            Span::raw("Run action  "),
             Span::styled("[a/r/s/e/d/A/q] ", Style::default().fg(emphasis)),
-            Span::raw("Direct hotkeys  "),
-            Span::styled("[J/K] ", Style::default().fg(accent)),
-            Span::raw("Scroll"),
+            Span::raw("Hotkeys"),
         ]),
         Line::from(""),
         Line::from(vec![
@@ -1808,6 +1868,12 @@ fn execute_intent(
         UiIntent::ScrollUp => state.content_scroll = state.content_scroll.saturating_sub(5),
         UiIntent::ScrollDown => state.content_scroll = state.content_scroll.saturating_add(5),
         UiIntent::ScrollHome => state.content_scroll = 0,
+        UiIntent::ToggleFocusPane => {
+            state.focused_pane = match state.focused_pane {
+                FocusedPane::Queue => FocusedPane::Inspect,
+                FocusedPane::Inspect => FocusedPane::Queue,
+            };
+        }
         UiIntent::FocusPrevAction => state.focus_prev_action(),
         UiIntent::FocusNextAction => state.focus_next_action(),
         UiIntent::RunFocusedAction => {
@@ -1992,13 +2058,45 @@ pub fn run_review_interactive(
     let mut tui = TuiSession::enter()?;
 
     while !state.pending.is_empty() {
-        tui.draw(&state, skills_dir)?;
+        tui.draw(&mut state, skills_dir)?;
 
         if !event::poll(Duration::from_millis(200)).context("Failed to poll terminal events")? {
             continue;
         }
 
-        let Event::Key(key) = event::read().context("Failed to read terminal event")? else {
+        let ev = event::read().context("Failed to read terminal event")?;
+
+        // Handle mouse scroll on the inspect panel.
+        if let Event::Mouse(mouse) = ev {
+            let col = mouse.column;
+            let row = mouse.row;
+            let in_inspect = col >= state.inspect_area.x
+                && col < state.inspect_area.x + state.inspect_area.width
+                && row >= state.inspect_area.y
+                && row < state.inspect_area.y + state.inspect_area.height;
+            let in_queue = col >= state.queue_area.x
+                && col < state.queue_area.x + state.queue_area.width
+                && row >= state.queue_area.y
+                && row < state.queue_area.y + state.queue_area.height;
+            match mouse.kind {
+                MouseEventKind::ScrollDown if in_inspect => {
+                    state.content_scroll = state.content_scroll.saturating_add(3);
+                }
+                MouseEventKind::ScrollUp if in_inspect => {
+                    state.content_scroll = state.content_scroll.saturating_sub(3);
+                }
+                MouseEventKind::ScrollDown if in_queue => {
+                    state.select_next();
+                }
+                MouseEventKind::ScrollUp if in_queue => {
+                    state.select_prev();
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        let Event::Key(key) = ev else {
             continue;
         };
         if key.kind != KeyEventKind::Press {
@@ -2037,7 +2135,7 @@ pub fn run_review_interactive(
                     state.status_line = "Confirmation cancelled.".to_string();
                 }
                 _ => {
-                    let quick_intent = intent_from_key(key.code, key.modifiers);
+                    let quick_intent = intent_from_key(key.code, key.modifiers, state.focused_pane);
                     if quick_intent == confirmation.intent() {
                         state.clear_confirmation();
                         state.set_focus_from_intent(quick_intent);
@@ -2058,7 +2156,7 @@ pub fn run_review_interactive(
             continue;
         }
 
-        let mut intent = intent_from_key(key.code, key.modifiers);
+        let mut intent = intent_from_key(key.code, key.modifiers, state.focused_pane);
         if intent == UiIntent::Noop {
             continue;
         }
@@ -2560,12 +2658,12 @@ mod tests {
         let backend = TestBackend::new(120, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw_review_ui(frame, &state, skills_dir.path()))
+            .draw(|frame| draw_review_ui(frame, &mut state, skills_dir.path()))
             .unwrap();
 
         let rendered = render_buffer_text(terminal.backend().buffer());
         assert!(
-            rendered.contains("Run focused action"),
+            rendered.contains("Run action"),
             "focused action controls must render"
         );
         assert!(
@@ -2792,7 +2890,7 @@ mod tests {
         let backend = TestBackend::new(120, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw_review_ui(frame, &state, skills_dir.path()))
+            .draw(|frame| draw_review_ui(frame, &mut state, skills_dir.path()))
             .unwrap();
 
         let rendered = render_buffer_text(terminal.backend().buffer());
