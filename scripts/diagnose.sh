@@ -32,8 +32,26 @@ echo "Cloud Environment"
 
 echo ""
 echo "Toolchains"
+_check "Node.js" node
+_check npm
+_check pnpm
+_check yarn
+_check bun
+_check Deno deno
+_check "Python" python3
+_check pip
+_check uv
+command -v go &>/dev/null && ok "Go: $(go version 2>&1)" || fail "Go: not installed"
 _check "Rust" rustc
 _check Cargo cargo
+_check Ruby ruby
+command -v java &>/dev/null && ok "Java: $(java -version 2>&1 | grep version | head -1)" || fail "Java: not installed"
+_check Erlang erl
+command -v elixir &>/dev/null && ok "Elixir: $(elixir --version 2>&1 | tail -1)" || fail "Elixir: not installed"
+_check Zig zig
+_check ".NET" dotnet
+_check PHP php
+_check Composer composer
 
 echo ""
 echo "CLI Tools"
@@ -41,6 +59,19 @@ _check git
 _check gh
 _check jq
 _check curl
+_check sqlite3
+_check psql
+_check redis-cli
+_check Docker docker
+if command -v docker &>/dev/null; then
+  docker ps &>/dev/null && ok "Docker daemon: running" || warn "Docker CLI installed but daemon not running"
+fi
+
+echo ""
+echo "Browser Automation"
+CHROMIUM=$(find /root/.cache/ms-playwright -name "chrome" -path "*/chrome-linux/chrome" 2>/dev/null | head -1)
+[ -n "$CHROMIUM" ] && ok "Playwright Chromium: $CHROMIUM" || fail "Playwright Chromium: not found"
+command -v chromium &>/dev/null && ok "chromium symlink: $(which chromium)" || warn "chromium not on PATH"
 
 echo ""
 echo "Setup Status"
