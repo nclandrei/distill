@@ -260,6 +260,45 @@ pub fn extract_json_value(text: &str) -> Result<serde_json::Value> {
     serde_json::from_str(json_str).context("Failed to parse agent response as JSON")
 }
 
+fn find_embedded_json_block(text: &str) -> Option<&str> {
+    let bytes = text.as_bytes();
+    let (open_idx, open_byte, close_byte) =
+        bytes.iter().enumerate().find_map(|(i, b)| match *b {
+            b'{' => Some((i, b'{', b'}')),
+            b'[' => Some((i, b'[', b']')),
+            _ => None,
+        })?;
+
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, b) in bytes.iter().enumerate().skip(open_idx) {
+        let byte = *b;
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b if b == open_byte => depth += 1,
+            b if b == close_byte => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&text[open_idx..=i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 pub fn cleanup_temp_files(paths: &[PathBuf]) {
     for path in paths {
         let _ = std::fs::remove_file(path);
@@ -615,9 +654,20 @@ fn extract_claude_stream_output(stdout: &str) -> Result<String> {
         collect_text_candidates(&value, &mut candidates, 0);
     }
 
-    for candidate in candidates.into_iter().rev() {
-        if extract_json_value(&candidate).is_ok() {
-            return Ok(candidate);
+    for candidate in candidates.iter().rev() {
+        if extract_json_value(candidate).is_ok() {
+            return Ok(candidate.clone());
+        }
+    }
+
+    // Claude sometimes prefixes its JSON payload with explanatory text
+    // (e.g. "Let me produce the analysis.\n\n{...}"). Recover by scanning
+    // each candidate for an embedded JSON object or array.
+    for candidate in candidates.iter().rev() {
+        if let Some(block) = find_embedded_json_block(candidate)
+            && extract_json_value(block).is_ok()
+        {
+            return Ok(block.to_string());
         }
     }
 
@@ -767,6 +817,21 @@ mod tests {
 
         let output = extract_claude_stream_output(stdout).unwrap();
         assert!(output.contains("\"inspected_files\""));
+    }
+
+    #[test]
+    fn test_extract_claude_stream_output_handles_preamble_before_json() {
+        // Claude sometimes emits a `result` field with preamble text followed by the JSON
+        // payload (e.g. "Now I have all files inspected. Let me produce the analysis.\n\n{...}").
+        // The extractor should still recover the embedded JSON object rather than failing with
+        // "Failed to extract structured JSON from Claude stream output".
+        let stdout = r#"{"type":"assistant","text":"thinking"}
+{"type":"result","subtype":"success","is_error":false,"result":"Now I have all 8 session files inspected. Let me produce the analysis.\n\n{\"inspected_files\": [\"/tmp/workspace/sessions/claude/0001.jsonl\"], \"session_findings\": [{\"session\": \"/tmp/workspace/sessions/claude/0001.jsonl\", \"summary\": \"Repeated workflow.\", \"candidates\": []}]}"}"#;
+
+        let output = extract_claude_stream_output(stdout).unwrap();
+        let parsed = extract_json_value(&output).unwrap();
+        assert!(parsed.get("inspected_files").is_some());
+        assert!(parsed.get("session_findings").is_some());
     }
 
     #[test]
