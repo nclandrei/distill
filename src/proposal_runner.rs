@@ -51,9 +51,8 @@ pub fn proposal_agent_command(agent_name: &str) -> ProposalAgentCommand {
             args: vec![
                 "--print".to_string(),
                 "--no-session-persistence".to_string(),
-                "--verbose".to_string(),
                 "--output-format".to_string(),
-                "stream-json".to_string(),
+                "json".to_string(),
                 "--permission-mode".to_string(),
                 "bypassPermissions".to_string(),
                 "--tools".to_string(),
@@ -157,6 +156,12 @@ pub fn prepare_proposal_command(
             if !effective_args.iter().any(|arg| arg == "--add-dir") {
                 effective_args.push("--add-dir".into());
                 effective_args.push(workspace_root.to_string_lossy().to_string());
+            }
+            if let Some(schema) = output_schema
+                && !effective_args.iter().any(|arg| arg == "--json-schema")
+            {
+                effective_args.push("--json-schema".into());
+                effective_args.push(schema.to_string());
             }
         }
         ProposalAgentMode::OpenCode => {}
@@ -1049,6 +1054,72 @@ mod tests {
             !prepared.env_overrides.iter().any(|(key, _)| key == "HOME"),
             "Claude mode must not override HOME — it breaks keychain auth"
         );
+    }
+
+    #[test]
+    fn test_proposal_agent_command_for_claude_uses_json_output_format() {
+        // --json-schema requires --output-format json (not stream-json).
+        let command = proposal_agent_command("claude");
+        assert_eq!(command.mode, ProposalAgentMode::Claude);
+        let idx = command
+            .args
+            .iter()
+            .position(|arg| arg == "--output-format")
+            .expect("claude args must include --output-format");
+        assert_eq!(command.args.get(idx + 1).map(String::as_str), Some("json"));
+        assert!(
+            !command.args.iter().any(|arg| arg == "--verbose"),
+            "--verbose is only meaningful for stream-json output"
+        );
+    }
+
+    #[test]
+    fn test_prepare_proposal_command_for_claude_injects_json_schema_when_provided() {
+        let schema = r#"{"type":"object","required":["inspected_files"]}"#;
+        let prepared = prepare_proposal_command(
+            "claude",
+            &proposal_agent_command("claude").args,
+            Path::new("/tmp/workspace"),
+            None,
+            Some(schema),
+        )
+        .unwrap();
+
+        let idx = prepared
+            .args
+            .iter()
+            .position(|arg| arg == "--json-schema")
+            .expect("Claude args must include --json-schema when output_schema is provided");
+        assert_eq!(prepared.args.get(idx + 1).map(String::as_str), Some(schema));
+    }
+
+    #[test]
+    fn test_prepare_proposal_command_for_claude_without_schema_omits_json_schema_flag() {
+        let prepared = prepare_proposal_command(
+            "claude",
+            &proposal_agent_command("claude").args,
+            Path::new("/tmp/workspace"),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            !prepared.args.iter().any(|arg| arg == "--json-schema"),
+            "Claude args must not include --json-schema when no schema is provided"
+        );
+    }
+
+    #[test]
+    fn test_extract_claude_stream_output_reads_structured_output_object() {
+        // With --output-format json + --json-schema, Claude emits a single JSON
+        // object whose `structured_output` is the validated payload.
+        let stdout = r#"{"type":"result","subtype":"success","is_error":false,"result":"done","structured_output":{"inspected_files":["/tmp/a.jsonl"],"session_findings":[]}}"#;
+
+        let output = extract_claude_stream_output(stdout).unwrap();
+        let parsed = extract_json_value(&output).unwrap();
+        assert!(parsed.get("inspected_files").is_some());
+        assert!(parsed.get("session_findings").is_some());
     }
 
     #[test]
