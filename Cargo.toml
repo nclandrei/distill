@@ -1,6 +1,6 @@
 [package]
 name = "distill-cli"
-version = "0.6.5"
+version = "0.6.6"
 edition = "2024"
 description = "CLI tool that monitors AI agent sessions, identifies patterns, and proposes skills"
 license = "MIT"

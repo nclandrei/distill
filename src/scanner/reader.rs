@@ -45,9 +45,13 @@ pub fn collect_sessions(agents: &[Box<dyn Agent>], since: DateTime<Utc>) -> Resu
     let mut all_sessions = Vec::new();
 
     for agent in agents {
-        let sessions = agent
-            .read_sessions(since)
-            .with_context(|| format!("Failed to read sessions from {} agent", agent.kind()))?;
+        let sessions = match agent.read_sessions(since) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Warning: skipping {} agent: {:#}", agent.kind(), e);
+                continue;
+            }
+        };
 
         for session in sessions {
             if seen_paths.insert(session.path.clone()) {
@@ -193,5 +197,49 @@ mod tests {
     fn test_last_scan_load_missing_file() {
         let result = LastScan::load(Path::new("/nonexistent/last-scan.json")).unwrap();
         assert!(result.is_none());
+    }
+
+    /// An agent whose read_sessions always fails (simulates missing CLI).
+    struct FailingAgent {
+        kind: AgentKind,
+    }
+
+    impl Agent for FailingAgent {
+        fn kind(&self) -> AgentKind {
+            self.kind
+        }
+
+        fn read_sessions(&self, _since: DateTime<Utc>) -> Result<Vec<Session>> {
+            anyhow::bail!("command not found: opencode")
+        }
+
+        fn write_skill(&self, _skill: &crate::agents::Skill) -> Result<()> {
+            Ok(())
+        }
+
+        fn config_dir(&self) -> PathBuf {
+            PathBuf::from("/fake")
+        }
+    }
+
+    #[test]
+    fn test_collect_sessions_skips_unavailable_agent() {
+        let working_agent: Box<dyn Agent> = Box::new(MockAgent {
+            kind: AgentKind::Claude,
+            sessions: vec![make_session("claude-1", AgentKind::Claude, 1)],
+        });
+        let broken_agent: Box<dyn Agent> = Box::new(FailingAgent {
+            kind: AgentKind::OpenCode,
+        });
+
+        let result = collect_sessions(
+            &[working_agent, broken_agent],
+            Utc::now() - chrono::Duration::days(1),
+        );
+
+        // Must succeed — the broken agent should be skipped, not crash the scan
+        let sessions = result.expect("collect_sessions should not fail when one agent errors");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "claude-1");
     }
 }
