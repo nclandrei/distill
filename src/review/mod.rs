@@ -881,11 +881,7 @@ impl PendingConfirmation {
     }
 }
 
-fn intent_from_key(
-    code: KeyCode,
-    modifiers: KeyModifiers,
-    focused_pane: FocusedPane,
-) -> UiIntent {
+fn intent_from_key(code: KeyCode, modifiers: KeyModifiers, focused_pane: FocusedPane) -> UiIntent {
     // Ctrl-modified keys for scrolling (may not work in all terminals)
     if modifiers.contains(KeyModifiers::CONTROL) {
         return match code {
