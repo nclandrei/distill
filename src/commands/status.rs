@@ -1,9 +1,9 @@
 use crate::config::{Config, Interval};
 use crate::scanner::reader::LastScan;
-use crate::schedule::{ScheduleCadence, schedule_cadence};
+use crate::schedule::{ScheduleCadence, SchedulerStatus, schedule_cadence};
 use anyhow::Result;
 use chrono::{DateTime, Datelike, Local, SecondsFormat, TimeZone, Utc, Weekday};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(serde::Deserialize)]
 struct StoredBacklog {
@@ -23,6 +23,10 @@ pub struct StatusInfo {
     /// Human-readable schedule status. This is either the next scheduled slot
     /// or an overdue marker when the last scan missed the latest slot.
     pub next_scheduled_scan: Option<String>,
+    /// Whether the platform scheduler (launchd plist / systemd timer) is
+    /// installed, plus the path to the file that was checked.
+    pub scheduler_installed: bool,
+    pub scheduler_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -256,6 +260,16 @@ pub fn format_status(info: &StatusInfo) -> String {
     let next_scan_display = info.next_scheduled_scan.as_deref().unwrap_or("unknown");
     out.push_str(&format!("Next scheduled scan: {next_scan_display}\n"));
 
+    let scheduler_state = if info.scheduler_installed {
+        "installed"
+    } else {
+        "not installed (run `distill watch --install` or re-run `distill`)"
+    };
+    out.push_str(&format!(
+        "Scheduler:         {scheduler_state} ({})\n",
+        info.scheduler_path.display()
+    ));
+
     out
 }
 
@@ -263,11 +277,13 @@ pub fn format_status(info: &StatusInfo) -> String {
 /// timestamp) from the given `base_dir` rather than the hard-coded default
 /// `~/.distill`.  This makes the function fully testable with `tempfile`.
 pub fn collect_status_info(config: &Config, base_dir: &Path) -> Result<StatusInfo> {
+    let scheduler = crate::schedule::create_scheduler_default();
     collect_status_info_with_shared_dir_at(
         config,
         base_dir,
         &Config::shared_skills_dir(),
         Utc::now(),
+        scheduler.as_ref(),
     )
 }
 
@@ -277,7 +293,14 @@ fn collect_status_info_with_shared_dir(
     base_dir: &Path,
     shared_skills_dir: &Path,
 ) -> Result<StatusInfo> {
-    collect_status_info_with_shared_dir_at(config, base_dir, shared_skills_dir, Utc::now())
+    let scheduler = crate::schedule::create_scheduler_for_tests(base_dir.to_path_buf());
+    collect_status_info_with_shared_dir_at(
+        config,
+        base_dir,
+        shared_skills_dir,
+        Utc::now(),
+        scheduler.as_ref(),
+    )
 }
 
 fn collect_status_info_with_shared_dir_at(
@@ -285,6 +308,7 @@ fn collect_status_info_with_shared_dir_at(
     base_dir: &Path,
     shared_skills_dir: &Path,
     now_utc: DateTime<Utc>,
+    scheduler: &dyn crate::schedule::Scheduler,
 ) -> Result<StatusInfo> {
     let proposals_dir = base_dir.join("proposals");
     let pending_proposals = if proposals_dir.exists() {
@@ -319,6 +343,9 @@ fn collect_status_info_with_shared_dir_at(
         (None, None)
     };
 
+    let scheduler_path = scheduler.plist_or_unit_path();
+    let scheduler_installed = matches!(scheduler.status()?, SchedulerStatus::Installed);
+
     Ok(StatusInfo {
         config: config.clone(),
         pending_proposals,
@@ -326,6 +353,8 @@ fn collect_status_info_with_shared_dir_at(
         pending_scan_backlog,
         last_scan,
         next_scheduled_scan,
+        scheduler_installed,
+        scheduler_path,
     })
 }
 
@@ -373,6 +402,8 @@ mod tests {
             pending_scan_backlog: 0,
             last_scan: None,
             next_scheduled_scan: None,
+            scheduler_installed: false,
+            scheduler_path: PathBuf::from("/tmp/distill-test-scheduler"),
         }
     }
 
@@ -459,6 +490,33 @@ mod tests {
         assert!(!output.contains("never"));
     }
 
+    #[test]
+    fn test_format_status_reports_scheduler_state_so_users_can_verify_distill_runs() {
+        let mut info = default_info();
+        info.scheduler_installed = false;
+        info.scheduler_path = PathBuf::from("/tmp/distill-test/com.distill.agent.plist");
+        let output = format_status(&info);
+        assert!(
+            output.contains("Scheduler:"),
+            "status output must surface scheduler state so users can confirm distill is wired up"
+        );
+        assert!(
+            output.contains("not installed"),
+            "missing scheduler must read as not installed instead of being silently absent"
+        );
+        assert!(
+            output.contains("/tmp/distill-test/com.distill.agent.plist"),
+            "status output must point at the scheduler artifact path for debugging"
+        );
+
+        info.scheduler_installed = true;
+        let output = format_status(&info);
+        assert!(
+            output.contains("installed"),
+            "installed scheduler must be reported as installed"
+        );
+    }
+
     /// Disabled agents must be shown as "(disabled)" in the output.
     #[test]
     fn test_format_status_disabled_agent() {
@@ -535,11 +593,13 @@ mod tests {
         .unwrap();
 
         let config = Config::default();
+        let scheduler = crate::schedule::create_scheduler_for_tests(base.to_path_buf());
         let info = collect_status_info_with_shared_dir_at(
             &config,
             base,
             &dir.path().join("shared"),
             utc_timestamp(2024, 6, 3, 8, 0),
+            scheduler.as_ref(),
         )
         .unwrap();
 
@@ -681,11 +741,13 @@ mod tests {
         .unwrap();
 
         let config = Config::default();
+        let scheduler = crate::schedule::create_scheduler_for_tests(base.to_path_buf());
         let info = collect_status_info_with_shared_dir_at(
             &config,
             base,
             &dir.path().join("shared"),
             utc_timestamp(2025, 1, 11, 12, 0),
+            scheduler.as_ref(),
         )
         .unwrap();
 
@@ -753,11 +815,13 @@ mod tests {
         .unwrap();
 
         let config = Config::default();
+        let scheduler = crate::schedule::create_scheduler_for_tests(base.to_path_buf());
         let info = collect_status_info_with_shared_dir_at(
             &config,
             base,
             &dir.path().join("shared"),
             utc_timestamp(2026, 3, 15, 12, 31),
+            scheduler.as_ref(),
         )
         .unwrap();
 

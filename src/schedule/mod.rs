@@ -24,6 +24,7 @@ pub(crate) struct ScheduleCadence {
 }
 
 impl ScheduleCadence {
+    #[cfg(any(not(target_os = "linux"), test))]
     fn launchd_start_calendar_interval(self) -> String {
         let mut lines = vec![
             "    <key>StartCalendarInterval</key>".to_string(),
@@ -163,6 +164,22 @@ impl Scheduler for LaunchdScheduler {
         let cadence = schedule_cadence(interval);
         let start_calendar_interval = cadence.launchd_start_calendar_interval();
 
+        let logs_dir = self.home.join(".distill").join("logs");
+        fs::create_dir_all(&logs_dir).with_context(|| {
+            format!(
+                "Failed to create scheduled-run log directory: {}",
+                logs_dir.display()
+            )
+        })?;
+        let stdout_log = logs_dir.join("scheduled-run.log");
+        let stderr_log = logs_dir.join("scheduled-run.err.log");
+
+        // Launchd inherits a minimal PATH that excludes Homebrew, so
+        // `terminal-notifier` (and other scan helpers) installed via brew are
+        // not reachable unless we widen PATH explicitly here.
+        let path_env =
+            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/sbin";
+
         let plist = format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -179,9 +196,20 @@ impl Scheduler for LaunchdScheduler {
 {start_calendar_interval}
     <key>RunAtLoad</key>
     <false/>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{path_env}</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>{stdout}</string>
+    <key>StandardErrorPath</key>
+    <string>{stderr}</string>
 </dict>
 </plist>
-"#
+"#,
+            stdout = stdout_log.display(),
+            stderr = stderr_log.display(),
         );
 
         let plist_path = self.plist_or_unit_path();
@@ -300,6 +328,9 @@ impl Scheduler for SystemdScheduler {
             .to_string();
         let on_calendar = systemd_on_calendar(interval);
 
+        // notify-send needs DBUS_SESSION_BUS_ADDRESS to deliver notifications,
+        // and a sensible PATH so distill can reach `notify-send` itself when
+        // the user manager was started without a graphical session env.
         let service = format!(
             "[Unit]\n\
              Description=Distill AI agent session scanner\n\
@@ -307,6 +338,10 @@ impl Scheduler for SystemdScheduler {
              [Service]\n\
              Type=oneshot\n\
              ExecStart={exe} scheduled-run\n\
+             Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus\n\
+             Environment=PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin\n\
+             StandardOutput=journal\n\
+             StandardError=journal\n\
              \n\
              [Install]\n\
              WantedBy=default.target\n"
@@ -666,6 +701,63 @@ mod tests {
             "service missing [Service] section"
         );
         assert!(content.contains("[Unit]"), "service missing [Unit] section");
+    }
+
+    #[test]
+    fn test_systemd_service_sets_dbus_and_path_env_for_notify_send() {
+        // notify-send fails silently when DBUS_SESSION_BUS_ADDRESS is not set
+        // and the user manager was started without graphical session env.
+        // Make sure the scheduled-run service injects both DBus and PATH.
+        let dir = tempdir().unwrap();
+        let scheduler = systemd_scheduler_for_command_tests(dir.path().to_path_buf());
+        scheduler.install(&Interval::Daily).unwrap();
+        let content = fs::read_to_string(scheduler.service_path()).unwrap();
+        assert!(
+            content.contains("Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus"),
+            "service must set DBUS_SESSION_BUS_ADDRESS so notify-send can reach the user bus"
+        );
+        assert!(
+            content.contains("Environment=PATH="),
+            "service must seed PATH so notify-send is reachable"
+        );
+    }
+
+    #[test]
+    fn test_launchd_plist_sets_path_and_log_paths_for_notifier_visibility() {
+        // terminal-notifier and other notifier helpers ship via Homebrew, which
+        // is not on launchd's default PATH. The plist must widen PATH and
+        // capture stdout/stderr so users can confirm the scheduled-run actually
+        // executed.
+        let dir = tempdir().unwrap();
+        let scheduler = launchd_scheduler_for_command_tests(dir.path().to_path_buf());
+        scheduler.install(&Interval::Daily).unwrap();
+        let content = fs::read_to_string(scheduler.plist_or_unit_path()).unwrap();
+        assert!(
+            content.contains("<key>EnvironmentVariables</key>"),
+            "plist missing EnvironmentVariables block"
+        );
+        assert!(
+            content.contains("/opt/homebrew/bin"),
+            "plist PATH must include Homebrew so terminal-notifier is reachable"
+        );
+        assert!(
+            content.contains("<key>StandardOutPath</key>"),
+            "plist missing StandardOutPath so the scheduled-run is invisible to users"
+        );
+        assert!(
+            content.contains("<key>StandardErrorPath</key>"),
+            "plist missing StandardErrorPath so notification errors are silently dropped"
+        );
+        let logs_dir = dir.path().join(".distill").join("logs");
+        assert!(
+            logs_dir.exists(),
+            "scheduled-run logs directory must be created at install time"
+        );
+        let stdout_log = logs_dir.join("scheduled-run.log");
+        assert!(
+            content.contains(&stdout_log.display().to_string()),
+            "plist StandardOutPath must point at ~/.distill/logs/scheduled-run.log"
+        );
     }
 
     #[test]
