@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::config::Interval;
@@ -81,6 +81,61 @@ pub(crate) fn systemd_on_calendar(interval: &Interval) -> &'static str {
     }
 }
 
+// ─── Stable program path resolution ──────────────────────────────────────────
+
+/// Stable symlinks where a packaged `distill` binary typically lives.
+/// We prefer these over the resolved `current_exe()` so the scheduler
+/// keeps working after `brew upgrade` (which moves the Cellar target).
+fn stable_program_candidates() -> Vec<PathBuf> {
+    let mut candidates = vec![
+        PathBuf::from("/opt/homebrew/bin/distill"),
+        PathBuf::from("/usr/local/bin/distill"),
+    ];
+    if let Some(home) = std::env::var_os("HOME") {
+        candidates.push(
+            PathBuf::from(home)
+                .join(".cargo")
+                .join("bin")
+                .join("distill"),
+        );
+    }
+    candidates
+}
+
+/// Choose the most stable path that points at the same binary as `current_exe`.
+///
+/// `std::env::current_exe()` on macOS canonicalizes through symlinks, so a
+/// Homebrew install resolves to the version-pinned Cellar path (e.g.
+/// `/opt/homebrew/Cellar/distill/0.5.3/bin/distill`). Writing that into a
+/// launchd plist breaks on the next `brew upgrade` because the Cellar
+/// directory is replaced — launchd then silently fails to exec and the
+/// scheduled job "never runs".
+///
+/// This helper looks for a non-versioned candidate (e.g.
+/// `/opt/homebrew/bin/distill`) whose canonical target matches the running
+/// binary, and prefers that path so future upgrades that just retarget the
+/// symlink keep working.
+fn pick_stable_program_path(current_exe: &Path, candidates: &[PathBuf]) -> PathBuf {
+    let canonical_current = current_exe
+        .canonicalize()
+        .unwrap_or_else(|_| current_exe.to_path_buf());
+
+    for candidate in candidates {
+        if let Ok(canonical_candidate) = candidate.canonicalize()
+            && canonical_candidate == canonical_current
+        {
+            return candidate.clone();
+        }
+    }
+
+    current_exe.to_path_buf()
+}
+
+fn resolve_stable_program_path() -> PathBuf {
+    let current = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("distill"));
+    pick_stable_program_path(&current, &stable_program_candidates())
+}
+
 // ─── Trait ────────────────────────────────────────────────────────────────────
 
 pub trait Scheduler {
@@ -145,6 +200,16 @@ impl LaunchdScheduler {
 
         Ok(())
     }
+
+    /// Best-effort `launchctl unload`. Used before re-loading on install so
+    /// reinstall over a stale plist does not fail with "service already
+    /// loaded" and so launchd actually picks up the new ProgramArguments.
+    fn try_unload(&self, plist_path: &PathBuf) {
+        let _ = Command::new(&self.launchctl_path)
+            .arg("unload")
+            .arg(plist_path)
+            .output();
+    }
 }
 
 #[cfg(any(not(target_os = "linux"), test))]
@@ -157,10 +222,11 @@ impl Scheduler for LaunchdScheduler {
     }
 
     fn install(&self, interval: &Interval) -> Result<()> {
-        let exe = std::env::current_exe()
-            .unwrap_or_else(|_| PathBuf::from("distill"))
-            .to_string_lossy()
-            .to_string();
+        // Pick a stable on-disk path for the binary so the plist keeps working
+        // across `brew upgrade` (which retargets the /opt/homebrew/bin symlink
+        // to a new versioned Cellar dir, breaking any plist that hard-coded the
+        // old Cellar path).
+        let exe = resolve_stable_program_path().to_string_lossy().to_string();
         let cadence = schedule_cadence(interval);
         let start_calendar_interval = cadence.launchd_start_calendar_interval();
 
@@ -179,6 +245,7 @@ impl Scheduler for LaunchdScheduler {
         // not reachable unless we widen PATH explicitly here.
         let path_env =
             "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/sbin";
+        let home_env = self.home.display().to_string();
 
         let plist = format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -200,6 +267,8 @@ impl Scheduler for LaunchdScheduler {
     <dict>
         <key>PATH</key>
         <string>{path_env}</string>
+        <key>HOME</key>
+        <string>{home_env}</string>
     </dict>
     <key>StandardOutPath</key>
     <string>{stdout}</string>
@@ -216,6 +285,12 @@ impl Scheduler for LaunchdScheduler {
         if let Some(parent) = plist_path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("Failed to create directory: {}", parent.display()))?;
+        }
+        // Unload any previously-loaded plist before writing the new content;
+        // otherwise launchd keeps the old (possibly stale) ProgramArguments
+        // resident and `launchctl load` fails with "service already loaded".
+        if plist_path.exists() {
+            self.try_unload(&plist_path);
         }
         fs::write(&plist_path, &plist)
             .with_context(|| format!("Failed to write plist: {}", plist_path.display()))?;
@@ -322,10 +397,7 @@ impl Scheduler for SystemdScheduler {
     }
 
     fn install(&self, interval: &Interval) -> Result<()> {
-        let exe = std::env::current_exe()
-            .unwrap_or_else(|_| PathBuf::from("distill"))
-            .to_string_lossy()
-            .to_string();
+        let exe = resolve_stable_program_path().to_string_lossy().to_string();
         let on_calendar = systemd_on_calendar(interval);
 
         // notify-send needs DBUS_SESSION_BUS_ADDRESS to deliver notifications,
@@ -757,6 +829,76 @@ mod tests {
         assert!(
             content.contains(&stdout_log.display().to_string()),
             "plist StandardOutPath must point at ~/.distill/logs/scheduled-run.log"
+        );
+        assert!(
+            content.contains("<key>HOME</key>"),
+            "plist must export HOME so scheduled-run can find ~/.distill state"
+        );
+    }
+
+    #[test]
+    fn test_pick_stable_program_path_prefers_symlink_to_versioned_target() {
+        // Simulate a Homebrew-style layout where /opt/homebrew/bin/distill is
+        // a symlink into Cellar. Rust's `current_exe()` canonicalizes through
+        // that symlink, so the install path otherwise hard-codes the versioned
+        // Cellar dir and goes stale on the next `brew upgrade`.
+        let dir = tempdir().unwrap();
+        let cellar = dir
+            .path()
+            .join("Cellar")
+            .join("distill")
+            .join("0.5.3")
+            .join("bin");
+        std::fs::create_dir_all(&cellar).unwrap();
+        let cellar_bin = cellar.join("distill");
+        std::fs::write(&cellar_bin, b"#!/bin/sh\nexit 0\n").unwrap();
+
+        let stable_dir = dir.path().join("bin");
+        std::fs::create_dir_all(&stable_dir).unwrap();
+        let stable_link = stable_dir.join("distill");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&cellar_bin, &stable_link).unwrap();
+        #[cfg(not(unix))]
+        std::fs::write(&stable_link, b"#!/bin/sh\nexit 0\n").unwrap();
+
+        let chosen = pick_stable_program_path(&cellar_bin, std::slice::from_ref(&stable_link));
+        assert_eq!(
+            chosen, stable_link,
+            "stable symlink must win over the versioned Cellar target"
+        );
+    }
+
+    #[test]
+    fn test_pick_stable_program_path_falls_back_when_no_candidate_matches() {
+        let dir = tempdir().unwrap();
+        let cellar_bin = dir.path().join("custom-distill");
+        std::fs::write(&cellar_bin, b"#!/bin/sh\nexit 0\n").unwrap();
+
+        let chosen =
+            pick_stable_program_path(&cellar_bin, &[PathBuf::from("/nonexistent/distill")]);
+        assert_eq!(
+            chosen, cellar_bin,
+            "with no matching candidate, current_exe must be returned unchanged"
+        );
+    }
+
+    #[test]
+    fn test_launchd_install_is_idempotent_when_plist_already_present() {
+        // Reinstall must succeed even when an older plist is already on disk.
+        // The previous behavior failed with "service already loaded" because
+        // install just called `launchctl load` without unloading the stale
+        // entry first, so `distill watch --install` was un-runnable on
+        // upgrade.
+        let dir = tempdir().unwrap();
+        let scheduler = launchd_scheduler_for_command_tests(dir.path().to_path_buf());
+        scheduler.install(&Interval::Daily).unwrap();
+        scheduler
+            .install(&Interval::Weekly)
+            .expect("reinstall over an existing plist must succeed");
+        let content = fs::read_to_string(scheduler.plist_or_unit_path()).unwrap();
+        assert!(
+            content.contains("<key>Weekday</key>"),
+            "second install must replace the plist content with the new cadence"
         );
     }
 
