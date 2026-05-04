@@ -90,6 +90,7 @@ fn stable_program_candidates() -> Vec<PathBuf> {
     let mut candidates = vec![
         PathBuf::from("/opt/homebrew/bin/distill"),
         PathBuf::from("/usr/local/bin/distill"),
+        PathBuf::from("/usr/bin/distill"),
     ];
     if let Some(home) = std::env::var_os("HOME") {
         candidates.push(
@@ -357,6 +358,19 @@ impl SystemdScheduler {
     }
 
     fn run_systemctl(&self, args: &[&str]) -> Result<()> {
+        match self.run_systemctl_outcome(args)? {
+            SystemctlOutcome::Ok => Ok(()),
+            SystemctlOutcome::UserBusUnreachable { stderr } => {
+                eprintln!(
+                    "{}",
+                    format_user_bus_warning(args, &stderr, &self.unit_dir())
+                );
+                Ok(())
+            }
+        }
+    }
+
+    fn run_systemctl_outcome(&self, args: &[&str]) -> Result<SystemctlOutcome> {
         let output = Command::new(&self.systemctl_path)
             .args(args)
             .env("HOME", &self.home)
@@ -370,23 +384,66 @@ impl SystemdScheduler {
                 )
             })?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            anyhow::bail!(
-                "{} {} failed with status {}{}",
-                self.systemctl_path.display(),
-                args.join(" "),
-                output.status,
-                if stderr.is_empty() {
-                    String::new()
-                } else {
-                    format!(": {stderr}")
-                }
-            );
+        if output.status.success() {
+            return Ok(SystemctlOutcome::Ok);
         }
 
-        Ok(())
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if is_user_bus_unreachable(&stderr) {
+            return Ok(SystemctlOutcome::UserBusUnreachable { stderr });
+        }
+
+        anyhow::bail!(
+            "{} {} failed with status {}{}",
+            self.systemctl_path.display(),
+            args.join(" "),
+            output.status,
+            if stderr.is_empty() {
+                String::new()
+            } else {
+                format!(": {stderr}")
+            }
+        );
     }
+}
+
+#[cfg(any(target_os = "linux", test))]
+enum SystemctlOutcome {
+    Ok,
+    UserBusUnreachable { stderr: String },
+}
+
+/// Format the warning printed when the user systemd bus is unreachable.
+///
+/// Extracted so the message can be tested without capturing stderr. The
+/// invocation `args` already contain `--user`, so don't add a second copy
+/// in the message preamble.
+#[cfg(any(target_os = "linux", test))]
+fn format_user_bus_warning(args: &[&str], stderr: &str, unit_dir: &Path) -> String {
+    let cmd = args.join(" ");
+    let trimmed = stderr.trim();
+    format!(
+        "warning: systemctl {cmd} could not reach the user bus ({trimmed}). \
+         Unit files were written under {unit}; activate them later with \
+         `systemctl --user daemon-reload && systemctl --user enable --now distill.timer`. \
+         Run `loginctl enable-linger \"$USER\"` if the timer should fire while logged out.",
+        unit = unit_dir.display(),
+    )
+}
+
+/// Heuristic: the user-level systemd manager isn't reachable from this
+/// invocation. Happens on servers/containers/sessions without a logged-in
+/// user manager (no /run/user/UID/bus, no DBUS_SESSION_BUS_ADDRESS, etc.).
+/// In that case the unit files we just wrote will activate cleanly once a
+/// user manager comes up — so installation should not be treated as a hard
+/// failure.
+#[cfg(any(target_os = "linux", test))]
+fn is_user_bus_unreachable(stderr: &str) -> bool {
+    let s = stderr.to_ascii_lowercase();
+    s.contains("failed to connect to bus")
+        || s.contains("no medium found")
+        || s.contains("host is down")
+        || s.contains("failed to connect to user scope bus")
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -452,8 +509,11 @@ impl Scheduler for SystemdScheduler {
         let service_path = self.service_path();
         let had_units = timer_path.exists() || service_path.exists();
 
+        // During uninstall, swallow the bus-unreachable case silently: the
+        // file-removal step below is the actual cleanup, and the install-time
+        // "activate them later" hint would be misleading here.
         if had_units {
-            self.run_systemctl(&["--user", "disable", "--now", "distill.timer"])?;
+            let _ = self.run_systemctl_outcome(&["--user", "disable", "--now", "distill.timer"])?;
         }
 
         if timer_path.exists() {
@@ -467,7 +527,7 @@ impl Scheduler for SystemdScheduler {
             })?;
         }
         if had_units {
-            self.run_systemctl(&["--user", "daemon-reload"])?;
+            let _ = self.run_systemctl_outcome(&["--user", "daemon-reload"])?;
         }
 
         Ok(())
@@ -869,6 +929,24 @@ mod tests {
     }
 
     #[test]
+    fn test_stable_program_candidates_includes_linux_system_paths() {
+        // On Linux, distill may be installed by a system package manager into
+        // /usr/bin/distill (e.g. .deb / .rpm) or under /usr/local/bin/distill
+        // (manual `cargo install --root /usr/local`). Without these candidates
+        // the systemd ExecStart hard-codes whatever current_exe() resolved to,
+        // breaking after a package upgrade that swaps the binary's inode.
+        let candidates = stable_program_candidates();
+        assert!(
+            candidates.contains(&PathBuf::from("/usr/bin/distill")),
+            "stable candidates must include /usr/bin/distill for Linux package installs"
+        );
+        assert!(
+            candidates.contains(&PathBuf::from("/usr/local/bin/distill")),
+            "stable candidates must include /usr/local/bin/distill"
+        );
+    }
+
+    #[test]
     fn test_pick_stable_program_path_falls_back_when_no_candidate_matches() {
         let dir = tempdir().unwrap();
         let cellar_bin = dir.path().join("custom-distill");
@@ -932,5 +1010,132 @@ mod tests {
         let scheduler =
             SystemdScheduler::with_systemctl_path(dir.path().to_path_buf(), PathBuf::from("false"));
         assert!(scheduler.install(&Interval::Daily).is_err());
+    }
+
+    /// Build a one-shot stub systemctl that exits 1 with the given stderr.
+    /// Returns the path to the executable; lives until `dir` is dropped.
+    #[cfg(unix)]
+    fn write_failing_systemctl_stub(dir: &Path, stderr: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("systemctl-stub.sh");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' {} >&2\nexit 1\n",
+            shell_quote(stderr)
+        );
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn shell_quote(s: &str) -> String {
+        // Single-quote-safe quoting for /bin/sh
+        let escaped = s.replace('\'', r"'\''");
+        format!("'{}'", escaped)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_systemd_install_soft_fails_when_user_bus_is_unreachable() {
+        // On a server / fresh container / non-graphical session, a user manager
+        // may not be running, so `systemctl --user daemon-reload` exits with
+        // "Failed to connect to bus: No medium found". Onboarding should not
+        // hard-fail in that case: the unit files have already been written, and
+        // the user can activate them later (after `loginctl enable-linger` or
+        // after their next graphical login).
+        let dir = tempdir().unwrap();
+        let stub =
+            write_failing_systemctl_stub(dir.path(), "Failed to connect to bus: No medium found");
+        let scheduler = SystemdScheduler::with_systemctl_path(dir.path().to_path_buf(), stub);
+        scheduler
+            .install(&Interval::Daily)
+            .expect("install must soft-succeed when the user bus is unreachable");
+        assert!(
+            scheduler.service_path().exists(),
+            "service file must be written even when user bus is unreachable"
+        );
+        assert!(
+            scheduler.timer_path().exists(),
+            "timer file must be written even when user bus is unreachable"
+        );
+    }
+
+    #[test]
+    fn test_format_user_bus_warning_does_not_duplicate_user_flag() {
+        // run_systemctl is always invoked with `--user` already in args, so
+        // the warning preamble must not prepend another `--user` itself —
+        // otherwise users see `systemctl --user --user daemon-reload` and
+        // wonder if the wrong command leaked.
+        let msg = format_user_bus_warning(
+            &["--user", "daemon-reload"],
+            "Failed to connect to bus",
+            Path::new("/home/u/.config/systemd/user"),
+        );
+        assert!(
+            !msg.contains("--user --user"),
+            "warning must not duplicate --user, got: {msg}"
+        );
+        assert!(
+            msg.contains("systemctl --user daemon-reload"),
+            "warning must include the actual systemctl invocation, got: {msg}"
+        );
+        assert!(
+            msg.contains("loginctl enable-linger"),
+            "warning must point users at the linger fix-up, got: {msg}"
+        );
+        assert!(
+            msg.contains("/home/u/.config/systemd/user"),
+            "warning must show where the unit files landed, got: {msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_systemd_uninstall_succeeds_when_user_bus_is_unreachable() {
+        // Uninstall is also blocked by `systemctl --user disable --now` failing
+        // when the user bus isn't reachable, but the file-removal half of the
+        // operation can still complete. Treat the bus error the same way as on
+        // install: soft-fail, finish the cleanup, and don't pollute stderr with
+        // the install-flavored "activate them later" hint that's irrelevant
+        // when we're tearing things down.
+        let dir = tempdir().unwrap();
+        // First install with a working systemctl so the unit files exist.
+        let install_scheduler =
+            SystemdScheduler::with_systemctl_path(dir.path().to_path_buf(), PathBuf::from("true"));
+        install_scheduler.install(&Interval::Daily).unwrap();
+        assert!(install_scheduler.service_path().exists());
+        assert!(install_scheduler.timer_path().exists());
+
+        // Now swap in a stub that fails like an offline user bus and uninstall.
+        let stub =
+            write_failing_systemctl_stub(dir.path(), "Failed to connect to bus: No medium found");
+        let uninstall_scheduler =
+            SystemdScheduler::with_systemctl_path(dir.path().to_path_buf(), stub);
+        uninstall_scheduler
+            .uninstall()
+            .expect("uninstall must soft-succeed when the user bus is unreachable");
+        assert!(
+            !uninstall_scheduler.service_path().exists(),
+            "service file must be removed even when user bus is unreachable"
+        );
+        assert!(
+            !uninstall_scheduler.timer_path().exists(),
+            "timer file must be removed even when user bus is unreachable"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_systemd_install_still_hard_fails_on_unrelated_systemctl_error() {
+        // Soft-fail must be narrow: a generic systemctl failure (malformed
+        // unit, permission denied, etc.) should still surface as an error so
+        // the user knows something went wrong.
+        let dir = tempdir().unwrap();
+        let stub = write_failing_systemctl_stub(dir.path(), "Unit distill.timer is invalid");
+        let scheduler = SystemdScheduler::with_systemctl_path(dir.path().to_path_buf(), stub);
+        assert!(
+            scheduler.install(&Interval::Daily).is_err(),
+            "install must hard-fail for non-bus systemctl errors so users see real problems"
+        );
     }
 }

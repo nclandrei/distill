@@ -53,12 +53,62 @@ fn print_post_install_hints(scheduler: &dyn schedule::Scheduler) {
 
     #[cfg(target_os = "linux")]
     {
-        println!("  Logs:     journalctl --user -u distill.service");
-        println!(
-            "  Verify:   systemctl --user start distill.service && journalctl --user -u distill.service -n 50"
+        for line in linux_post_install_hints() {
+            println!("{line}");
+        }
+    }
+}
+
+/// Linux post-install hint lines for `distill watch --install`.
+///
+/// Extracted as a pure function so the wording (in particular, the
+/// `loginctl enable-linger` reminder) is unit-testable. Without lingering,
+/// `systemd --user` timers don't fire while the user is logged out — the
+/// scheduled scan would silently never run on a server or on a laptop after
+/// reboot if the user hasn't logged in yet, and there is nothing in the
+/// install path that would surface that fact otherwise.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn linux_post_install_hints() -> Vec<String> {
+    vec![
+        "  Logs:     journalctl --user -u distill.service".to_string(),
+        "  Verify:   systemctl --user start distill.service && journalctl --user -u distill.service -n 50".to_string(),
+        "  Persist:  loginctl enable-linger \"$USER\"   # so timers fire while logged out".to_string(),
+        "  Note:     Terminal-only notifications surface via the shell hook (`distill notify --check`).".to_string(),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_linux_post_install_hints_mentions_loginctl_enable_linger() {
+        // systemd --user timers do not fire while the user is logged out
+        // unless lingering is enabled. The post-install hint output is the
+        // only place a user would learn this from distill itself, so it must
+        // surface the exact command they need to run.
+        let hints = linux_post_install_hints();
+        let joined = hints.join("\n");
+        assert!(
+            joined.contains("loginctl enable-linger"),
+            "post-install hints must reference `loginctl enable-linger`, got:\n{joined}"
         );
-        println!(
-            "  Note:     Terminal-only notifications surface via the shell hook (`distill notify --check`)."
+    }
+
+    #[test]
+    fn test_linux_post_install_hints_keeps_journal_and_verify_lines() {
+        // The journal log path and the verify command are how users confirm
+        // that the timer fired correctly. Don't regress them while adding the
+        // linger guidance.
+        let hints = linux_post_install_hints();
+        let joined = hints.join("\n");
+        assert!(
+            joined.contains("journalctl --user -u distill.service"),
+            "hints must keep pointing at journalctl for log inspection"
+        );
+        assert!(
+            joined.contains("systemctl --user start distill.service"),
+            "hints must keep the manual verify command"
         );
     }
 }
