@@ -90,6 +90,7 @@ fn stable_program_candidates() -> Vec<PathBuf> {
     let mut candidates = vec![
         PathBuf::from("/opt/homebrew/bin/distill"),
         PathBuf::from("/usr/local/bin/distill"),
+        PathBuf::from("/usr/bin/distill"),
     ];
     if let Some(home) = std::env::var_os("HOME") {
         candidates.push(
@@ -865,6 +866,24 @@ mod tests {
         assert_eq!(
             chosen, stable_link,
             "stable symlink must win over the versioned Cellar target"
+        );
+    }
+
+    #[test]
+    fn test_stable_program_candidates_includes_linux_system_paths() {
+        // On Linux, distill may be installed by a system package manager into
+        // /usr/bin/distill (e.g. .deb / .rpm) or under /usr/local/bin/distill
+        // (manual `cargo install --root /usr/local`). Without these candidates
+        // the systemd ExecStart hard-codes whatever current_exe() resolved to,
+        // breaking after a package upgrade that swaps the binary's inode.
+        let candidates = stable_program_candidates();
+        assert!(
+            candidates.contains(&PathBuf::from("/usr/bin/distill")),
+            "stable candidates must include /usr/bin/distill for Linux package installs"
+        );
+        assert!(
+            candidates.contains(&PathBuf::from("/usr/local/bin/distill")),
+            "stable candidates must include /usr/local/bin/distill"
         );
     }
 
