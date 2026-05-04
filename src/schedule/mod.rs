@@ -509,8 +509,11 @@ impl Scheduler for SystemdScheduler {
         let service_path = self.service_path();
         let had_units = timer_path.exists() || service_path.exists();
 
+        // During uninstall, swallow the bus-unreachable case silently: the
+        // file-removal step below is the actual cleanup, and the install-time
+        // "activate them later" hint would be misleading here.
         if had_units {
-            self.run_systemctl(&["--user", "disable", "--now", "distill.timer"])?;
+            let _ = self.run_systemctl_outcome(&["--user", "disable", "--now", "distill.timer"])?;
         }
 
         if timer_path.exists() {
@@ -524,7 +527,7 @@ impl Scheduler for SystemdScheduler {
             })?;
         }
         if had_units {
-            self.run_systemctl(&["--user", "daemon-reload"])?;
+            let _ = self.run_systemctl_outcome(&["--user", "daemon-reload"])?;
         }
 
         Ok(())
@@ -1083,6 +1086,41 @@ mod tests {
         assert!(
             msg.contains("/home/u/.config/systemd/user"),
             "warning must show where the unit files landed, got: {msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_systemd_uninstall_succeeds_when_user_bus_is_unreachable() {
+        // Uninstall is also blocked by `systemctl --user disable --now` failing
+        // when the user bus isn't reachable, but the file-removal half of the
+        // operation can still complete. Treat the bus error the same way as on
+        // install: soft-fail, finish the cleanup, and don't pollute stderr with
+        // the install-flavored "activate them later" hint that's irrelevant
+        // when we're tearing things down.
+        let dir = tempdir().unwrap();
+        // First install with a working systemctl so the unit files exist.
+        let install_scheduler =
+            SystemdScheduler::with_systemctl_path(dir.path().to_path_buf(), PathBuf::from("true"));
+        install_scheduler.install(&Interval::Daily).unwrap();
+        assert!(install_scheduler.service_path().exists());
+        assert!(install_scheduler.timer_path().exists());
+
+        // Now swap in a stub that fails like an offline user bus and uninstall.
+        let stub =
+            write_failing_systemctl_stub(dir.path(), "Failed to connect to bus: No medium found");
+        let uninstall_scheduler =
+            SystemdScheduler::with_systemctl_path(dir.path().to_path_buf(), stub);
+        uninstall_scheduler
+            .uninstall()
+            .expect("uninstall must soft-succeed when the user bus is unreachable");
+        assert!(
+            !uninstall_scheduler.service_path().exists(),
+            "service file must be removed even when user bus is unreachable"
+        );
+        assert!(
+            !uninstall_scheduler.timer_path().exists(),
+            "timer file must be removed even when user bus is unreachable"
         );
     }
 
